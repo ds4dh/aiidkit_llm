@@ -188,3 +188,4 @@ wandb
 
 # Other files
 notebooks/DataManipulation/TEAVPatientsGraphs_Backup20251001_OldAIIDKITCode.ipynb
+out_slurm_files/
