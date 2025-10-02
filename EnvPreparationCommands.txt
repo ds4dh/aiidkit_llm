@@ -1,0 +1,14 @@
+1) Create the environment: python3.11 -m venv /path/to/new/virtual/environment
+
+2) Activate the environment: source /path/to/new/virtual/environment/bin/activate
+
+3) Torch installation: python -m pip install torch==2.7.1 torchaudio==2.7.1 torchvision==0.22.1
+
+4) Force libraries to install to use PyTorch's cuda: export USE_SYSTEM_CUDA=0; export FORCE_CUDA="1"
+
+5) (OPTIONAL) torch-cluster, torch-scatter, torch-sparse and torch-spline-conv installation (two ways, CPU or GPU):
+	- CPU : python -m pip install torch-cluster torch-scatter torch-sparse torch-spline-conv -f https://data.pyg.org/whl/torch-2.6.0%2Bcpu.html
+	- GPU (REPLACE ${CUDA} by cu118, cu124, cu126, or cu128 depending on the torch installation) : python -m pip install torch-cluster torch-scatter torch-sparse torch-spline-conv -f https://data.pyg.org/whl/torch-2.7.1+${CUDA}.html
+
+6) Installation of the rest of the libraries: python -m pip install --no-cache-dir --force-reinstall -r requirements.txt
+
