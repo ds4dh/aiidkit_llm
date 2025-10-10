@@ -5,6 +5,7 @@ from torch_geometric.nn import (
                                     global_mean_pool,
                                     TopKPooling,
                                 )
+from edl_pytorch import Dirichlet
 
 from src.model.GraphBased.AiidkitTEAVGraphEmbedder import AiidkitTEAVGraphEmbedder
 
@@ -23,6 +24,7 @@ class HeteroGNN(nn.Module):
                     metadata,
                     graph_pool_strategy="mean",
                     graph_pool_fusion="stack",
+                    evidential=False
                 ):
         super().__init__()
         self.graph_pool_strategy = graph_pool_strategy
@@ -51,7 +53,18 @@ class HeteroGNN(nn.Module):
                                                 })
 
         # Output layer
-        self.graph_lin = nn.Linear(hidden_channels, out_channels)
+        if (evidential):
+            if (self.graph_pool_fusion.lower() == "stack"):
+                self.graph_lin = Dirichlet(hidden_channels, out_channels)
+            elif (self.graph_pool_fusion.lower() == "concatenation"):
+                n_nodes = len(in_channels)
+                self.graph_lin = Dirichlet(n_nodes*hidden_channels, out_channels)
+        else:
+            if (self.graph_pool_fusion.lower() == "stack"):
+                self.graph_lin = nn.Linear(hidden_channels, out_channels)
+            elif (self.graph_pool_fusion.lower() == "concatenation"):
+                n_nodes = len(in_channels)
+                self.graph_lin = nn.Linear(n_nodes*hidden_channels, out_channels)
 
     def forward(self, data):
         x_dict = {}

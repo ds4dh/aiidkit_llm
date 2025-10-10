@@ -461,10 +461,10 @@ def create_PyGeo_Graph_DS_from_HDF5(h5_fn, label_type="infection_label_binary_ba
         pat_data_graph["central", "sequence", "central"].edge_attr = torch.from_numpy(hdf5_file[str_pat_ID]["central_to_central"]["edge_attr"][:])
         # Central to central child_cont
         pat_data_graph["central", "has_child", "child_cont"].edge_index = torch.from_numpy(hdf5_file[str_pat_ID]["central_to_child_cont"]["edge_index"][:])
-        pat_data_graph["central", "has_child", "child_cont"].edge_attr = torch.from_numpy(hdf5_file[str_pat_ID]["central_to_child_cont"]["edge_attr"][:])
+        pat_data_graph["central", "has_child", "child_cont"].edge_attr = torch.from_numpy(hdf5_file[str_pat_ID]["central_to_child_cont"]["edge_attr"][:]).T # Transpose as should be of shape (num_features, 1) and not (1, num_features) to be able to do batching
         # Central to central child_categ
         pat_data_graph["central", "has_child", "child_categ"].edge_index = torch.from_numpy(hdf5_file[str_pat_ID]["central_to_child_categ"]["edge_index"][:])
-        pat_data_graph["central", "has_child", "child_categ"].edge_attr = torch.from_numpy(hdf5_file[str_pat_ID]["central_to_child_categ"]["edge_attr"][:])
+        pat_data_graph["central", "has_child", "child_categ"].edge_attr = torch.from_numpy(hdf5_file[str_pat_ID]["central_to_child_categ"]["edge_attr"][:]).T # Transpose as should be of shape (num_features, 1) and not (1, num_features) to be able to do batching
 
         # Label
         try:

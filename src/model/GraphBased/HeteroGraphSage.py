@@ -6,6 +6,7 @@ from torch_geometric.nn import (
                                     TopKPooling,
                                 )
 from torch_geometric.nn.models import GraphSAGE
+from edl_pytorch import Dirichlet
 
 from src.model.GraphBased.AiidkitTEAVGraphEmbedder import AiidkitTEAVGraphEmbedder
 
@@ -31,7 +32,8 @@ class HeteroGraphSage(nn.Module):
                     graph_pool_strategy="mean",
                     graph_pool_fusion="stack",
                     act='ReLU',
-                    aggr='mean'
+                    aggr='mean',
+                    evidential=False
                 ):
         """
         Graph-based module using GraphSAGE.
@@ -66,12 +68,19 @@ class HeteroGraphSage(nn.Module):
                                                     for node_type in in_channels
                                                 })
         
-        # Output projection layers
-        if (self.graph_pool_fusion.lower() == "stack"):
-            self.graph_lin = nn.Linear(hidden_channels, out_channels)
-        elif (self.graph_pool_fusion.lower() == "concatenation"):
-            n_nodes = len(in_channels)
-            self.graph_lin = nn.Linear(n_nodes*hidden_channels, out_channels)
+        # Output layer
+        if (evidential):
+            if (self.graph_pool_fusion.lower() == "stack"):
+                self.graph_lin = Dirichlet(hidden_channels, out_channels)
+            elif (self.graph_pool_fusion.lower() == "concatenation"):
+                n_nodes = len(in_channels)
+                self.graph_lin = Dirichlet(n_nodes*hidden_channels, out_channels)
+        else:
+            if (self.graph_pool_fusion.lower() == "stack"):
+                self.graph_lin = nn.Linear(hidden_channels, out_channels)
+            elif (self.graph_pool_fusion.lower() == "concatenation"):
+                n_nodes = len(in_channels)
+                self.graph_lin = nn.Linear(n_nodes*hidden_channels, out_channels)
 
 
     #def forward(self, x, ids, edge_index, edge_attr, timestamps):

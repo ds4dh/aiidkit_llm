@@ -1,0 +1,54 @@
+# Parameters file
+# Name of the experiment
+exp_id: "SimpleHeteroGNN_TEAV"
+
+# Dataset to use
+Dataset:
+  dataset_name: AIIDKIT
+  subdataset: TEAV_Static_Graph_v1
+  hdf5_dataset_filename:
+    Train: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/AIIDKIT_TEAV_Graph_TRAIN_0.hdf5
+    Validation: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/AIIDKIT_TEAV_Graph_VALIDATION_0.hdf5
+    Test: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/AIIDKIT_TEAV_Graph_TEST_0.hdf5
+  normalize_ds: true
+  label_type: infection_label_binary_bacterial
+
+# Device to use
+device: cuda:0
+
+# Save information
+epochs_step_save_preds: 10
+
+# Architecture to use
+Model:
+  model_type: GNN
+  model_to_use: SimpleHeteroGNN
+  hidden_channels: 16
+  graph_pool_strategy: mean
+  graph_pool_fusion: concatenation
+
+# Training parameters
+TrainingParams:
+  lr: 1.0e-2 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
+  weight_decay: 1.0e-5 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
+  batch_size_train: 32
+  batch_size_val: 32
+  batch_size_test: 32
+  n_epochs: 50
+  nb_repetitions: 5
+
+# Optimization
+Optimization:
+  Optuna:
+    use_optuna: false
+    n_trials: 0
+    optuna_starting_point_fn: null
+  optimizer: Adam
+  loss_function: CE
+  EarlyStopping:
+    use_early_stopping: false
+    patience: 5
+    min_delta: 1.0e-4 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
+
+  
+

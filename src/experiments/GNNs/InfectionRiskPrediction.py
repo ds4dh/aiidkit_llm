@@ -33,6 +33,8 @@ from src.data.process.graph_patient_dataset import create_PyGeo_Graph_DS_from_HD
                                                    compute_statistics_dataset
 from src.model.GraphBased.HeteroGNN import HeteroGNN
 from src.model.GraphBased.HeteroGraphSage import HeteroGraphSage
+from src.experiments.Utils.EvidentialClassification import EvidentialClassification
+from src.experiments.Utils.tools import get_uncertainties
 
 #====================================================================================================#
 #====================================================================================================#
@@ -56,32 +58,32 @@ class InfectionRiskPred(GenericExperiment):
         """
             Create the torch datasets associated needed to train and evaluate the model
         """
-        if ('Train' not in self.parameters_exp['hdf5_dataset_filename']) or ('Test' not in self.parameters_exp['hdf5_dataset_filename']):
+        if ('Train' not in self.parameters_exp['Dataset']['hdf5_dataset_filename']) or ('Test' not in self.parameters_exp['Dataset']['hdf5_dataset_filename']):
             raise RuntimeError("Train and Test datasets must be specified (Validation is optional).")
         else:
-            if (self.parameters_exp['dataset_name'].lower() == 'aiidkit'):
-                if (self.parameters_exp['subdataset'].lower() == 'teav_static_graph_v1'):
+            if (self.parameters_exp['Dataset']['dataset_name'].lower() == 'aiidkit'):
+                if (self.parameters_exp['Dataset']['subdataset'].lower() == 'teav_static_graph_v1'):
                     # Train
                     self.train_ds = create_PyGeo_Graph_DS_from_HDF5(
-                                                                        h5_fn=self.parameters_exp['hdf5_dataset_filename']['Train'],
-                                                                        label_type=self.parameters_exp['label_type']
+                                                                        h5_fn=self.parameters_exp['Dataset']['hdf5_dataset_filename']['Train'],
+                                                                        label_type=self.parameters_exp['Dataset']['label_type']
                                                                     )
                     # Validation
-                    if ('Val' in self.parameters_exp['hdf5_dataset_filename']):
+                    if ('Validation' in self.parameters_exp['Dataset']['hdf5_dataset_filename']):
                         self.val_ds = create_PyGeo_Graph_DS_from_HDF5(
-                                                                            h5_fn=self.parameters_exp['hdf5_dataset_filename']['Validation'],
-                                                                            label_type=self.parameters_exp['label_type']
+                                                                            h5_fn=self.parameters_exp['Dataset']['hdf5_dataset_filename']['Validation'],
+                                                                            label_type=self.parameters_exp['Dataset']['label_type']
                                                                         ) 
                     else:
                         self.val_ds = []
                     # Test
                     self.test_ds = create_PyGeo_Graph_DS_from_HDF5(
-                                                                        h5_fn=self.parameters_exp['hdf5_dataset_filename']['Test'],
-                                                                        label_type=self.parameters_exp['label_type']
+                                                                        h5_fn=self.parameters_exp['Dataset']['hdf5_dataset_filename']['Test'],
+                                                                        label_type=self.parameters_exp['Dataset']['label_type']
                                                                     )
                     
                     # Load important data for GNNs
-                    graph_ds_folder_name = '/'.join(self.parameters_exp['hdf5_dataset_filename']['Train'].split('/')[:-1]) + '/'
+                    graph_ds_folder_name = '/'.join(self.parameters_exp['Dataset']['hdf5_dataset_filename']['Train'].split('/')[:-1]) + '/'
                     possible_values_all_patients_fn = graph_ds_folder_name + 'possible_values_all_patients.pkl'
                     with open(possible_values_all_patients_fn, mode='rb') as pf:
                         self.possible_values_all_patients = pickle.load(pf)
@@ -89,9 +91,9 @@ class InfectionRiskPred(GenericExperiment):
                     with open(categorical_ent_attr_pairs_fn, mode='rb') as pf:
                         self.categorical_ent_attr_pairs = pickle.load(pf)
                 else:
-                    raise ValueError(f"Subsdataset {self.parameters_exp['subdataset']} is not valid")
+                    raise ValueError(f"Subsdataset {self.parameters_exp['Dataset']['subdataset']} is not valid")
             else:
-                raise ValueError(f"Dataset {self.parameters_exp['dataset_name']} is not valid")
+                raise ValueError(f"Dataset {self.parameters_exp['Dataset']['dataset_name']} is not valid")
             
     
     def addClassWeightsLoss(self, multiclass_strategy='balanced'):
@@ -100,8 +102,8 @@ class InfectionRiskPred(GenericExperiment):
             these class weights to handle imbalanced classes.
         """
         # Compute class weights
-        if (self.parameters_exp['dataset_name'].lower() == 'aiidkit') and\
-            (self.parameters_exp['subdataset'].lower() == 'teav_static_graph_v1'):
+        if (self.parameters_exp['Dataset']['dataset_name'].lower() == 'aiidkit') and\
+            (self.parameters_exp['Dataset']['subdataset'].lower() == 'teav_static_graph_v1'):
                 # Getting all the labels
                 y_all = []
                 for data in self.train_ds:
@@ -110,15 +112,15 @@ class InfectionRiskPred(GenericExperiment):
                 y_all = torch.cat(y_all).numpy()
 
                 # Computing the number of classes if not given
-                if num_classes is None:
-                    num_classes = int(y_all.max()) + 1
+                if self.num_classes is None:
+                    self.num_classes = int(y_all.max()) + 1
 
                 # Number of samples per class
-                counts = np.bincount(y_all, minlength=num_classes).astype(float)
+                counts = np.bincount(y_all, minlength=self.num_classes).astype(float)
                 total = counts.sum()
 
                 # Computing weights
-                if (num_classes == 2):
+                if (self.num_classes == 2) and (not self.use_evidential_learning):
                     num_neg = counts[0]
                     num_pos = counts[1]
                     if num_pos == 0 or num_neg == 0:
@@ -131,7 +133,7 @@ class InfectionRiskPred(GenericExperiment):
                     print(f"\n===> pos_weight = {self.class_weights_to_use.item():.4f}") 
                 else:
                     if multiclass_strategy == "balanced":
-                        weights = total / (num_classes * counts)
+                        weights = total / (self.num_classes * counts)
                     elif multiclass_strategy == "inverse":
                         weights = 1.0 / counts
                     elif multiclass_strategy == "sqrt_inv":
@@ -147,22 +149,24 @@ class InfectionRiskPred(GenericExperiment):
                     print(f"\n===> Class counts: {counts.astype(int)}")
                     print(f"\n===> Weights ({multiclass_strategy}): {weights.tolist()}")
         else:
-            raise ValueError(f"Combination of dataset {self.parameters_exp['dataset_name']} and subdataset type {self.parameters_exp['subdataset']} is not valid.")
+            raise ValueError(f"Combination of dataset {self.parameters_exp['Dataset']['dataset_name']} and subdataset type {self.parameters_exp['Dataset']['subdataset']} is not valid.")
 
         # Defining the new loss
-        if (self.parameters_exp['loss_function'].lower() == "ce"):
+        if (self.parameters_exp['Optimization']['loss_function'].lower() == "ce"):
             if (self.num_classes > 2):
                 self.criterion = torch.nn.CrossEntropyLoss(weight=self.class_weights_to_use)
             else:
                 self.criterion = torch.nn.BCEWithLogitsLoss(pos_weight=self.class_weights_to_use)
+        elif (self.use_evidential_learning):
+            self.criterion = EvidentialClassification(lamb=self. parameters_exp['Optimization']['EvidentialLoss']['lambda_evidential'], class_weights=self.class_weights_to_use)
     
     def normalizeDataset(self):
         """
             Normalize the dataset by substracting the mean and dividing by
             the std
         """
-        if (self.parameters_exp['dataset_name'].lower() == 'aiidkit') and\
-            (self.parameters_exp['subdataset'].lower() == 'teav_static_graph_v1'):
+        if (self.parameters_exp['Dataset']['dataset_name'].lower() == 'aiidkit') and\
+            (self.parameters_exp['Dataset']['subdataset'].lower() == 'teav_static_graph_v1'):
                 # Compute statistics on the training dataset
                 train_statistics = compute_statistics_dataset(self.train_ds)
 
@@ -172,7 +176,7 @@ class InfectionRiskPred(GenericExperiment):
                     self.val_ds = normalize_dataset(dataset=self.val_ds, statistics=train_statistics)
                 self.test_ds = normalize_dataset(dataset=self.test_ds, statistics=train_statistics)
         else:
-            raise ValueError(f"Combination of dataset {self.parameters_exp['dataset_name']} and subdataset type {self.parameters_exp['subdataset']} is not valid.")
+            raise ValueError(f"Combination of dataset {self.parameters_exp['Dataset']['dataset_name']} and subdataset type {self.parameters_exp['Dataset']['subdataset']} is not valid.")
 
     
     def dataloadersCreation(self):
@@ -180,20 +184,20 @@ class InfectionRiskPred(GenericExperiment):
             Create the train and test dataloader necessary to train and test a
             deep learning model
         """
-        if (self.parameters_exp['dataset_name'].lower() == 'aiidkit'):
-            if (self.parameters_exp['subdataset'].lower() == 'teav_static_graph_v1'):
+        if (self.parameters_exp['Dataset']['dataset_name'].lower() == 'aiidkit'):
+            if (self.parameters_exp['Dataset']['subdataset'].lower() == 'teav_static_graph_v1'):
                 # Train
-                self.train_loader = torch_geometric.loader.DataLoader(self.train_ds, batch_size=self.parameters_exp['batch_size_train'])  # batching heterogeneous graphs
+                self.train_loader = torch_geometric.loader.DataLoader(self.train_ds, batch_size=self.parameters_exp['TrainingParams']['batch_size_train'])  # batching heterogeneous graphs
                 
                 # Validation
-                self.val_loader = torch_geometric.loader.DataLoader(self.val_ds, batch_size=self.parameters_exp['batch_size_val'])  # batching heterogeneous graphs
+                self.val_loader = torch_geometric.loader.DataLoader(self.val_ds, batch_size=self.parameters_exp['TrainingParams']['batch_size_val'])  # batching heterogeneous graphs
 
                 # Test
-                self.test_loader = torch_geometric.loader.DataLoader(self.test_ds, batch_size=self.parameters_exp['batch_size_test'])  # batching heterogeneous graphs
+                self.test_loader = torch_geometric.loader.DataLoader(self.test_ds, batch_size=self.parameters_exp['TrainingParams']['batch_size_test'])  # batching heterogeneous graphs
             else:
-                raise ValueError(f"Subsdataset {self.parameters_exp['subdataset']} is not valid")
+                raise ValueError(f"Subsdataset {self.parameters_exp['Dataset']['subdataset']} is not valid")
         else:
-            raise ValueError(f"Dataset {self.parameters_exp['dataset_name']} is not valid")
+            raise ValueError(f"Dataset {self.parameters_exp['Dataset']['dataset_name']} is not valid")
 
     
     def modelCreation(self):
@@ -201,44 +205,46 @@ class InfectionRiskPred(GenericExperiment):
             Creates a model to be trained on the selected time-frequency
             representation
         """
-        if (self.parameters_exp['model_type'].lower() == "gnn"):
-            if (self.parameters_exp['model_to_use'].lower() == "simpleheterognn"):
+        if (self.parameters_exp['Model']['model_type'].lower() == "gnn"):
+            if (self.parameters_exp['Model']['model_to_use'].lower() == "simpleheterognn"):
                 print("\n==========> Using HeteroGNN GNN <==========\n")
-                model = HeteroGNN(
-                                    hidden_channels=self.parameters_exp["hidden_channels"],
-                                    out_channels=self.parameters_exp["out_channels"],
+                self.model = HeteroGNN(
+                                    hidden_channels=self.parameters_exp['Model']['hidden_channels'],
+                                    out_channels=self.parameters_exp['Model']['out_channels'],
                                     possible_values_all_patients=self.possible_values_all_patients,
                                     categorical_ent_attr_pairs=self.categorical_ent_attr_pairs,
                                     metadata=self.train_ds[0].metadata(),
-                                    graph_pool_strategy=self.parameters_exp["graph_pool_strategy"],
-                                    graph_pool_fusion=self.parameters_exp["graph_pool_fusion"]
+                                    graph_pool_strategy=self.parameters_exp['Model']['graph_pool_strategy'],
+                                    graph_pool_fusion=self.parameters_exp['Model']['graph_pool_fusion'],
+                                    evidential=self.use_evidential_learning
                                 ).to(self.device)
-            elif (self.parameters_exp['model_to_use'].lower() == "heterographsage"):
+            elif (self.parameters_exp['Model']['model_to_use'].lower() == "heterographsage"):
                 print("\n==========> Using HeteroGraphSage GNN <==========\n")
-                model = HeteroGraphSage(
+                self.model = HeteroGraphSage(
                                             in_channels={"central": 1, "child_cont": 9, "child_categ": 8},
-                                            hidden_channels=self.parameters_exp["hidden_channels"],
-                                            out_channels=self.parameters_exp["out_channels"],
-                                            dropout=self.parameters_exp["dropout"],
-                                            num_layers=self.parameters_exp["num_layers"],
+                                            hidden_channels=self.parameters_exp['Model']['hidden_channels'],
+                                            out_channels=self.parameters_exp['Model']['out_channels'],
+                                            dropout=self.parameters_exp['Model']["dropout"],
+                                            num_layers=self.parameters_exp['Model']["num_layers"],
                                             possible_values_all_patients=self.possible_values_all_patients,
                                             categorical_ent_attr_pairs=self.categorical_ent_attr_pairs,
                                             metadata=self.train_ds[0].metadata(),
-                                            graph_pool_strategy=self.parameters_exp["graph_pool_strategy"],
-                                            graph_pool_fusion=self.parameters_exp["graph_pool_fusion"],
+                                            graph_pool_strategy=self.parameters_exp['Model']['graph_pool_strategy'],
+                                            graph_pool_fusion=self.parameters_exp['Model']['graph_pool_fusion'],
                                             act='ReLU',
-                                            aggr='mean'
+                                            aggr='mean',
+                                            evidential=self.use_evidential_learning
                                         ).to(self.device) 
             else:
-                raise ValueError("Model to use {} is not valid".format(self.parameters_exp['model_to_use']))
+                raise ValueError("Model to use {} is not valid".format(self.parameters_exp['Model']['model_to_use']))
 
 
-    def computeForwardPass(self, batch, epoch_nb):
+    def computeForwardPass(self, batch, epoch_nb, batch_ID=None):
         #======================================================================#
         #======================================================================#
         #======================================================================#
-        if (self.parameters_exp['dataset_name'].lower() == 'aiidkit') and\
-            (self.parameters_exp['subdataset'].lower() == 'teav_static_graph_v1'):
+        if (self.parameters_exp['Dataset']['dataset_name'].lower() == 'aiidkit') and\
+            (self.parameters_exp['Dataset']['subdataset'].lower() == 'teav_static_graph_v1'):
             # Putting batch to correct device
             batch = batch.to(self.device)
 
@@ -247,43 +253,62 @@ class InfectionRiskPred(GenericExperiment):
 
             # Getting the loss function
             if (self.num_classes == 2):
-                loss_classif = self.criterion(out.view(-1), batch.y.float())
+                if (not self.use_evidential_learning):
+                    loss_classif = self.criterion(out.view(-1), batch.y.float())
+                else:
+                    loss_classif = self.criterion(out, batch.y)
             else:
                 loss_classif = self.criterion(out, batch.y.squeeze())
 
             # Adding the loss to the dictionary of losses
             loss = {
-                        "loss_classif": loss_classif # DO NOT USE .item() unless you do not want to compute the gradient on it!
+                        "total_loss": loss_classif # DO NOT USE .item() unless you do not want to compute the gradient on it!
                     }
 
             # Getting the predictions
             if (self.num_classes == 2):
-                # Getting the predictions
-                decision_treshold = 0.5
-                if (out.ndim > 1 and out.size(-1) == 1):
-                    predictions_probs = torch.sigmoid(out.view(-1)).cpu().numpy()
+                if (self.use_evidential_learning):
+                    # Getting the prediction probabilities
+                    alphas = out # out is the alpha (evidence+1) as indicated in the code of Dirichlet layer of edl_pytorch
+                    predictions_probs = alphas / torch.sum(alphas, dim=1, keepdim=True)
+                    # Predictions
+                    predictions = torch.argmax(predictions_probs, dim=1).detach().cpu().numpy()
+                    predictions_probs = predictions_probs.detach().cpu().numpy()
                 else:
-                    predictions_probs = torch.sigmoid(out).view(-1).cpu().numpy()
-                predictions = (predictions_probs >= decision_treshold).astype(int)
+                    # Prediction probabilities
+                    decision_treshold = 0.5
+                    if (out.ndim > 1 and out.size(-1) == 1):
+                        predictions_probs = torch.sigmoid(out.view(-1)).detach().cpu().numpy()
+                    else:
+                        predictions_probs = torch.sigmoid(out).view(-1).detach().cpu().numpy()
+                    # Predictions
+                    predictions = (predictions_probs >= decision_treshold).astype(int)
+
                 # Get true labels (must be 0/1 tensor)
                 targets = batch.y.view(-1).cpu().numpy()
+
                 # Fill the predictions dictionary
                 preds = {
                             "targets": targets,
                             "predictions": predictions,
                             "predictions_probs": predictions_probs
                         }
+                if (self.use_evidential_learning):
+                    epistemic_uncert, aleatoric_uncert, total_uncert = get_uncertainties(alphas)
+                    preds["epistemic_uncert"] = epistemic_uncert.detach().cpu().numpy()
+                    preds["aleatoric_uncert"] = aleatoric_uncert.detach().cpu().numpy()
+                    preds["total_uncert"] = total_uncert.detach().cpu().numpy()
             else:
                 raise NotImplementedError("Not implemented yes, see code epidemio_informed_gnns.")
         else:
-            raise ValueError(f"Combination of dataset {self.parameters_exp['dataset_name']} and subdataset type {self.parameters_exp['subdataset']} is not valid.")
+            raise ValueError(f"Combination of dataset {self.parameters_exp['Dataset']['dataset_name']} and subdataset type {self.parameters_exp['Dataset']['subdataset']} is not valid.")
 
         return loss, preds
 
     
-    def singleTrain(self):
+    def singleTrain(self, rep_ID):
         """
-            Trains a model one time during self.n_epochs epochs
+            Trains a model one time during self.parameters_exp['TrainingParams']['n_epochs'] epochs
         """
         # Doing all on the hdf5 files result
         with h5py.File(self.repetitions_results_fn, 'a') as h5f_rep_results:
@@ -304,7 +329,11 @@ class InfectionRiskPred(GenericExperiment):
 
             # Epochs
             seen_loss_types = []
-            for epoch in tqdm(range(self.n_epochs)):
+            for epoch in tqdm(range(self.parameters_exp['TrainingParams']['n_epochs'])):
+                # Update lambda evidential learning if asked
+                if (self.use_evidential_learning) and\
+                   (self.parameters_exp['Optimization']['EvidentialLoss']['lambda_evidential_sched']):
+                    self.scheduling_lambda_evidential(epoch)
                 # Training
                 self.test_mode = False
                 self.model.train()
@@ -326,36 +355,19 @@ class InfectionRiskPred(GenericExperiment):
                 # Mean performance in the batch
                 for loss_type in tmp_train_losses:
                     if (f"Rep-{self.repetition_id}/Loss/Train/{loss_type}" not in h5f_rep_results):
-                        h5f_rep_results.create_dataset(f"Rep-{self.repetition_id}/Loss/Train/{loss_type}", shape=(self.n_epochs,), dtype='f')
+                        h5f_rep_results.create_dataset(f"Rep-{self.repetition_id}/Loss/Train/{loss_type}", shape=(self.parameters_exp['TrainingParams']['n_epochs'],), dtype='f')
                         seen_loss_types.append(loss_type)
                     h5f_rep_results[f"Rep-{self.repetition_id}/Loss/Train/{loss_type}"][epoch] = np.mean(tmp_train_losses[loss_type])
                 # Preds
-                if (epoch % self.epochs_step_save_preds == 0) or (epoch == self.n_epochs-1):
+                if (epoch % self.epochs_step_save_preds == 0) or (epoch == self.parameters_exp['TrainingParams']['n_epochs']-1):
+                    # Create group for the current epoch
                     h5f_rep_results.create_group(f"Rep-{self.repetition_id}/Preds/Train/Epoch-{epoch}")
-
-
-
-
-
-
-
-
-
-                    raise NotImplementedError("Correct, in this case we do not have days (as for epidemio-informed one batch was one snapshot corresponding to one day)")
-
-
-
-
-
-
-
-
-
                     
-                    for day in range(len(tmp_train_preds)):
-                        h5f_rep_results.create_group(f"Rep-{self.repetition_id}/Preds/Train/Epoch-{epoch}/Day-{day}")
-                        for res_name in tmp_train_preds[day]:
-                            h5f_rep_results.create_dataset(f"Rep-{self.repetition_id}/Preds/Train/Epoch-{epoch}/Day-{day}/{res_name}", data=tmp_train_preds[day][res_name].detach().cpu().numpy())
+                    # Concatenating the results of the batches
+                    for pred_type in list(tmp_train_preds[0].keys()):
+                        tmp_pred = np.concatenate([tmp_train_preds[batch_ID][pred_type] for batch_ID in range(len(tmp_train_preds))])
+                        h5f_rep_results.create_dataset(f"Rep-{self.repetition_id}/Preds/Train/Epoch-{epoch}/{pred_type}", data=tmp_pred)
+
 
                 # Validation
                 self.test_mode = False # As the validation set has the same characteristics as the training set
@@ -363,18 +375,20 @@ class InfectionRiskPred(GenericExperiment):
                 # Loss
                 for loss_type in tmp_val_losses:
                     if (f"Rep-{self.repetition_id}/Loss/Val/{loss_type}" not in h5f_rep_results):
-                        h5f_rep_results.create_dataset(f"Rep-{self.repetition_id}/Loss/Val/{loss_type}", shape=(self.n_epochs,), dtype='f')
+                        h5f_rep_results.create_dataset(f"Rep-{self.repetition_id}/Loss/Val/{loss_type}", shape=(self.parameters_exp['TrainingParams']['n_epochs'],), dtype='f')
                     h5f_rep_results[f"Rep-{self.repetition_id}/Loss/Val/{loss_type}"][epoch] = np.mean(tmp_val_losses[loss_type])
                 # Preds
-                if (epoch % self.epochs_step_save_preds == 0) or (epoch == self.n_epochs-1):
+                if (epoch % self.epochs_step_save_preds == 0) or (epoch == self.parameters_exp['TrainingParams']['n_epochs']-1):
+                    # Create group for the current epoch
                     h5f_rep_results.create_group(f"Rep-{self.repetition_id}/Preds/Val/Epoch-{epoch}")
-                    for day in range(len(tmp_val_preds)):
-                        h5f_rep_results.create_group(f"Rep-{self.repetition_id}/Preds/Val/Epoch-{epoch}/Day-{day}")
-                        for res_name in tmp_val_preds[day]:
-                            h5f_rep_results.create_dataset(f"Rep-{self.repetition_id}/Preds/Val/Epoch-{epoch}/Day-{day}/{res_name}", data=tmp_val_preds[day][res_name].detach().cpu().numpy())
+                    
+                    # Concatenating the results of the batches
+                    for pred_type in list(tmp_val_preds[0].keys()):
+                        tmp_pred = np.concatenate([tmp_val_preds[batch_ID][pred_type] for batch_ID in range(len(tmp_val_preds))])
+                        h5f_rep_results.create_dataset(f"Rep-{self.repetition_id}/Preds/Val/Epoch-{epoch}/{pred_type}", data=tmp_pred)
                 
                 # LR scheduler
-                # if (self.parameters_exp['optimizer'].lower() in ['adam', 'adamw']):
+                # if (self.parameters_exp['Optimization']['optimizer'].lower() in ['adam', 'adamw']):
                 #     # print("\n\n (BEFORE) Doing scheduler update (lr = {})".format(self.sched.get_last_lr()))
                 #     self.sched.step(loss_values['Val'][epoch]) # For ReduceLROnPlateau
                 #     # self.sched.step() # For MultiStepLR
@@ -386,15 +400,17 @@ class InfectionRiskPred(GenericExperiment):
                 # Loss
                 for loss_type in tmp_test_losses:
                     if (f"Rep-{self.repetition_id}/Loss/Test/{loss_type}" not in h5f_rep_results):
-                        h5f_rep_results.create_dataset(f"Rep-{self.repetition_id}/Loss/Test/{loss_type}", shape=(self.n_epochs,), dtype='f')
+                        h5f_rep_results.create_dataset(f"Rep-{self.repetition_id}/Loss/Test/{loss_type}", shape=(self.parameters_exp['TrainingParams']['n_epochs'],), dtype='f')
                     h5f_rep_results[f"Rep-{self.repetition_id}/Loss/Test/{loss_type}"][epoch] = np.mean(tmp_test_losses[loss_type])
                 # Preds
-                if (epoch % self.epochs_step_save_preds == 0) or (epoch == self.n_epochs-1):
+                if (epoch % self.epochs_step_save_preds == 0) or (epoch == self.parameters_exp['TrainingParams']['n_epochs']-1):
+                    # Create group for the current epoch
                     h5f_rep_results.create_group(f"Rep-{self.repetition_id}/Preds/Test/Epoch-{epoch}")
-                    for day in range(len(tmp_test_preds)):
-                        h5f_rep_results.create_group(f"Rep-{self.repetition_id}/Preds/Test/Epoch-{epoch}/Day-{day}")
-                        for res_name in tmp_test_preds[day]:
-                            h5f_rep_results.create_dataset(f"Rep-{self.repetition_id}/Preds/Test/Epoch-{epoch}/Day-{day}/{res_name}", data=tmp_test_preds[day][res_name].detach().cpu().numpy())
+                    
+                    # Concatenating the results of the batches
+                    for pred_type in list(tmp_test_preds[0].keys()):
+                        tmp_pred = np.concatenate([tmp_test_preds[batch_ID][pred_type] for batch_ID in range(len(tmp_test_preds))])
+                        h5f_rep_results.create_dataset(f"Rep-{self.repetition_id}/Preds/Test/Epoch-{epoch}/{pred_type}", data=tmp_pred)
 
                 print("================================================================================")
                 print("LOSS AND METRICS\n")
@@ -415,35 +431,16 @@ class InfectionRiskPred(GenericExperiment):
             #             # if (os.path.exists(self.results_folder + '/model/JIT_current_model-{}_epoch-{}_holdout-{}_rep-{}.pth'.format(self.exp_id, epoch-1, self.holdout_train_id, self.repetition_id))):
             #                 # os.remove(self.results_folder + '/model/JIT_current_model-{}_epoch-{}_holdout-{}_rep-{}.pth'.format(self.exp_id, epoch-1, self.holdout_train_id, self.repetition_id))
     
-        raise NotImplementedError("TODO: ADAPT TO AIIDKIT")
-
 
     def evalCurrentModel(self, dataloader, epoch):
-        # Reinitialize memory if it is a memory based model
-        self.reinitialize_memory_model()
-
         # Evaluation
-        self.models.eval()
+        self.model.eval()
         tmp_losses = {}
         tmp_preds = []
-        # IMPORTANT: HERE WE DO NOT USE WITH TORC NO GRAD AS WE NEED TO COMPUTE THE GRADIENTS FOR THE VALIDATION AND TEST LOSSES
+        # IMPORTANT: HERE WE DO NOT USE WITH TORCH NO GRAD AS WE NEED TO COMPUTE THE GRADIENTS FOR THE VALIDATION AND TEST LOSSES
         for batch in tqdm(dataloader):
             # Forward pass
             loss, preds = self.computeForwardPass(batch, epoch)
-
-            # Detach model components (memory) from the computational graph for STM models (memory components)
-            if (self.parameters_exp['model_to_use'].lower().lower() == "stm"):
-                self.models["model_node_enc"].detach()
-    
-            # Detach recurrent weights from graph to prevent backprop through time
-            if (type(self.models["model_node_enc"]) == SEIRPredictor):
-                self.models["model_node_enc"].recurrent.weight.detach_()
-            elif (type(self.models["model_node_enc"]) == SEIRPredictorDeeper):
-                self.models["model_node_enc"].recurrent_1.weight.detach_()
-                self.models["model_node_enc"].recurrent_2.weight.detach_()
-                self.models["model_node_enc"].recurrent_3.weight.detach_()
-                self.models["model_node_enc"].recurrent_4.weight.detach_()
-                self.models["model_node_enc"].recurrent_5.weight.detach_()
 
             # Add predictions and losses to list
             tmp_preds.append(preds)
@@ -455,8 +452,6 @@ class InfectionRiskPred(GenericExperiment):
                 except:
                     tmp_losses[loss_type].append(loss[loss_type])
         self.optimizer.zero_grad()
-
-        raise NotImplementedError("TODO: ADAPT TO AIIDKIT")
 
         return tmp_losses, tmp_preds
     
@@ -556,8 +551,13 @@ def main():
 
 
     # Doing holdout evaluation
-    exp.holdoutTrain(save_results=True)
-    #exp.holdoutTrain(save_results=False)
+    # Optuna or classical holdout
+    if (parameters_exp['Optimization']['Optuna']['use_optuna']):
+        exp.optuna_tunning() 
+    else:
+        # Doing holdout evaluation
+        exp.holdoutTrain(save_results=True)
+        #exp.holdoutTrain(save_results=False)
 
     # Saving the training parameters in the folder of the results
     inc = 0
@@ -576,17 +576,17 @@ def main():
         print(f"An error occurred: {e}")
 
     # Saving the python file containing the network architecture
-    if (parameters_exp['model_to_use'].lower() == "simpleheterognn"):
+    if (parameters_exp['Model']['model_to_use'].lower() == "simpleheterognn"):
         shutil.copy2('src/model/GraphBased/AiidkitTEAVGraphEmbedder.py', resultsFolder + '/model/graph_embedder_architecture.py')
         shutil.copy2('src/model/GraphBased/HeteroGNN.py', resultsFolder + '/model/architecture.py')
-    elif (parameters_exp['model_to_use'].lower() == "heterographsage"):
+    elif (parameters_exp['Model']['model_to_use'].lower() == "heterographsage"):
         shutil.copy2('src/model/GraphBased/AiidkitTEAVGraphEmbedder.py', resultsFolder + '/model/graph_embedder_architecture.py')
         shutil.copy2('src/model/GraphBased/HeteroGraphSage.py', resultsFolder + '/model/graph_classifier_architecture.py')
     else:
         raise ValueError()
     
     # Save the data distribution
-    #shutil.copy2(parameters_exp['dataset_folder'] + '/' + parameters_exp['hdf5_filename'], resultsFolder + '/params_exp/{}'.format(parameters_exp['hdf5_filename']))
+    # TODO: Copy HDF5 dataset files?
 
 
     #==========================================================================#
