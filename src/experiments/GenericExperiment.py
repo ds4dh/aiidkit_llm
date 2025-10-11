@@ -591,8 +591,8 @@ class GenericExperiment(ABC):
                 if (len(results_h5_file[f"Rep-{rep_id}"]["Preds"][data_split].keys()) > 0):
                     # Getting targets and predictions
                     targets = results_h5_file[f"Rep-{rep_id}"]["Preds"][data_split][f"Epoch-{epochs_to_use}"]['targets']
-                    if (self.num_classes > 2) or ( (self.num_classes == 2) and (self.use_evidential_learning) ):
-                        predictions = np.argmax(results_h5_file[f"Rep-{rep_id}"]["Preds"][data_split][f"Epoch-{epochs_to_use}"]['predictions'], axis=1)
+                    if (self.num_classes > 2):
+                        raise NotImplementedError("Not implemented yet, see code epidemio_informed_gnns.")
                     else:
                         predictions = results_h5_file[f"Rep-{rep_id}"]["Preds"][data_split][f"Epoch-{epochs_to_use}"]['predictions']
                     predictions_probs = results_h5_file[f"Rep-{rep_id}"]["Preds"][data_split][f"Epoch-{epochs_to_use}"]['predictions_probs']
@@ -609,7 +609,13 @@ class GenericExperiment(ABC):
                                                                                                         )
                     # AUC
                     if (self.num_classes == 2):
-                        auc = roc_auc_score(targets, predictions_probs, average="macro")
+                        if (self.use_evidential_learning):
+                            new_targets = np.zeros((targets.shape[0], 2), dtype=int)
+                            new_targets[targets[:] == 0., 0] = 1
+                            new_targets[targets[:] == 1., 1] = 1
+                            auc = roc_auc_score(new_targets, predictions_probs, average="macro")
+                        else:
+                            auc = roc_auc_score(targets, predictions_probs, average="macro")
                     else:
                         # According to Scikit-learn roc_auc_score with multi_class='ovo' and average="macro" is insensitive to class imbalance 
                         auc = roc_auc_score(targets, predictions_probs, multi_class='ovo', average="macro")

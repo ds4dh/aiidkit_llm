@@ -299,7 +299,7 @@ class InfectionRiskPred(GenericExperiment):
                     preds["aleatoric_uncert"] = aleatoric_uncert.detach().cpu().numpy()
                     preds["total_uncert"] = total_uncert.detach().cpu().numpy()
             else:
-                raise NotImplementedError("Not implemented yes, see code epidemio_informed_gnns.")
+                raise NotImplementedError("Not implemented yet, see code epidemio_informed_gnns.")
         else:
             raise ValueError(f"Combination of dataset {self.parameters_exp['Dataset']['dataset_name']} and subdataset type {self.parameters_exp['Dataset']['subdataset']} is not valid.")
 

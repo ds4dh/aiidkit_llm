@@ -25,19 +25,19 @@ Model:
   model_to_use: HeteroGraphSAGE
   hidden_channels: 16
   num_layers: 2
-  dropout: 0.1
+  dropout: 0.3131283596219851
   graph_pool_strategy: mean
   graph_pool_fusion: concatenation
 
 # Training parameters
 TrainingParams:
-  lr: 1.0e-2 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
+  lr: 0.00028280242879086747 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
   weight_decay: 1.0e-5 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
   batch_size_train: 32
   batch_size_val: 32
   batch_size_test: 32
   n_epochs: 50
-  nb_repetitions: 5
+  nb_repetitions: 10
 
 # Optimization
 Optimization:
