@@ -23,15 +23,15 @@ epochs_step_save_preds: 1
 Model:
   model_type: GNN
   model_to_use: HeteroGraphSAGE
-  hidden_channels: 16
-  num_layers: 2
-  dropout: 0.3131283596219851
+  hidden_channels: 8
+  num_layers: 4
+  dropout: 0.18990611162443552
   graph_pool_strategy: mean
   graph_pool_fusion: concatenation
 
 # Training parameters
 TrainingParams:
-  lr: 1.0e-2 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
+  lr: 0.002428561267270143
   weight_decay: 1.0e-5 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
   batch_size_train: 32
   batch_size_val: 32
@@ -49,7 +49,7 @@ Optimization:
   loss_function: EvidentialLearningLoss
   EvidentialLoss:
     lambda_evidential_sched: true
-    lambda_evidential: 1.0e-3
+    lambda_evidential:  0.003656147513211113
   EarlyStopping:
     use_early_stopping: false
     patience: 5

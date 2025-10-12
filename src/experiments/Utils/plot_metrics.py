@@ -98,6 +98,18 @@ def main():
     results_h5_file = h5py.File(results_file, 'r')
 
     #======================================================================#
+    #===========================Load params file===========================#
+    #======================================================================#
+    # Load params file to know if evidential learning was used during training
+    parameters_file = results_folder + f"/params_exp/params_0.yaml"
+    with open(parameters_file, 'r') as file:
+        params_exp = yaml.safe_load(file)
+    if (params_exp['Optimization']['loss_function'].lower() == 'evidentiallearningloss'):
+        use_evidential_learning = True 
+    else:
+        use_evidential_learning = False
+
+    #======================================================================#
     #===============================Plot loss===============================#
     #======================================================================#
     if (plot_loss):
@@ -184,9 +196,17 @@ def main():
                                                                                                         )
                     # AUC
                     if (len(N_UNIQUE_CLASSES) == 2): # Binary classification
-                        auc = roc_auc_score(targets, preds_probs, average="macro")
-                        random_preds_probs = np.random.dirichlet(alpha=np.ones(2), size=len(targets))
-                        auc_random = roc_auc_score(targets, random_preds_probs[:, 1], average="macro") 
+                        if (use_evidential_learning):
+                            new_targets = np.zeros((targets.shape[0], 2), dtype=int)
+                            new_targets[targets[:] == 0., 0] = 1
+                            new_targets[targets[:] == 1., 1] = 1
+                            auc = roc_auc_score(new_targets, preds_probs, average="macro")
+                            random_preds_probs = np.random.dirichlet(alpha=np.ones(2), size=len(targets))
+                            auc_random = roc_auc_score(new_targets, random_preds_probs, average="macro") 
+                        else:
+                            auc = roc_auc_score(targets, preds_probs, average="macro")
+                            random_preds_probs = np.random.dirichlet(alpha=np.ones(2), size=len(targets))
+                            auc_random = roc_auc_score(targets, random_preds_probs[:, 1], average="macro") 
                     else:
                         # According to Scikit-learn roc_auc_score with multi_class='ovo' and average="macro" is insensitive to class imbalance 
                         auc = roc_auc_score(targets, preds_probs, multi_class='ovo', average="macro")
@@ -249,15 +269,6 @@ def main():
     #======================================================================#
     #===========================Calibration error===========================#
     #======================================================================#
-    # Load params file to know if evidential learning was used during training
-    parameters_file = results_folder + f"/params_exp/params_0.yaml"
-    with open(parameters_file, 'r') as file:
-        params_exp = yaml.safe_load(file)
-    if (params_exp['Optimization']['loss_function'].lower() == 'evidentiallearningloss'):
-        use_evidential_learning = True 
-    else:
-        use_evidential_learning = False
-
     # Get the expected calibration error ECE
     #data_split_to_use = 'Val'
     data_split_to_use = 'Test'
