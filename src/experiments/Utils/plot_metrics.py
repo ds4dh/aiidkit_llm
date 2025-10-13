@@ -11,7 +11,6 @@ from sklearn.metrics import roc_auc_score,\
 from src.experiments.Utils.classification_metrics import get_classification_metrics,\
                                                          compute_ece
 from src.experiments.Utils.uncertainty_quantification import get_evidential_uncertainties,\
-                                                              get_uncertainties_per_rep_all_days,\
                                                               plot_metric_vs_uncertainty,\
                                                               plot_calibration_uncertainty_correctness,\
                                                               plot_calibrated_uncertainty_correctness
@@ -76,7 +75,6 @@ def main():
     # Add the arguments to the parser
     ap.add_argument('--results_folder', required=True, help="Path to the folder containing the results of the experiment", type=str)
     ap.add_argument('--plot_loss', help="Use it if want to plot the losses", action='store_true')
-    ap.add_argument('--get_metrics_per_epochs', help="Use it if want to print the metrics per epochs", action='store_true')
     ap.add_argument('--print_classification_report', help="Use it if want to print the classification report per epochs", action='store_true')
     ap.add_argument('--uncertainties', help="Use it if want to see the uncertainties of evidential learning experiments", action='store_true')
     ap.add_argument('-v', '--verbose', help="Use it to get details about the performances per epoch", action='store_true')
@@ -85,7 +83,6 @@ def main():
     # Getting the value of the arguments
     results_folder = args['results_folder']
     plot_loss = args['plot_loss']
-    get_metrics_per_epochs = args['get_metrics_per_epochs']
     print_classification_report = args['print_classification_report']
     uncertainties = args['uncertainties']
     verbose = args['verbose']
@@ -178,9 +175,9 @@ def main():
                     # Last epochs targets and preds
                     if (epoch == max(epochs_list)):
                         # States preds
-                        targets_last_epoch[rep_id][data_split] = targets
-                        preds_last_epoch[rep_id][data_split] = preds
-                        preds_probs_last_epoch[rep_id][data_split] = preds_probs
+                        targets_last_epoch[rep_id][data_split] = targets[:]
+                        preds_last_epoch[rep_id][data_split] = preds[:]
+                        preds_probs_last_epoch[rep_id][data_split] = preds_probs[:]
 
                     # Getting the metrics for the epoch
                     print(f"\n\n=========> {data_split.upper()} DATA SPLIT FOR EPOCH {epoch} <=========\n")
@@ -277,8 +274,8 @@ def main():
     #N_BINS = 15 # Finer bins give more detail but can be noisy; coarser bins are smoother but less precise.
     for rep_ID in preds_probs_last_epoch:
         ece_rep = compute_ece(
-                                    probs=preds_probs_last_epoch[rep_ID][data_split_to_use][:],
-                                    labels=targets_last_epoch[rep_ID][data_split_to_use][:],
+                                    probs=preds_probs_last_epoch[rep_ID][data_split_to_use],
+                                    labels=targets_last_epoch[rep_ID][data_split_to_use],
                                     n_bins=N_BINS,
                                     evidential=use_evidential_learning
                             )
@@ -301,112 +298,81 @@ def main():
     #======================================================================#
     if (uncertainties):
         if (use_evidential_learning):
-            raise NotImplementedError()
-        #     #======================================================================#
-        #     #==================Uncertainty PLOTS (NO CALIBRATION)==================#
-        #     #======================================================================#
-        #     # Getting the average epistemic, aleatoric and total uncertainty for the different repetitions
-        #     #data_split_to_use = 'Train' 
-        #     #data_split_to_use = 'Val' 
-        #     data_split_to_use = 'Test'
-        #     epoch_to_use = last_epoch
-        #     uncertainties_dict = get_evidential_uncertainties(
-        #                                                         h5_results_file=results_h5_file,
-        #                                                         epoch_to_use=epoch_to_use,
-        #                                                         data_split_to_use=data_split_to_use
-        #                                                     )
+            # Getting the average epistemic, aleatoric and total uncertainty for the different repetitions
+            epoch_to_use = max(epochs_list)
+            uncertainties_dict = get_evidential_uncertainties(
+                                                                h5_results_file=results_h5_file,
+                                                                epoch_to_use=epoch_to_use
+                                                            )
 
-        #     # Analyzing some uncertainties
-        #     # Min and max possible values
-        #     n_classes = len(N_UNIQUE_CLASSES)
-        #     print("\n=========> EPISTEMIC uncertainty ranges between 0 and 1")
-        #     print(f"\t=========> ALEATORIC uncertainty ranges between 0 and {np.log(n_classes)}")
-        #     print(f"\t=========> TOTAL uncertainty ranges between 0 and {np.log(n_classes)}")
+            # Analyzing some uncertainties
+            # Min and max possible values
+            n_classes = len(N_UNIQUE_CLASSES)
+            print("\n=========> EPISTEMIC uncertainty ranges between 0 and 1")
+            print(f"\t=========> ALEATORIC uncertainty ranges between 0 and {np.log(n_classes)}")
+            print(f"\t=========> TOTAL uncertainty ranges between 0 and {np.log(n_classes)}")
 
 
-        #     # Get the average uncertainties per class
-        #     # Group by class
-        #     uncert_by_class = {targ: {"Epistemic": [], "Aleatoric": [], "Total": []} for targ in np.unique(uncertainties_dict['Targets'])}
-        #     for indiv_ID in range(len(uncertainties_dict['Epistemic'])):
-        #         for rep_ID in range(len(uncertainties_dict["Epistemic"][indiv_ID])):
-        #             # Target label
-        #             target_label = uncertainties_dict["Targets"][indiv_ID][rep_ID]
+            # Get the average uncertainties per class
+            # Group by class
+            #data_split_to_use = 'Train' 
+            #data_split_to_use = 'Val' 
+            data_split_to_use = 'Test'
+            uncert_by_class = {int(targ): {"Epistemic": [ [] for _ in range(n_repetitions) ], "Aleatoric": [ [] for _ in range(n_repetitions) ], "Total": [ [] for _ in range(n_repetitions) ]} for targ in np.unique(list(uncertainties_dict['Targets'].keys()))}
+            for rep_ID in range(len(uncertainties_dict["Epistemic"])):
+                for sample_ID in range(uncertainties_dict['Targets'][rep_ID][data_split_to_use].shape[0]):
+                    # Target label
+                    target_label = int(uncertainties_dict["Targets"][rep_ID][data_split_to_use][sample_ID])
                     
-        #             # Uncertainties
-        #             uncert_by_class[target_label]["Epistemic"].append(uncertainties_dict["Epistemic"][indiv_ID][rep_ID])
-        #             uncert_by_class[target_label]["Aleatoric"].append(uncertainties_dict["Aleatoric"][indiv_ID][rep_ID])
-        #             uncert_by_class[target_label]["Total"].append(uncertainties_dict["Total"][indiv_ID][rep_ID])
+                    # Uncertainties
+                    uncert_by_class[target_label]["Epistemic"][rep_ID].append(uncertainties_dict["Epistemic"][rep_ID][data_split_to_use][sample_ID])
+                    uncert_by_class[target_label]["Aleatoric"][rep_ID].append(uncertainties_dict["Aleatoric"][rep_ID][data_split_to_use][sample_ID])
+                    uncert_by_class[target_label]["Total"][rep_ID].append(uncertainties_dict["Total"][rep_ID][data_split_to_use][sample_ID])
 
-
+            #======================================================================#
+            #==================Uncertainty PLOTS (CALIBRATION)==================#
+            #======================================================================#
+            # Parameters for ALL THE PLOTS
+            rep_ID_to_use = 0
+            #metric_to_use = "MCC"
+            #metric_to_use = "F1Score"
+            metric_to_use = "BalancedAccuracy"
+            #metric_to_use = "AUC"
+            # Plot metric vs uncertainty
+            #UNCERT_TYPE = "Epistemic"
+            #UNCERT_TYPE = "Aleatoric"
+            UNCERT_TYPE = "Total"
+            plot_metric_vs_uncertainty(
+                                        uncertainty_dict_per_rep=uncertainties_dict[UNCERT_TYPE],
+                                        targets_dict_per_rep=targets_last_epoch,
+                                        preds_dict_per_rep=preds_last_epoch,
+                                        preds_probs_dict_per_rep=preds_probs_last_epoch,
+                                        metric_to_use=metric_to_use,
+                                        rep_id=rep_ID_to_use,
+                                        data_split=data_split_to_use
+                                    )
             
-
-
-        #     #======================================================================#
-        #     #==================Uncertainty PLOTS (CALIBRATION)==================#
-        #     #======================================================================#
-        #     # Reordering the uncertainties to have one per sample as for targets and predictions of all the days in the last epoch
-        #     #data_split = "Train"
-        #     #data_split = "Val"
-        #     data_split = "Test"
-        #     epoch_to_use = max([int(epoch_str.split('-')[-1]) for epoch_str in list(results_h5_file[base_name_main_group+"0"]["Preds"][data_split].keys())])
-        #     total_uncertainties_all_days_epoch_to_use,\
-        #     alea_uncertainty_all_days_epoch_to_use,\
-        #     epi_uncertainty_all_days_epoch_to_use = get_uncertainties_per_rep_all_days(
-        #                                                                                 results_h5_file=results_h5_file,
-        #                                                                                 epoch_to_use=epoch_to_use
-        #                                                                             )
+            # Uncertainty vs Correctness
+            plot_calibration_uncertainty_correctness(
+                                                        uncertainty_dict_per_rep=uncertainties_dict[UNCERT_TYPE],
+                                                        targets_dict_per_rep=targets_last_epoch,
+                                                        preds_dict_per_rep=preds_last_epoch,
+                                                        rep_id=rep_ID_to_use,
+                                                        data_split=data_split_to_use
+                                                )
             
-        #     # Parameters for ALL THE PLOTS
-        #     rep_id = 0
-        #     #metric_to_use = "MCC"
-        #     #metric_to_use = "F1Score"
-        #     metric_to_use = "BalancedAccuracy"
-        #     #metric_to_use = "AUC"
-        #     uncertainty_all_days_per_rep = total_uncertainties_all_days_epoch_to_use
-        #     #uncertainty_all_days_per_rep = alea_uncertainty_all_days_epoch_to_use
-        #     #uncertainty_all_days_per_rep = epi_uncertainty_all_days_epoch_to_use
-        #     targets_all_days_per_rep = targets_all_days_last_epoch
-        #     preds_all_days_per_rep = preds_all_days_last_epoch
-        #     preds_probs_all_days_per_rep = preds_probs_all_days_last_epoch
-
-        #     # Plot metric vs uncertainty
-        #     plot_metric_vs_uncertainty(
-        #                                 uncertainty_all_days_per_rep=uncertainty_all_days_per_rep,
-        #                                 targets_all_days_per_rep=targets_all_days_per_rep,
-        #                                 preds_all_days_per_rep=preds_all_days_per_rep,
-        #                                 preds_probs_all_days_per_rep=preds_probs_all_days_per_rep,
-        #                                 metric_to_use=metric_to_use,
-        #                                 rep_id=rep_id,
-        #                                 data_split=data_split
-        #                             )
-            
-        #     # Uncertainty vs Correctness
-        #     plot_calibration_uncertainty_correctness(
-        #                                                 uncertainty_all_days_per_rep,
-        #                                                 targets_all_days_per_rep,
-        #                                                 preds_all_days_per_rep,
-        #                                                 rep_id,
-        #                                                 data_split
-        #                                         )
-            
-        #     # Plot calibrated uncertainty using the probability of correctness threshold
-        #     plot_calibrated_uncertainty_correctness(
-        #                                             uncertainty_all_days_per_rep=uncertainty_all_days_per_rep,
-        #                                             targets_all_days_per_rep=targets_all_days_per_rep,
-        #                                             preds_all_days_per_rep=preds_all_days_per_rep,
-        #                                             preds_probs_all_days_per_rep=preds_probs_all_days_per_rep,
-        #                                             metric_to_use=metric_to_use,
-        #                                             rep_id=rep_id,
-        #                                             data_split=data_split
-        #                                         )
-
-        # else:
-        #     print("\nUncertainty quantification can only be done for evidential learning experiments")
+            # Plot calibrated uncertainty using the probability of correctness threshold
+            plot_calibrated_uncertainty_correctness(
+                                                    uncertainty_dict_per_rep=uncertainties_dict[UNCERT_TYPE],
+                                                    targets_dict_per_rep=targets_last_epoch,
+                                                    preds_dict_per_rep=preds_last_epoch,
+                                                    preds_probs_dict_per_rep=preds_probs_last_epoch,
+                                                    metric_to_use=metric_to_use,
+                                                    rep_id=rep_ID_to_use,
+                                                    data_split=data_split_to_use
+                                                )
+        else:
+            print("\nUncertainty quantification can only be done for evidential learning experiments")
     
-    #======================================================================#
-    #========Analysis of LOCAL predicted epidemiological parameters========#
-    #======================================================================#
-    # TODO
-
 if (__name__=='__main__'):
     main()

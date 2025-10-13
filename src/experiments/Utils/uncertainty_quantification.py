@@ -1,14 +1,11 @@
 """
     Plot the metrics and results of an experiment
 """
-import os
 import h5py
 import argparse
-import pickle
+import yaml
 import numpy as np
-from tqdm import tqdm
 import matplotlib.pyplot as plt
-from scipy import stats
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import matthews_corrcoef,\
                             f1_score,\
@@ -17,96 +14,33 @@ from sklearn.metrics import matthews_corrcoef,\
 
 
 
-def get_evidential_uncertainties(h5_results_file, epoch_to_use, data_split_to_use):
+def get_evidential_uncertainties(h5_results_file, epoch_to_use):
     # Getting the average epistemic, aleatoric and total uncertainty for the different repetitions
     n_repetitions = len(h5_results_file)
-    if ("aleatoric_uncert" in h5_results_file["Rep-0"]["Preds"][data_split_to_use]["Epoch-0"]["Day-0"]):
-        n_days_split = len(h5_results_file["Rep-0"]["Preds"][data_split_to_use][f"Epoch-{epoch_to_use}"])
-        n_reps = len(h5_results_file)
-        n_individuals = len(h5_results_file["Rep-0"]["Preds"][data_split_to_use][f"Epoch-{epoch_to_use}"]["Day-0"]["aleatoric_uncert"])
-        uncertainties_dict = {
-                                'Epistemic': [ [ [None for _ in range(n_reps)] for _ in range(n_individuals)] for _ in range(n_days_split) ],
-                                'Aleatoric': [ [ [None for _ in range(n_reps)] for _ in range(n_individuals)] for _ in range(n_days_split) ],
-                                'Total': [ [ [None for _ in range(n_reps)] for _ in range(n_individuals)] for _ in range(n_days_split) ],
-                                'Targets': [ [ [None for _ in range(n_reps)] for _ in range(n_individuals)] for _ in range(n_days_split) ]
-                            }    
-        for rep_ID in range(n_repetitions):
-            for day in range(len(h5_results_file[f"Rep-{rep_ID}"]["Preds"][data_split_to_use][f"Epoch-{epoch_to_use}"])):
+    data_splits = list(h5_results_file["Rep-0"]["Preds"].keys())
+    uncertainties_dict = {
+                                'Epistemic': { rep_ID: {data_split: None for data_split in data_splits} for rep_ID in range(n_repetitions) },
+                                'Aleatoric': { rep_ID: {data_split: None for data_split in data_splits} for rep_ID in range(n_repetitions) },
+                                'Total': { rep_ID: {data_split: None for data_split in data_splits} for rep_ID in range(n_repetitions) },
+                                'Targets': { rep_ID: {data_split: None for data_split in data_splits} for rep_ID in range(n_repetitions) }
+                            }  
+    for data_split in data_splits:
+        if ("aleatoric_uncert" in h5_results_file["Rep-0"]["Preds"][data_split]["Epoch-0"]):
+            for rep_ID in range(n_repetitions):
                 # Getting the uncertainties
-                for individual_ID in range(len(h5_results_file[f"Rep-{rep_ID}"]["Preds"][data_split_to_use][f"Epoch-{epoch_to_use}"][f"Day-{day}"]['aleatoric_uncert'])):
-                    uncertainties_dict["Epistemic"][day][individual_ID][rep_ID] = h5_results_file[f"Rep-{rep_ID}"]["Preds"][data_split_to_use][f"Epoch-{epoch_to_use}"][f"Day-{day}"]['epistemic_uncert'][individual_ID]
-                    uncertainties_dict["Aleatoric"][day][individual_ID][rep_ID] = h5_results_file[f"Rep-{rep_ID}"]["Preds"][data_split_to_use][f"Epoch-{epoch_to_use}"][f"Day-{day}"]['aleatoric_uncert'][individual_ID]
-                    uncertainties_dict["Total"][day][individual_ID][rep_ID] = h5_results_file[f"Rep-{rep_ID}"]["Preds"][data_split_to_use][f"Epoch-{epoch_to_use}"][f"Day-{day}"]['total_uncert'][individual_ID]
-                    uncertainties_dict["Targets"][day][individual_ID][rep_ID] = h5_results_file[f"Rep-{rep_ID}"]["Preds"][data_split_to_use][f"Epoch-{epoch_to_use}"][f"Day-{day}"]['true_seir_states'][individual_ID]
-
+                uncertainties_dict["Epistemic"][rep_ID][data_split] = h5_results_file[f"Rep-{rep_ID}"]["Preds"][data_split][f"Epoch-{epoch_to_use}"]['epistemic_uncert'][:]
+                uncertainties_dict["Aleatoric"][rep_ID][data_split] = h5_results_file[f"Rep-{rep_ID}"]["Preds"][data_split][f"Epoch-{epoch_to_use}"]['aleatoric_uncert'][:]
+                uncertainties_dict["Total"][rep_ID][data_split] = h5_results_file[f"Rep-{rep_ID}"]["Preds"][data_split][f"Epoch-{epoch_to_use}"]['total_uncert'][:]
+                uncertainties_dict["Targets"][rep_ID][data_split] = h5_results_file[f"Rep-{rep_ID}"]["Preds"][data_split][f"Epoch-{epoch_to_use}"]['targets'][:]
+        
     return uncertainties_dict
 
 
-def get_uncertainties_per_rep_all_days(results_h5_file, epoch_to_use):
-    """
-        Get the uncertainties per repetition.
-
-        Parameters:
-        -----------
-        results_h5_file: h5py._hl.files.File
-            HDF5 file containing the results of the experiment.
-        epoch_to_use: int
-            Epoch to use to select the data.
-
-        Returns:
-        --------
-        total_uncertainties_all_days_epoch_to_use: dict
-            Dictionary containing the total uncertainty of ALL the 
-            days. The keys are the repetitions IDs and the values
-            are dicts having as keys the data splits, and as values
-            a np.ndarray containing the uncertainties for all
-            the days, for all the individuals (single dimension
-            array combining all of this information).
-        alea_uncertainty_all_days_epoch_to_use: dict
-            Dictionary containing the aleatoric uncertainty of ALL the 
-            days. The keys are the repetitions IDs and the values
-            are dicts having as keys the data splits, and as values
-            a np.ndarray containing the uncertainties for all
-            the days, for all the individuals (single dimension
-            array combining all of this information).
-        epi_uncertainty_all_days_epoch_to_use: dict
-            Dictionary containing the epistemic uncertainty of ALL the 
-            days. The keys are the repetitions IDs and the values
-            are dicts having as keys the data splits, and as values
-            a np.ndarray containing the uncertainties for all
-            the days, for all the individuals (single dimension
-            array combining all of this information).
-    """
-    data_splits = list(results_h5_file[f"Rep-0"]["Preds"].keys())
-    n_repetitions = len(results_h5_file)
-    total_uncertainties_all_days_epoch_to_use = {rep_id: {data_split:None for data_split in data_splits} for rep_id in range(n_repetitions)}
-    alea_uncertainty_all_days_epoch_to_use = {rep_id: {data_split:None for data_split in data_splits} for rep_id in range(n_repetitions)}
-    epi_uncertainty_all_days_epoch_to_use = {rep_id: {data_split:None for data_split in data_splits} for rep_id in range(n_repetitions)}
-    for rep_id in range(n_repetitions):
-        for data_split in data_splits:
-            total_uncertainty_all_days = []
-            epi_uncertainty_all_days = []
-            alea_uncertainty_all_days = []
-            n_days = len(results_h5_file[f"Rep-{rep_id}"]["Preds"][data_split][f"Epoch-{epoch_to_use}"].keys())
-            for day in range(n_days):
-                # Getting targets and predictions
-                total_uncertainty_all_days.append(results_h5_file[f"Rep-{rep_id}"]["Preds"][data_split][f"Epoch-{epoch_to_use}"][f"Day-{day}"]['total_uncert'])
-                alea_uncertainty_all_days.append(results_h5_file[f"Rep-{rep_id}"]["Preds"][data_split][f"Epoch-{epoch_to_use}"][f"Day-{day}"]['aleatoric_uncert'])
-                epi_uncertainty_all_days.append(results_h5_file[f"Rep-{rep_id}"]["Preds"][data_split][f"Epoch-{epoch_to_use}"][f"Day-{day}"]['epistemic_uncert'])
-            total_uncertainties_all_days_epoch_to_use[rep_id][data_split] = np.concatenate(total_uncertainty_all_days, axis=0)
-            alea_uncertainty_all_days_epoch_to_use[rep_id][data_split] = np.concatenate(alea_uncertainty_all_days, axis=0)
-            epi_uncertainty_all_days_epoch_to_use[rep_id][data_split] = np.concatenate(epi_uncertainty_all_days, axis=0)
-
-    return total_uncertainties_all_days_epoch_to_use,\
-           alea_uncertainty_all_days_epoch_to_use,\
-           epi_uncertainty_all_days_epoch_to_use
-
-
 def plot_metric_vs_uncertainty(
-                                uncertainty_all_days_per_rep,
-                                targets_all_days_per_rep,
-                                preds_all_days_per_rep,
-                                preds_probs_all_days_per_rep=None,
+                                uncertainty_dict_per_rep,
+                                targets_dict_per_rep,
+                                preds_dict_per_rep,
+                                preds_probs_dict_per_rep=None,
                                 metric_to_use='BalancedAccuracy',
                                 rep_id=0,
                                 data_split='Test'
@@ -118,30 +52,30 @@ def plot_metric_vs_uncertainty(
 
         Parameters:
         -----------
-        uncertainty_all_days_per_rep: dict
-            Dictionary containing the uncertainty of ALL the 
-            days. The keys are the repetitions IDs and the values
+        uncertainty_dict_per_rep: dict
+            Dictionary containing the uncertainty all the samples.
+            The keys are the repetitions IDs and the values
             are dicts having as keys the data splits, and as values
             a np.ndarray containing the uncertainties for all
             the days, for all the individuals (single dimension
             array combining all of this information).
-        targets_all_days_per_rep: dict
-            Dictionary containing the targets of ALL the 
-            days. The keys are the repetitions IDs and the values
+        targets_dict_per_rep: dict
+            Dictionary containing the targets of all the samples.
+            The keys are the repetitions IDs and the values
             are dicts having as keys the data splits, and as values
             a np.ndarray containing the uncertainties for all
             the days, for all the individuals (single dimension
             array combining all of this information).
-        preds_all_days_per_rep: dict
-            Dictionary containing the predictions of ALL the 
-            days. The keys are the repetitions IDs and the values
+        preds_dict_per_rep: dict
+            Dictionary containing the predictions of all the samples.
+            The keys are the repetitions IDs and the values
             are dicts having as keys the data splits, and as values
             a np.ndarray containing the uncertainties for all
             the days, for all the individuals (single dimension
             array combining all of this information).
-        preds_probs_all_days_per_rep: dict
-            Dictionary containing the predictions probabilities of ALL the 
-            days. The keys are the repetitions IDs and the values
+        preds_probs_dict_per_rep: dict
+            Dictionary containing the predictions probabilities of all the samples.
+            The keys are the repetitions IDs and the values
             are dicts having as keys the data splits, and as values
             a np.ndarray containing the uncertainties for all
             the days, for all the individuals (single dimension
@@ -155,10 +89,10 @@ def plot_metric_vs_uncertainty(
             Data split to use.
     """
     # Getting the useful data
-    uncertainties = uncertainty_all_days_per_rep[rep_id][data_split]
-    true_labels = targets_all_days_per_rep[rep_id][data_split]
-    predictions = preds_all_days_per_rep[rep_id][data_split]
-    predictions_probs = preds_probs_all_days_per_rep[rep_id][data_split]
+    uncertainties = uncertainty_dict_per_rep[rep_id][data_split]
+    true_labels = targets_dict_per_rep[rep_id][data_split]
+    predictions = preds_dict_per_rep[rep_id][data_split]
+    predictions_probs = preds_probs_dict_per_rep[rep_id][data_split]
     all_classes = np.unique(true_labels)
     
     # Define thresholds over uncertainty
@@ -235,9 +169,9 @@ def plot_metric_vs_uncertainty(
 
 
 def plot_calibration_uncertainty_correctness(
-                                                uncertainty_all_days_per_rep,
-                                                targets_all_days_per_rep,
-                                                preds_all_days_per_rep,
+                                                uncertainty_dict_per_rep,
+                                                targets_dict_per_rep,
+                                                preds_dict_per_rep,
                                                 rep_id,
                                                 data_split
                                            ):
@@ -248,23 +182,23 @@ def plot_calibration_uncertainty_correctness(
 
         Parameters:
         -----------
-        uncertainty_all_days_per_rep: dict
-            Dictionary containing the uncertainty of ALL the 
-            days. The keys are the repetitions IDs and the values
+        uncertainty_dict_per_rep: dict
+            Dictionary containing the uncertainty all the samples.
+            The keys are the repetitions IDs and the values
             are dicts having as keys the data splits, and as values
             a np.ndarray containing the uncertainties for all
             the days, for all the individuals (single dimension
             array combining all of this information).
-        targets_all_days_per_rep: dict
-            Dictionary containing the targets of ALL the 
-            days. The keys are the repetitions IDs and the values
+        targets_dict_per_rep: dict
+            Dictionary containing the targets of all the samples.
+            The keys are the repetitions IDs and the values
             are dicts having as keys the data splits, and as values
             a np.ndarray containing the uncertainties for all
             the days, for all the individuals (single dimension
             array combining all of this information).
-        preds_all_days_per_rep: dict
-            Dictionary containing the predictions of ALL the 
-            days. The keys are the repetitions IDs and the values
+        preds_dict_per_rep: dict
+            Dictionary containing the predictions of all the samples.
+            The keys are the repetitions IDs and the values
             are dicts having as keys the data splits, and as values
             a np.ndarray containing the uncertainties for all
             the days, for all the individuals (single dimension
@@ -275,9 +209,9 @@ def plot_calibration_uncertainty_correctness(
             Data split to use.
     """
     # Getting the data
-    uncertainties = uncertainty_all_days_per_rep[rep_id][data_split]
-    true_labels = targets_all_days_per_rep[rep_id][data_split]
-    predictions = preds_all_days_per_rep[rep_id][data_split]
+    uncertainties = uncertainty_dict_per_rep[rep_id][data_split]
+    true_labels = targets_dict_per_rep[rep_id][data_split]
+    predictions = preds_dict_per_rep[rep_id][data_split]
     correct = (predictions == true_labels).astype(int)
 
     # Plot
@@ -327,10 +261,10 @@ def plot_calibration_uncertainty_correctness(
 
 
 def plot_calibrated_uncertainty_correctness(
-                                                uncertainty_all_days_per_rep,
-                                                targets_all_days_per_rep,
-                                                preds_all_days_per_rep,
-                                                preds_probs_all_days_per_rep=None,
+                                                uncertainty_dict_per_rep,
+                                                targets_dict_per_rep,
+                                                preds_dict_per_rep,
+                                                preds_probs_dict_per_rep=None,
                                                 metric_to_use='BalancedAccuracy',
                                                 rep_id=0,
                                                 data_split='Test'
@@ -343,30 +277,30 @@ def plot_calibrated_uncertainty_correctness(
 
         Parameters:
         -----------
-        uncertainty_all_days_per_rep: dict
-            Dictionary containing the uncertainty of ALL the 
-            days. The keys are the repetitions IDs and the values
+        uncertainty_dict_per_rep: dict
+            Dictionary containing the uncertainty all the samples.
+            The keys are the repetitions IDs and the values
             are dicts having as keys the data splits, and as values
             a np.ndarray containing the uncertainties for all
             the days, for all the individuals (single dimension
             array combining all of this information).
-        targets_all_days_per_rep: dict
-            Dictionary containing the targets of ALL the 
-            days. The keys are the repetitions IDs and the values
+        targets_dict_per_rep: dict
+            Dictionary containing the targets of all the samples.
+            The keys are the repetitions IDs and the values
             are dicts having as keys the data splits, and as values
             a np.ndarray containing the uncertainties for all
             the days, for all the individuals (single dimension
             array combining all of this information).
-        preds_all_days_per_rep: dict
-            Dictionary containing the predictions of ALL the 
-            days. The keys are the repetitions IDs and the values
+        preds_dict_per_rep: dict
+            Dictionary containing the predictions of all the samples.
+            The keys are the repetitions IDs and the values
             are dicts having as keys the data splits, and as values
             a np.ndarray containing the uncertainties for all
             the days, for all the individuals (single dimension
             array combining all of this information).
-        preds_probs_all_days_per_rep: dict
-            Dictionary containing the predictions probabilities of ALL the 
-            days. The keys are the repetitions IDs and the values
+        preds_probs_dict_per_rep: dict
+            Dictionary containing the predictions probabilities of all the samples.
+            The keys are the repetitions IDs and the values
             are dicts having as keys the data splits, and as values
             a np.ndarray containing the uncertainties for all
             the days, for all the individuals (single dimension
@@ -380,10 +314,10 @@ def plot_calibrated_uncertainty_correctness(
             Data split to use.
     """
     # Step 1: Compute correctness (1 if correct, 0 if wrong)
-    uncertainties = uncertainty_all_days_per_rep[rep_id][data_split]
-    true_labels = targets_all_days_per_rep[rep_id][data_split]
-    predictions = preds_all_days_per_rep[rep_id][data_split]
-    predictions_probs = preds_probs_all_days_per_rep[rep_id][data_split]
+    uncertainties = uncertainty_dict_per_rep[rep_id][data_split]
+    true_labels = targets_dict_per_rep[rep_id][data_split]
+    predictions = preds_dict_per_rep[rep_id][data_split]
+    predictions_probs = preds_probs_dict_per_rep[rep_id][data_split]
     all_classes = np.unique(true_labels)
     correct = (predictions == true_labels).astype(int)
     
@@ -500,75 +434,68 @@ def main():
     results_file = results_folder + "/metrics/final_results_all_repetitions_0.hdf5"
     results_h5_file = h5py.File(results_file, 'r')
 
-    # Number of unique classes (necessary for performances of random classifier)
-    if ('murcia' in results_folder.lower()):
-        N_UNIQUE_CLASSES = [tmp_i for tmp_i in range(6)]
+    #======================================================================#
+    #===========================Load params file===========================#
+    #======================================================================#
+    # Load params file to know if evidential learning was used during training
+    parameters_file = results_folder + f"/params_exp/params_0.yaml"
+    with open(parameters_file, 'r') as file:
+        params_exp = yaml.safe_load(file)
+    if (params_exp['Optimization']['loss_function'].lower() == 'evidentiallearningloss'):
+        use_evidential_learning = True 
     else:
-        N_UNIQUE_CLASSES = [tmp_i for tmp_i in range(4)]
+        use_evidential_learning = False
 
-    # Opening the parameters used for this experiment
-    parameters_file = results_folder + f"/params_exp/params_0.pth"
-    with open(parameters_file, 'rb') as pf:
-        params_exp = pickle.load(pf)
-
-    # Mapping
-    if (params_exp['dataset_name'].lower() == 'sociopatterns'):
-        SUSCEPTIBLE, EXPOSED, INFECTIOUS, RECOVERED = 0, 1, 2, 3 # states of the nodes
-        MAPPING = {'S' : SUSCEPTIBLE, 'E' : EXPOSED, 'I' : INFECTIOUS, 'R' : RECOVERED}
-    elif (params_exp['dataset_name'].lower() == 'murcia'):
-        SUSCEPTIBLE, EXPOSED, INFECTIOUS, RECOVERED, DECEASED, NONSUSCEPTIBLE = 0, 1, 2, 3, 4, 5 # states of the nodes
-        MAPPING = {'S' : SUSCEPTIBLE, 'E' : EXPOSED, 'I' : INFECTIOUS, 'R' : RECOVERED, 'D': DECEASED, 'NS': NONSUSCEPTIBLE}
-    INV_MAPPING = {v: k for k, v in MAPPING.items()}
+    #======================================================================#
+    #===========================Use of multiple DS===========================#
+    #======================================================================#
+    # Getting the metrics dicts for the different losses
+    if ('Rep-0' in results_h5_file):
+        base_name_main_group = 'Rep-'
+        multiple_datasets = False
+    else:
+        base_name_main_group = 'Rep-0_Dataset-'
+        multiple_datasets = True
 
 
     #======================================================================#
     #========================Get performance metrics========================#
     #======================================================================#
-    # Getting the predictions for each epoch (concatenate days)
+    # Getting the predictions for each epoch 
     n_repetitions = len(results_h5_file)
-    epochs_list = sorted([int(epoch_str.split('-')[-1]) for epoch_str in list(results_h5_file["Rep-0"]["Preds"]["Train"].keys())])
-    targets_all_days_last_epoch = {rep_id : {data_split: None for data_split in list(results_h5_file[f"Rep-{rep_id}"]["Preds"].keys())} for rep_id in range(n_repetitions)}
-    preds_all_days_last_epoch = {rep_id : {data_split: None for data_split in list(results_h5_file[f"Rep-{rep_id}"]["Preds"].keys())} for rep_id in range(n_repetitions)}
-    preds_probs_all_days_last_epoch = {rep_id : {data_split: None for data_split in list(results_h5_file[f"Rep-{rep_id}"]["Preds"].keys())} for rep_id in range(n_repetitions)}
+    epochs_list = sorted([int(epoch_str.split('-')[-1]) for epoch_str in list(results_h5_file[base_name_main_group+"0"]["Preds"]["Train"].keys())])
+    targets_last_epoch = {rep_id : {data_split: None for data_split in list(results_h5_file[base_name_main_group+str(rep_id)]["Preds"].keys())} for rep_id in range(n_repetitions)}
+    preds_last_epoch = {rep_id : {data_split: None for data_split in list(results_h5_file[base_name_main_group+str(rep_id)]["Preds"].keys())} for rep_id in range(n_repetitions)}
+    preds_probs_last_epoch = {rep_id : {data_split: None for data_split in list(results_h5_file[base_name_main_group+str(rep_id)]["Preds"].keys())} for rep_id in range(n_repetitions)}
     for rep_id in range(n_repetitions):
-        for data_split in list(results_h5_file[f"Rep-{rep_id}"]["Preds"].keys()):
-            if (len(results_h5_file[f"Rep-{rep_id}"]["Preds"][data_split].keys()) > 0):
+        for data_split in list(results_h5_file[base_name_main_group+str(rep_id)]["Preds"].keys()):
+            if (len(results_h5_file[base_name_main_group+str(rep_id)]["Preds"][data_split].keys()) > 0):
                 for epoch in epochs_list:
-                    targets_all_days = []
-                    preds_all_days = []
-                    preds_all_days_probs = []
-                    n_days = len(results_h5_file[f"Rep-{rep_id}"]["Preds"][data_split][f"Epoch-{epoch}"].keys())
-                    for day in range(n_days):
-                        # Getting targets and predictions
-                        targets_all_days.append(results_h5_file[f"Rep-{rep_id}"]["Preds"][data_split][f"Epoch-{epoch}"][f"Day-{day}"]['true_seir_states'])
-                        preds_all_days.append(np.argmax(results_h5_file[f"Rep-{rep_id}"]["Preds"][data_split][f"Epoch-{epoch}"][f"Day-{day}"]['pred_seir_states_probs'], axis=1))
-                        preds_all_days_probs.append(results_h5_file[f"Rep-{rep_id}"]["Preds"][data_split][f"Epoch-{epoch}"][f"Day-{day}"]['pred_seir_states_probs'])
-                    targets_all_days = np.concatenate(targets_all_days, axis=0)
-                    preds_all_days = np.concatenate(preds_all_days, axis=0)
-                    preds_all_days_probs = np.concatenate(preds_all_days_probs, axis=0)
+                    # Get targets, preds and prediction scores
+                    targets = results_h5_file[base_name_main_group+str(rep_id)]['Preds'][data_split][f'Epoch-{epoch}']['targets']
+                    N_UNIQUE_CLASSES = np.unique(targets)
+                    if (len(N_UNIQUE_CLASSES) == 2): # Bianry classificaiton
+                        preds = results_h5_file[base_name_main_group+str(rep_id)]['Preds'][data_split][f'Epoch-{epoch}']['predictions']
+                    else:
+                        preds = np.argmax(results_h5_file[base_name_main_group+str(rep_id)]['Preds'][data_split][f'Epoch-{epoch}']['predictions'], axis=1)
+                    preds_probs = results_h5_file[base_name_main_group+str(rep_id)]['Preds'][data_split][f'Epoch-{epoch}']['predictions_probs']
 
                     # Last epochs targets and preds
                     if (epoch == max(epochs_list)):
-                        targets_all_days_last_epoch[rep_id][data_split] = targets_all_days
-                        preds_all_days_last_epoch[rep_id][data_split] = preds_all_days
-                        preds_probs_all_days_last_epoch[rep_id][data_split] = preds_all_days_probs
+                        # States preds
+                        targets_last_epoch[rep_id][data_split] = targets[:]
+                        preds_last_epoch[rep_id][data_split] = preds[:]
+                        preds_probs_last_epoch[rep_id][data_split] = preds_probs[:]
                     
-   #======================================================================#
-    #======================Uncertainty quantification======================#
     #======================================================================#
-    if (params_exp['loss_function'].lower() == 'evidentiallearningloss'):
-        #======================================================================#
-        #==================Uncertainty PLOTS (NO CALIBRATION)==================#
-        #======================================================================#
+    #==================Uncertainty PLOTS (NO CALIBRATION)==================#
+    #======================================================================#
+    if (use_evidential_learning):
         # Getting the average epistemic, aleatoric and total uncertainty for the different repetitions
-        #data_split_to_use = 'Train' 
-        #data_split_to_use = 'Val' 
-        data_split_to_use = 'Test'
-        epoch_to_use = last_epoch
+        epoch_to_use = max(epochs_list)
         uncertainties_dict = get_evidential_uncertainties(
                                                             h5_results_file=results_h5_file,
-                                                            epoch_to_use=epoch_to_use,
-                                                            data_split_to_use=data_split_to_use
+                                                            epoch_to_use=epoch_to_use
                                                         )
 
         # Analyzing some uncertainties
@@ -578,221 +505,65 @@ def main():
         print(f"\t=========> ALEATORIC uncertainty ranges between 0 and {np.log(n_classes)}")
         print(f"\t=========> TOTAL uncertainty ranges between 0 and {np.log(n_classes)}")
 
-        # For a given day
-        #day_to_use = 0
-        day_to_use = -1
-        # Epistemic
-        print(f"\n===>MEAN EPISTEMIC uncertainties for day {day_to_use}: {np.mean(uncertainties_dict['Epistemic'][day_to_use], axis=1)}")
-        #print(f"\t===>STD EPISTEMIC uncertainties for day {day_to_use}: {np.std(uncertainties_dict['Epistemic'][day_to_use], axis=1)}")
-        # Aleatoric
-        print(f"\n===>MEAN ALEATORIC uncertainties for day {day_to_use}: {np.mean(uncertainties_dict['Aleatoric'][day_to_use], axis=1)}")
-        #print(f"\t===>STD ALEATORIC uncertainties for day {day_to_use}: {np.std(uncertainties_dict['Aleatoric'][day_to_use], axis=1)}")
-        # Total
-        print(f"\n===>MEAN TOTAL uncertainties for day {day_to_use}: {np.mean(uncertainties_dict['Total'][day_to_use], axis=1)}")
-        #print(f"\t===>STD TOTAL uncertainties for day {day_to_use}: {np.std(uncertainties_dict['Total'][day_to_use], axis=1)}")
-    
-
-        # Comparing EPISTEMIC uncertainty for different days
-        days_compare = [0, 5, -1]
-        plt.figure()
-        for day in days_compare:
-            indiv_list = list(range(len(uncertainties_dict["Epistemic"][day])))
-            epistemic_uncert_mean = np.mean(uncertainties_dict['Epistemic'][day], axis=1)
-            epistemic_uncert_std = np.std(uncertainties_dict['Epistemic'][day], axis=1)
-            plt.scatter(indiv_list, epistemic_uncert_mean, label=f"Day-{day}")
-            #plt.plot(indiv_list, epistemic_uncert_mean, label=f"Day-{day}")
-            #plt.errorbar(indiv_list, epistemic_uncert_mean, epistemic_uncert_std, label=f"Day-{day}")
-        plt.legend()
-        plt.xlabel("Individuals")
-        plt.ylabel("Uncertainty")
-        plt.title("EPISTEMIC Uncertainty")
-        plt.show()
-
-        # Comparing ALEATORIC uncertainty for different days
-        days_compare = [0, 5, -1]
-        plt.figure()
-        for day in days_compare:
-            indiv_list = list(range(len(uncertainties_dict["Aleatoric"][day])))
-            aleatoric_uncert_mean = np.mean(uncertainties_dict['Aleatoric'][day], axis=1)
-            aleatoric_uncert_std = np.std(uncertainties_dict['Aleatoric'][day], axis=1)
-            plt.scatter(indiv_list, aleatoric_uncert_mean, label=f"Day-{day}")
-            #plt.plot(indiv_list, aleatoric_uncert_mean, label=f"Day-{day}")
-            #plt.errorbar(indiv_list, aleatoric_uncert_mean, aleatoric_uncert_std, label=f"Day-{day}")
-        plt.legend()
-        plt.xlabel("Individuals")
-        plt.ylabel("Uncertainty")
-        plt.title("ALEATORIC Uncertainty")
-        plt.show()
-
-        # Comparing TOTAL uncertainty for different days
-        days_compare = [0, 5, -1]
-        plt.figure()
-        for day in days_compare:
-            indiv_list = list(range(len(uncertainties_dict["Total"][day])))
-            total_uncert_mean = np.mean(uncertainties_dict['Total'][day], axis=1)
-            total_uncert_std = np.std(uncertainties_dict['Total'][day], axis=1)
-            plt.scatter(indiv_list, total_uncert_mean, label=f"Day-{day}")
-            #plt.plot(indiv_list, total_uncert_mean, label=f"Day-{day}")
-            #plt.errorbar(indiv_list, total_uncert_mean, total_uncert_std, label=f"Day-{day}")
-        plt.legend()
-        plt.xlabel("Individuals")
-        plt.ylabel("Uncertainty")
-        plt.title("TOTAL Uncertainty")
-        plt.show()
 
         # Get the average uncertainties per class
-        # Day to use
-        #day_to_use = 0
-        day_to_use = -1
-        #day_to_use = 10
         # Group by class
-        uncert_by_class = {targ: {"Epistemic": [], "Aleatoric": [], "Total": []} for targ in np.unique(uncertainties_dict['Targets'])}
-        for indiv_ID in range(len(uncertainties_dict['Epistemic'][day_to_use])):
-            for rep_ID in range(len(uncertainties_dict["Epistemic"][day_to_use][indiv_ID])):
+        #data_split_to_use = 'Train' 
+        #data_split_to_use = 'Val' 
+        data_split_to_use = 'Test'
+        uncert_by_class = {int(targ): {"Epistemic": [ [] for _ in range(n_repetitions) ], "Aleatoric": [ [] for _ in range(n_repetitions) ], "Total": [ [] for _ in range(n_repetitions) ]} for targ in np.unique(list(uncertainties_dict['Targets'].keys()))}
+        for rep_ID in range(len(uncertainties_dict["Epistemic"])):
+            for sample_ID in range(uncertainties_dict['Targets'][rep_ID][data_split_to_use].shape[0]):
                 # Target label
-                target_label = uncertainties_dict["Targets"][day_to_use][indiv_ID][rep_ID]
+                target_label = int(uncertainties_dict["Targets"][rep_ID][data_split_to_use][sample_ID])
                 
                 # Uncertainties
-                uncert_by_class[target_label]["Epistemic"].append(uncertainties_dict["Epistemic"][day_to_use][indiv_ID][rep_ID])
-                uncert_by_class[target_label]["Aleatoric"].append(uncertainties_dict["Aleatoric"][day_to_use][indiv_ID][rep_ID])
-                uncert_by_class[target_label]["Total"].append(uncertainties_dict["Total"][day_to_use][indiv_ID][rep_ID])
-
-
-        # Plot per class uncertaintw
-        for target_label in uncert_by_class:
-            print(f"\n\n=========> CLASS {target_label} <=========\n")
-            print(f"===>NUMBER OF SAMPLES in class {target_label} for day {day_to_use}: {len(uncert_by_class[target_label]['Epistemic'])}")
-            # Epistemic
-            print(f"\n===>MEAN EPISTEMIC uncertainties for day {day_to_use}: {np.mean(uncert_by_class[target_label]['Epistemic'])}")
-            #print(f"\t===>STD EPISTEMIC uncertainties for day {day_to_use}: {np.std(uncert_by_class[target_label]['Epistemic'])}")
-            # Aleatoric
-            print(f"\n===>MEAN ALEATORIC uncertainties for day {day_to_use}: {np.mean(uncert_by_class[target_label]['Aleatoric'])}")
-            #print(f"\t===>STD ALEATORIC uncertainties for day {day_to_use}: {np.std(uncert_by_class[target_label]['Aleatoric'])}")
-            # Total
-            print(f"\n===>MEAN TOTAL uncertainties for day {day_to_use}: {np.mean(uncert_by_class[target_label]['Total'])}")
-            #print(f"\t===>STD TOTAL uncertainties for day {day_to_use}: {np.std(uncert_by_class[target_label]['Total'])}")
-
-            # Get the average uncertainties per class
-            for day_to_use in range(len(uncertainties_dict["Epistemic"])):
-                print(f"\n\n\n===========================> DAY {day_to_use} <===========================")
-                # Group by class
-                uncert_by_class = {targ: {"Epistemic": [], "Aleatoric": [], "Total": []} for targ in np.unique(uncertainties_dict['Targets'])}
-                for indiv_ID in range(len(uncertainties_dict['Epistemic'][day_to_use])):
-                    for rep_ID in range(len(uncertainties_dict["Epistemic"][day_to_use][indiv_ID])):
-                        # Target label
-                        target_label = uncertainties_dict["Targets"][day_to_use][indiv_ID][rep_ID]           
-                        
-                        # Uncertainties
-                        uncert_by_class[target_label]["Epistemic"].append(uncertainties_dict["Epistemic"][day_to_use][indiv_ID][rep_ID])
-                        uncert_by_class[target_label]["Aleatoric"].append(uncertainties_dict["Aleatoric"][day_to_use][indiv_ID][rep_ID])
-                        uncert_by_class[target_label]["Total"].append(uncertainties_dict["Total"][day_to_use][indiv_ID][rep_ID])
-                
-                
-                # Plot per class uncertaintw
-                for target_label in uncert_by_class:
-                    print(f"\n\n=========> CLASS {target_label} <=========\n")
-                    print(f"===>NUMBER OF SAMPLES in class {target_label} for day {day_to_use}: {len(uncert_by_class[target_label]['Epistemic'])}")
-                    # Epistemic
-                    print(f"\n===>MEAN EPISTEMIC uncertainties for day {day_to_use}: {np.mean(uncert_by_class[target_label]['Epistemic'])}")
-                    #print(f"\t===>STD EPISTEMIC uncertainties for day {day_to_use}: {np.std(uncert_by_class[target_label]['Epistemic'])}")
-                    # Aleatoric
-                    print(f"\n===>MEAN ALEATORIC uncertainties for day {day_to_use}: {np.mean(uncert_by_class[target_label]['Aleatoric'])}")
-                    #print(f"\t===>STD ALEATORIC uncertainties for day {day_to_use}: {np.std(uncert_by_class[target_label]['Aleatoric'])}")
-                    # Total
-                    print(f"\n===>MEAN TOTAL uncertainties for day {day_to_use}: {np.mean(uncert_by_class[target_label]['Total'])}")
-                    #print(f"\t===>STD TOTAL uncertainties for day {day_to_use}: {np.std(uncert_by_class[target_label]['Total'])}")
-
-        # Uncertainty evolution of a patient over time
-        #node_to_use = 0
-        #n_nodes = len(uncertainties_dict["Epistemic"][0])
-        n_nodes = 3
-        #n_nodes = 10
-        for node_to_use in range(n_nodes):
-            n_days = len(uncertainties_dict["Epistemic"])
-            uncertainties_per_day_current_node = {
-                                                    "Epistemic": [-1 for _ in range(n_days)],
-                                                    "Aleatoric": [-1 for _ in range(n_days)],
-                                                    "Total": [-1 for _ in range(n_days)]
-                                                }
-            for day in range(n_days):
-                uncertainties_per_day_current_node["Epistemic"][day] = uncertainties_dict["Epistemic"][day][node_to_use]
-                uncertainties_per_day_current_node["Aleatoric"][day] = uncertainties_dict["Aleatoric"][day][node_to_use]
-                uncertainties_per_day_current_node["Total"][day] = uncertainties_dict["Total"][day][node_to_use]
-                
-                
-            plt.figure()
-            for uncert_type in uncertainties_per_day_current_node:
-                mean_uncert = [np.mean(uncertainties_per_day_current_node[uncert_type][day]) for day in range(n_days)]
-                std_uncert = [np.std(uncertainties_per_day_current_node[uncert_type][day]) for day in range(n_days)]
-                #plt.scatter(list(range(n_days)), mean_uncert, label=uncert_type)
-                #plt.plot(list(range(n_days)), mean_uncert, label=uncert_type)
-                plt.errorbar(list(range(n_days)), mean_uncert, std_uncert, label=uncert_type)
-            plt.legend()
-            plt.xlabel("Time (days)")
-            plt.ylabel("Uncertainty")
-            plt.title(f"Uncertainties for node {node_to_use}")
-            plt.show()
-
+                uncert_by_class[target_label]["Epistemic"][rep_ID].append(uncertainties_dict["Epistemic"][rep_ID][data_split_to_use][sample_ID])
+                uncert_by_class[target_label]["Aleatoric"][rep_ID].append(uncertainties_dict["Aleatoric"][rep_ID][data_split_to_use][sample_ID])
+                uncert_by_class[target_label]["Total"][rep_ID].append(uncertainties_dict["Total"][rep_ID][data_split_to_use][sample_ID])
 
         #======================================================================#
         #==================Uncertainty PLOTS (CALIBRATION)==================#
         #======================================================================#
-        # Reordering the uncertainties to have one per sample as for targets and predictions of all the days in the last epoch
-        #data_split = "Train"
-        #data_split = "Val"
-        data_split = "Test"
-        epoch_to_use = max([int(epoch_str.split('-')[-1]) for epoch_str in list(results_h5_file[base_name_main_group+"0"]["Preds"][data_split].keys())])
-        total_uncertainties_all_days_epoch_to_use,\
-        alea_uncertainty_all_days_epoch_to_use,\
-        epi_uncertainty_all_days_epoch_to_use = get_uncertainties_per_rep_all_days(
-                                                                                    results_h5_file=results_h5_file,
-                                                                                    epoch_to_use=epoch_to_use
-                                                                                )
-        
         # Parameters for ALL THE PLOTS
-        rep_id = 0
+        rep_ID_to_use = 0
         #metric_to_use = "MCC"
         #metric_to_use = "F1Score"
         metric_to_use = "BalancedAccuracy"
         #metric_to_use = "AUC"
-        uncertainty_all_days_per_rep = total_uncertainties_all_days_epoch_to_use
-        #uncertainty_all_days_per_rep = alea_uncertainty_all_days_epoch_to_use
-        #uncertainty_all_days_per_rep = epi_uncertainty_all_days_epoch_to_use
-        targets_all_days_per_rep = targets_all_days_last_epoch
-        preds_all_days_per_rep = preds_all_days_last_epoch
-        preds_probs_all_days_per_rep = preds_probs_all_days_last_epoch
-
         # Plot metric vs uncertainty
+        #UNCERT_TYPE = "Epistemic"
+        #UNCERT_TYPE = "Aleatoric"
+        UNCERT_TYPE = "Total"
         plot_metric_vs_uncertainty(
-                                    uncertainty_all_days_per_rep=uncertainty_all_days_per_rep,
-                                    targets_all_days_per_rep=targets_all_days_per_rep,
-                                    preds_all_days_per_rep=preds_all_days_per_rep,
-                                    preds_probs_all_days_per_rep=preds_probs_all_days_per_rep,
+                                    uncertainty_dict_per_rep=uncertainties_dict[UNCERT_TYPE],
+                                    targets_dict_per_rep=targets_last_epoch,
+                                    preds_dict_per_rep=preds_last_epoch,
+                                    preds_probs_dict_per_rep=preds_probs_last_epoch,
                                     metric_to_use=metric_to_use,
-                                    rep_id=rep_id,
-                                    data_split=data_split
+                                    rep_id=rep_ID_to_use,
+                                    data_split=data_split_to_use
                                 )
         
         # Uncertainty vs Correctness
         plot_calibration_uncertainty_correctness(
-                                                    uncertainty_all_days_per_rep,
-                                                    targets_all_days_per_rep,
-                                                    preds_all_days_per_rep,
-                                                    rep_id,
-                                                    data_split
+                                                    uncertainty_dict_per_rep=uncertainties_dict[UNCERT_TYPE],
+                                                    targets_dict_per_rep=targets_last_epoch,
+                                                    preds_dict_per_rep=preds_last_epoch,
+                                                    rep_id=rep_ID_to_use,
+                                                    data_split=data_split_to_use
                                             )
         
         # Plot calibrated uncertainty using the probability of correctness threshold
         plot_calibrated_uncertainty_correctness(
-                                                uncertainty_all_days_per_rep=uncertainty_all_days_per_rep,
-                                                targets_all_days_per_rep=targets_all_days_per_rep,
-                                                preds_all_days_per_rep=preds_all_days_per_rep,
-                                                preds_probs_all_days_per_rep=preds_probs_all_days_per_rep,
+                                                uncertainty_dict_per_rep=uncertainties_dict[UNCERT_TYPE],
+                                                targets_dict_per_rep=targets_last_epoch,
+                                                preds_dict_per_rep=preds_last_epoch,
+                                                preds_probs_dict_per_rep=preds_probs_last_epoch,
                                                 metric_to_use=metric_to_use,
-                                                rep_id=rep_id,
-                                                data_split=data_split
+                                                rep_id=rep_ID_to_use,
+                                                data_split=data_split_to_use
                                             )
-
     else:
         print("\nUncertainty quantification can only be done for evidential learning experiments")
 

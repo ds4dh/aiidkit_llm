@@ -1,6 +1,6 @@
 # Parameters file
 # Name of the experiment
-exp_id: "HeteroGraphSAGE_Evidential_TEAV"
+exp_id: "SimpleHeteroGNN_TEAV_OPTUNA"
 
 # Dataset to use
 Dataset:
@@ -17,41 +17,36 @@ Dataset:
 device: cuda:0
 
 # Save information
-epochs_step_save_preds: 1
+epochs_step_save_preds: 10
 
 # Architecture to use
 Model:
   model_type: GNN
-  model_to_use: HeteroGraphSAGE
-  hidden_channels: 8
-  num_layers: 4
-  dropout: 0.18990611162443552
+  model_to_use: SimpleHeteroGNN
+  hidden_channels: 16
   graph_pool_strategy: mean
   graph_pool_fusion: concatenation
 
 # Training parameters
 TrainingParams:
-  lr: 0.0016608145825101664
+  lr: 1.0e-2 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
   weight_decay: 1.0e-5 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
   batch_size_train: 32
   batch_size_val: 32
   batch_size_test: 32
-  n_epochs: 50
-  nb_repetitions: 10
+  n_epochs: 30
+  nb_repetitions: 1
 
 # Optimization
 Optimization:
   Optuna:
-    use_optuna: false
-    n_trials: 0
+    use_optuna: true
+    n_trials: 30
     optuna_starting_point_fn: null
   optimizer: Adam
-  loss_function: EvidentialLearningLoss
-  EvidentialLoss:
-    lambda_evidential_sched: true
-    lambda_evidential: 0.00010860182695486194
+  loss_function: CE
   EarlyStopping:
-    use_early_stopping: false
+    use_early_stopping: true
     patience: 5
     min_delta: 1.0e-4 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
 

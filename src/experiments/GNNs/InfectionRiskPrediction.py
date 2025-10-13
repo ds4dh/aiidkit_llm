@@ -33,6 +33,7 @@ from src.data.process.graph_patient_dataset import create_PyGeo_Graph_DS_from_HD
                                                    compute_statistics_dataset
 from src.model.GraphBased.HeteroGNN import HeteroGNN
 from src.model.GraphBased.HeteroGraphSage import HeteroGraphSage
+from src.model.GraphBased.HeteroGAT import HeteroGAT
 from src.experiments.Utils.EvidentialClassification import EvidentialClassification
 from src.experiments.Utils.tools import get_uncertainties
 
@@ -209,15 +210,16 @@ class InfectionRiskPred(GenericExperiment):
             if (self.parameters_exp['Model']['model_to_use'].lower() == "simpleheterognn"):
                 print("\n==========> Using HeteroGNN GNN <==========\n")
                 self.model = HeteroGNN(
-                                    hidden_channels=self.parameters_exp['Model']['hidden_channels'],
-                                    out_channels=self.parameters_exp['Model']['out_channels'],
-                                    possible_values_all_patients=self.possible_values_all_patients,
-                                    categorical_ent_attr_pairs=self.categorical_ent_attr_pairs,
-                                    metadata=self.train_ds[0].metadata(),
-                                    graph_pool_strategy=self.parameters_exp['Model']['graph_pool_strategy'],
-                                    graph_pool_fusion=self.parameters_exp['Model']['graph_pool_fusion'],
-                                    evidential=self.use_evidential_learning
-                                ).to(self.device)
+                                            in_channels={"central": 1, "child_cont": 9, "child_categ": 8},
+                                            hidden_channels=self.parameters_exp['Model']['hidden_channels'],
+                                            out_channels=self.parameters_exp['Model']['out_channels'],
+                                            possible_values_all_patients=self.possible_values_all_patients,
+                                            categorical_ent_attr_pairs=self.categorical_ent_attr_pairs,
+                                            metadata=self.train_ds[0].metadata(),
+                                            graph_pool_strategy=self.parameters_exp['Model']['graph_pool_strategy'],
+                                            graph_pool_fusion=self.parameters_exp['Model']['graph_pool_fusion'],
+                                            evidential=self.use_evidential_learning
+                                        ).to(self.device)
             elif (self.parameters_exp['Model']['model_to_use'].lower() == "heterographsage"):
                 print("\n==========> Using HeteroGraphSage GNN <==========\n")
                 self.model = HeteroGraphSage(
@@ -231,6 +233,25 @@ class InfectionRiskPred(GenericExperiment):
                                             metadata=self.train_ds[0].metadata(),
                                             graph_pool_strategy=self.parameters_exp['Model']['graph_pool_strategy'],
                                             graph_pool_fusion=self.parameters_exp['Model']['graph_pool_fusion'],
+                                            act='ReLU',
+                                            aggr='mean',
+                                            evidential=self.use_evidential_learning
+                                        ).to(self.device) 
+            elif (self.parameters_exp['Model']['model_to_use'].lower() == "heterogat"):
+                print("\n==========> Using HeteroGraphSage GNN <==========\n")
+                self.model = HeteroGAT(
+                                            in_channels={"central": 1, "child_cont": 9, "child_categ": 8},
+                                            hidden_channels=self.parameters_exp['Model']['hidden_channels'],
+                                            out_channels=self.parameters_exp['Model']['out_channels'],
+                                            dropout=self.parameters_exp['Model']["dropout"],
+                                            num_layers=self.parameters_exp['Model']["num_layers"],
+                                            heads=self.parameters_exp['Model']["heads"],
+                                            possible_values_all_patients=self.possible_values_all_patients,
+                                            categorical_ent_attr_pairs=self.categorical_ent_attr_pairs,
+                                            metadata=self.train_ds[0].metadata(),
+                                            graph_pool_strategy=self.parameters_exp['Model']['graph_pool_strategy'],
+                                            graph_pool_fusion=self.parameters_exp['Model']['graph_pool_fusion'],
+                                            add_self_loops=False,
                                             act='ReLU',
                                             aggr='mean',
                                             evidential=self.use_evidential_learning

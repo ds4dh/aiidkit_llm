@@ -202,6 +202,8 @@ class GenericExperiment(ABC):
             parameters_exp['TrainingParams']['lr'] = 1e-2
         if ('nb_repetitions' not in parameters_exp['TrainingParams']):
             parameters_exp['TrainingParams']['nb_repetitions'] = 1
+        if (parameters_exp['Optimization']['Optuna']['use_optuna'] and parameters_exp['TrainingParams']['nb_repetitions'] > 1):
+            raise RecursionError("When doing Optuna hyperparameter search, you cannot select mora than one repetition of a single training and evaluation")
         if ('weight_decay' not in parameters_exp['TrainingParams']):
             parameters_exp['TrainingParams']['weight_decay'] = 1e-5
         if ('batch_size_train' not in parameters_exp['TrainingParams']):
@@ -538,16 +540,17 @@ class GenericExperiment(ABC):
             self.parameters_exp['Optimization']['lambda_evidential'] = trial.suggest_float("lambda_evidential", 1e-4, 1e-1, log=True)
 
         # Define per-model hyper-parameters to tune
-        self.parameters_exp['Model']['hidden_channels'] = trial.suggest_categorical("hidden_channels", [8, 16, 32, 64])
-        #self.parameters_exp['Model']['graph_pool_strategy'] = trial.suggest_categorical("graph_pool_strategy", ["mean", "topk"])
-        self.parameters_exp['Model']['graph_pool_fusion'] = trial.suggest_categorical("graph_pool_fusion", ["stack", "concatenation"])
-        if (self.parameters_exp['Model']['model_to_use'].lower() == 'simpleheterognn'):
-            pass 
-        elif (self.parameters_exp['Model']['model_to_use'].lower() == 'heterographsage'):
-            self.parameters_exp['dropout'] = trial.suggest_float("dropout", 0.0, 0.5, log=False)
-            self.parameters_exp["num_layers"] = trial.suggest_categorical("num_layers", [1, 2, 4])
-        else:
-            raise ValueError(f"\nModel to use {self.parameters_exp['Model']['model_to_use'].lower()} is not valid for Optuna hyper-parameter tuning\n.")
+        if (not self.use_evidential_learning):
+            self.parameters_exp['Model']['hidden_channels'] = trial.suggest_categorical("hidden_channels", [8, 16, 32, 64])
+            #self.parameters_exp['Model']['graph_pool_strategy'] = trial.suggest_categorical("graph_pool_strategy", ["mean", "topk"])
+            self.parameters_exp['Model']['graph_pool_fusion'] = trial.suggest_categorical("graph_pool_fusion", ["stack", "concatenation"])
+            if (self.parameters_exp['Model']['model_to_use'].lower() == 'simpleheterognn'):
+                pass # All the parameters where already defined
+            elif (self.parameters_exp['Model']['model_to_use'].lower() == 'heterographsage'):
+                self.parameters_exp['dropout'] = trial.suggest_float("dropout", 0.0, 0.5, log=False)
+                self.parameters_exp["num_layers"] = trial.suggest_categorical("num_layers", [1, 2, 4])
+            else:
+                raise ValueError(f"\nModel to use {self.parameters_exp['Model']['model_to_use'].lower()} is not valid for Optuna hyper-parameter tuning\n.")
 
         #======================================================================#
         #==================Creating HDF5 for temporary results==================#
