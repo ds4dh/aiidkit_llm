@@ -280,7 +280,8 @@ def create_HDF5_file_graph_DS(
                                 continuous_ent_attr_pairs,
                                 categorical_ent_attr_pairs,
                                 data_split,
-                                perc_patients_keep=1.0
+                                perc_patients_keep=1.0,
+                                metadata={}
                              ):
     """
         Creates an HDF5 file with the graph structure
@@ -309,6 +310,10 @@ def create_HDF5_file_graph_DS(
             (usually 'train', 'validation', and 'test')
         perc_patients_keep: float
             Percentage of patients to keep.
+        metadata: dict
+            Dictionary containing information about the dataset that is going
+            to be stored in the HDF5 file (cuttoff days for train, cutoff 
+            days for validation and prediction horizon)
 
         Returns:
         --------
@@ -319,6 +324,8 @@ def create_HDF5_file_graph_DS(
     # HDF5 filename
     i = 0
     h5_fn = store_path + f"/AIIDKIT_TEAV_Graph_{data_split.upper()}_"
+    for key in metadata:
+        h5_fn += f"{key}-{metadata[key]}_"
     while (os.path.exists(h5_fn + str(i) + '.hdf5')):
         i += 1
     h5_fn = h5_fn + str(i) + '.hdf5'

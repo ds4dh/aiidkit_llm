@@ -549,6 +549,10 @@ class GenericExperiment(ABC):
             elif (self.parameters_exp['Model']['model_to_use'].lower() == 'heterographsage'):
                 self.parameters_exp['dropout'] = trial.suggest_float("dropout", 0.0, 0.5, log=False)
                 self.parameters_exp["num_layers"] = trial.suggest_categorical("num_layers", [1, 2, 4])
+            elif (self.parameters_exp['Model']['model_to_use'].lower() == "heterogat"):
+                self.parameters_exp['dropout'] = trial.suggest_float("dropout", 0.0, 0.5, log=False)
+                self.parameters_exp["num_layers"] = trial.suggest_categorical("num_layers", [1, 2, 4])
+                self.parameters_exp["heads"] = trial.suggest_categorical("heads", [2, 4, 8])
             else:
                 raise ValueError(f"\nModel to use {self.parameters_exp['Model']['model_to_use'].lower()} is not valid for Optuna hyper-parameter tuning\n.")
 

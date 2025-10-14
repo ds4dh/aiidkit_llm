@@ -98,6 +98,11 @@ def main():
 
     #==========================================================================#
     # Creating HDF5 file        
+    metadata = {
+                    "CutOffTrain": cutoff_days_train,
+                    "CutOffVal": cutoff_days_valid,
+                    "PredHorizon": prediction_horizon,
+                }
     for data_split in ["Train", "Validation", "Test"]:
         possible_ent_attr_pairs = list(possible_values_all_patients)
         ids_ent_attr_pairs = {possible_ent_attr_pairs[i]: i for i in range(len(possible_ent_attr_pairs))}
@@ -110,6 +115,7 @@ def main():
                                             data_split=data_split,
                                             perc_patients_keep=1,
                                             #perc_patients_keep=0.01,
+                                            metadata=metadata
                                         )
         
     #==========================================================================#

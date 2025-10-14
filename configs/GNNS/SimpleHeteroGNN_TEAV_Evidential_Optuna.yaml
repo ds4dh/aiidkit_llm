@@ -1,6 +1,6 @@
 # Parameters file
 # Name of the experiment
-exp_id: "SimpleHeteroGNN_TEAV"
+exp_id: "SimpleHeteroGNN_TEAV_Evidential_Optuna"
 
 # Dataset to use
 Dataset:
@@ -29,24 +29,27 @@ Model:
 
 # Training parameters
 TrainingParams:
-  lr: 0.001337311826973835
+  lr: 1.0e-2 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
   weight_decay: 1.0e-5 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
   batch_size_train: 32
   batch_size_val: 32
   batch_size_test: 32
   n_epochs: 50
-  nb_repetitions: 10
+  nb_repetitions: 1
 
 # Optimization
 Optimization:
   Optuna:
-    use_optuna: false
-    n_trials: 0
+    use_optuna: true
+    n_trials: 30
     optuna_starting_point_fn: null
   optimizer: Adam
-  loss_function: CE
+  loss_function: EvidentialLearningLoss
+  EvidentialLoss:
+    lambda_evidential_sched: true
+    lambda_evidential: 1.0e-3
   EarlyStopping:
-    use_early_stopping: false
+    use_early_stopping: true
     patience: 5
     min_delta: 1.0e-4 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
 

@@ -1,6 +1,6 @@
 # Parameters file
 # Name of the experiment
-exp_id: "SimpleHeteroGNN_TEAV"
+exp_id: "SimpleHeteroGNN_TEAV_Evidential"
 
 # Dataset to use
 Dataset:
@@ -17,7 +17,7 @@ Dataset:
 device: cuda:0
 
 # Save information
-epochs_step_save_preds: 10
+epochs_step_save_preds: 1
 
 # Architecture to use
 Model:
@@ -29,7 +29,7 @@ Model:
 
 # Training parameters
 TrainingParams:
-  lr: 0.001337311826973835
+  lr: TODO
   weight_decay: 1.0e-5 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
   batch_size_train: 32
   batch_size_val: 32
@@ -44,7 +44,10 @@ Optimization:
     n_trials: 0
     optuna_starting_point_fn: null
   optimizer: Adam
-  loss_function: CE
+  loss_function: EvidentialLearningLoss
+  EvidentialLoss:
+    lambda_evidential_sched: true
+    lambda_evidential: TODO
   EarlyStopping:
     use_early_stopping: false
     patience: 5
