@@ -537,7 +537,7 @@ class GenericExperiment(ABC):
         #self.parameters_exp['TrainingParams']['weight_decay'] = trial.suggest_float("weight_decay", 1e-5, 1e-1, log=True)
         #self.parameters_exp['Optimization']['optimizer'] = trial.suggest_categorical("optimizer", ["Adam", "AdamW"])
         if (self.use_evidential_learning):
-            self.parameters_exp['Optimization']['lambda_evidential'] = trial.suggest_float("lambda_evidential", 1e-4, 1e-1, log=True)
+            self.parameters_exp['Optimization']['EvidentialLoss']['lambda_evidential'] = trial.suggest_float("lambda_evidential", 1e-4, 1e-1, log=True)
 
         # Define per-model hyper-parameters to tune
         if (not self.use_evidential_learning):
@@ -547,15 +547,15 @@ class GenericExperiment(ABC):
             if (self.parameters_exp['Model']['model_to_use'].lower() == 'simpleheterognn'):
                 pass # All the parameters where already defined
             elif (self.parameters_exp['Model']['model_to_use'].lower() == 'heterographsage'):
-                self.parameters_exp['dropout'] = trial.suggest_float("dropout", 0.0, 0.5, log=False)
-                self.parameters_exp["num_layers"] = trial.suggest_categorical("num_layers", [1, 2, 4])
+                self.parameters_exp['Model']['dropout'] = trial.suggest_float("dropout", 0.0, 0.5, log=False)
+                self.parameters_exp['Model']["num_layers"] = trial.suggest_categorical("num_layers", [1, 2, 4])
             elif (self.parameters_exp['Model']['model_to_use'].lower() == "heterogat"):
-                self.parameters_exp['dropout'] = trial.suggest_float("dropout", 0.0, 0.5, log=False)
-                self.parameters_exp["num_layers"] = trial.suggest_categorical("num_layers", [1, 2, 4])
-                self.parameters_exp["heads"] = trial.suggest_categorical("heads", [2, 4, 8])
+                self.parameters_exp['Model']['dropout'] = trial.suggest_float("dropout", 0.0, 0.5, log=False)
+                self.parameters_exp['Model']["num_layers"] = trial.suggest_categorical("num_layers", [1, 2, 4])
+                self.parameters_exp['Model']["heads"] = trial.suggest_categorical("heads", [2, 4, 8])
             else:
                 raise ValueError(f"\nModel to use {self.parameters_exp['Model']['model_to_use'].lower()} is not valid for Optuna hyper-parameter tuning\n.")
-
+            
         #======================================================================#
         #==================Creating HDF5 for temporary results==================#
         #======================================================================#
@@ -684,7 +684,7 @@ class GenericExperiment(ABC):
             db_dir = Path(self.results_folder) / 'metrics'
             db_dir.mkdir(parents=True, exist_ok=True)
             storage = f"sqlite:///{db_dir / 'optuna_results.db'}"
-            study = optuna.create_study(
+            self.study = optuna.create_study(
                                             direction="maximize",
                                             study_name=f'OptunaHyperParamOptim_{self.exp_id}',
                                             sampler=optuna.samplers.TPESampler(seed=42), # Fix seed for reproducibility
@@ -693,14 +693,14 @@ class GenericExperiment(ABC):
         else: # Continue study
             print(f"\n\n=========> LOADING OPTUNA STUDY TO CONTINUE IT ({self.parameters_exp['Optimization']['Optuna']['optuna_starting_point_fn']}) <=========\n")
             optuna_study_path = Path(self.parameters_exp['Optimization']['Optuna']['optuna_starting_point_fn'])
-            study = optuna.load_study(
+            self.study = optuna.load_study(
                                         study_name=f'OptunaHyperParamOptim_{self.exp_id}',
                                         sampler=optuna.samplers.TPESampler(seed=42), # Fix seed for reproducibility
                                         storage=f"sqlite:///{optuna_study_path}"
                                     )
-        study.optimize(self.optuna_objective, n_trials=self.parameters_exp['Optimization']['Optuna']['n_trials'])
+        self.study.optimize(self.optuna_objective, n_trials=self.parameters_exp['Optimization']['Optuna']['n_trials'])
         print("Best Trial:")
-        trial = study.best_trial
+        trial = self.study.best_trial
         print(f"{self.metric_use_optuna.upper()}: {trial.value:.4f}")
         print("\tParams:")
         for key, value in trial.params.items():

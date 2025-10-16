@@ -120,10 +120,12 @@ def main():
         
     #==========================================================================#
     # Save other variables necessary to use the GNN models (possible_values_all_patients and categorical_ent_attr_pairs)
-    possible_values_all_patients_path = store_path + "/possible_values_all_patients.pkl"
+    #possible_values_all_patients_path = store_path + f"/possible_values_all_patients.pkl"
+    possible_values_all_patients_path = store_path + f"/possible_values_all_patients_CutOffTrain-{cutoff_days_train}_CutOffVal-{cutoff_days_valid}_PredHorizon-{prediction_horizon}_0.pkl"
     with open(possible_values_all_patients_path, "wb") as fp:   
         pickle.dump(possible_values_all_patients, fp)
-    categorical_ent_attr_pairs_path = store_path + "/categorical_ent_attr_pairs.pkl"
+    #categorical_ent_attr_pairs_path = store_path + f"/categorical_ent_attr_pairs.pkl"
+    categorical_ent_attr_pairs_path = store_path + f"/categorical_ent_attr_pairs_CutOffTrain-{cutoff_days_train}_CutOffVal-{cutoff_days_valid}_PredHorizon-{prediction_horizon}_0.pkl"
     with open(categorical_ent_attr_pairs_path, "wb") as fp:   #Pickling
         pickle.dump(categorical_ent_attr_pairs, fp)
 

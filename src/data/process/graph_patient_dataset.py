@@ -444,33 +444,33 @@ def create_PyGeo_Graph_DS_from_HDF5(h5_fn, label_type="infection_label_binary_ba
 
         # Central nodes
         pat_data_graph["central"].x = torch.from_numpy(hdf5_file[str_pat_ID]["central"]["x"][:])
-        pat_data_graph['central'].ent_attr_ids = torch.from_numpy(hdf5_file[str_pat_ID]["central"]["ent_attr_ids"][:])
+        pat_data_graph['central'].ent_attr_ids = torch.from_numpy(hdf5_file[str_pat_ID]["central"]["ent_attr_ids"][:]).to(torch.long)
         pat_data_graph['central'].vals = torch.from_numpy(hdf5_file[str_pat_ID]["central"]["vals"][:])
         pat_data_graph['central'].vocab_ids = torch.from_numpy(hdf5_file[str_pat_ID]["central"]["vocab_ids"][:])
         pat_data_graph['central'].days_since_tpx = torch.from_numpy(hdf5_file[str_pat_ID]["central"]["days_since_tpx"][:])
 
         # Continuous children nodes
         pat_data_graph["child_cont"].x = torch.from_numpy(hdf5_file[str_pat_ID]["child_cont"]["x"][:])
-        pat_data_graph['child_cont'].ent_attr_ids = torch.from_numpy(hdf5_file[str_pat_ID]["child_cont"]["ent_attr_ids"][:])
+        pat_data_graph['child_cont'].ent_attr_ids = torch.from_numpy(hdf5_file[str_pat_ID]["child_cont"]["ent_attr_ids"][:]).to(torch.long)
         pat_data_graph['child_cont'].vals = torch.from_numpy(hdf5_file[str_pat_ID]["child_cont"]["vals"][:])
         pat_data_graph['child_cont'].vocab_ids = torch.from_numpy(hdf5_file[str_pat_ID]["child_cont"]["vocab_ids"][:])
         pat_data_graph['child_cont'].days_since_tpx = torch.from_numpy(hdf5_file[str_pat_ID]["child_cont"]["days_since_tpx"][:])
 
         # Categorical children nodes
         pat_data_graph["child_categ"].x = torch.from_numpy(hdf5_file[str_pat_ID]["child_categ"]["x"][:])
-        pat_data_graph['child_categ'].ent_attr_ids = torch.from_numpy(hdf5_file[str_pat_ID]["child_categ"]["ent_attr_ids"][:])
+        pat_data_graph['child_categ'].ent_attr_ids = torch.from_numpy(hdf5_file[str_pat_ID]["child_categ"]["ent_attr_ids"][:]).to(torch.long)
         pat_data_graph['child_categ'].vals = torch.from_numpy(hdf5_file[str_pat_ID]["child_categ"]["vals"][:])
         pat_data_graph['child_categ'].vocab_ids = torch.from_numpy(hdf5_file[str_pat_ID]["child_categ"]["vocab_ids"][:])
         pat_data_graph['child_categ'].days_since_tpx = torch.from_numpy(hdf5_file[str_pat_ID]["child_categ"]["days_since_tpx"][:])
 
         # Central to central edges
-        pat_data_graph["central", "sequence", "central"].edge_index = torch.from_numpy(hdf5_file[str_pat_ID]["central_to_central"]["edge_index"][:])
+        pat_data_graph["central", "sequence", "central"].edge_index = torch.from_numpy(hdf5_file[str_pat_ID]["central_to_central"]["edge_index"][:]).to(torch.long)
         pat_data_graph["central", "sequence", "central"].edge_attr = torch.from_numpy(hdf5_file[str_pat_ID]["central_to_central"]["edge_attr"][:])
         # Central to central child_cont
-        pat_data_graph["central", "has_child", "child_cont"].edge_index = torch.from_numpy(hdf5_file[str_pat_ID]["central_to_child_cont"]["edge_index"][:])
+        pat_data_graph["central", "has_child", "child_cont"].edge_index = torch.from_numpy(hdf5_file[str_pat_ID]["central_to_child_cont"]["edge_index"][:]).to(torch.long)
         pat_data_graph["central", "has_child", "child_cont"].edge_attr = torch.from_numpy(hdf5_file[str_pat_ID]["central_to_child_cont"]["edge_attr"][:]).T # Transpose as should be of shape (num_features, 1) and not (1, num_features) to be able to do batching
         # Central to central child_categ
-        pat_data_graph["central", "has_child", "child_categ"].edge_index = torch.from_numpy(hdf5_file[str_pat_ID]["central_to_child_categ"]["edge_index"][:])
+        pat_data_graph["central", "has_child", "child_categ"].edge_index = torch.from_numpy(hdf5_file[str_pat_ID]["central_to_child_categ"]["edge_index"][:]).to(torch.long)
         pat_data_graph["central", "has_child", "child_categ"].edge_attr = torch.from_numpy(hdf5_file[str_pat_ID]["central_to_child_categ"]["edge_attr"][:]).T # Transpose as should be of shape (num_features, 1) and not (1, num_features) to be able to do batching
 
         # Label
