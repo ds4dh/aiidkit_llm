@@ -7,9 +7,9 @@ Dataset:
   dataset_name: AIIDKIT
   subdataset: TEAV_Static_Graph_v1
   hdf5_dataset_filename:
-    Train: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/AIIDKIT_TEAV_Graph_TRAIN_CutOffTrain-[365]_CutOffVal-[365]_PredHorizon-60_0.hdf5
-    Validation: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/AIIDKIT_TEAV_Graph_VALIDATION_CutOffTrain-[365]_CutOffVal-[365]_PredHorizon-60_0.hdf5
-    Test: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/AIIDKIT_TEAV_Graph_TEST_CutOffTrain-[365]_CutOffVal-[365]_PredHorizon-60_0.hdf5
+    Train: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/Cutoff-365/PredHorizon-60/AIIDKIT_TEAV_Graph_TRAIN_CutOffTrain-[365]_CutOffVal-[365]_PredHorizon-60_0.hdf5
+    Validation: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/Cutoff-365/PredHorizon-60/AIIDKIT_TEAV_Graph_VALIDATION_CutOffTrain-[365]_CutOffVal-[365]_PredHorizon-60_0.hdf5
+    Test: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/Cutoff-365/PredHorizon-60/AIIDKIT_TEAV_Graph_TEST_CutOffTrain-[365]_CutOffVal-[365]_PredHorizon-60_0.hdf5
   normalize_ds: true
   label_type: infection_label_binary_bacterial
 

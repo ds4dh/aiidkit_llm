@@ -7,7 +7,7 @@ Dataset:
   dataset_name: AIIDKIT
   subdataset: TEAV_Static_Graph_v1
   hdf5_dataset_filename:
-    Train: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/AIIDKIT_TEAV_Graph_TRAIN_CutOffTrain-[30]_CutOffVal-[30]_PredHorizon-30_0.hdf5
+    Train: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/Cutoff-30/PredHorizon-30/AIIDKIT_TEAV_Graph_TRAIN_CutOffTrain-[30]_CutOffVal-[30]_PredHorizon-30_0.hdf5
     Validation: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/AIIDKIT_TEAV_Graph_VALIDATION_CutOffTrain-[30]_CutOffVal-[30]_PredHorizon-30_0.hdf5
     Test: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/AIIDKIT_TEAV_Graph_TEST_CutOffTrain-[30]_CutOffVal-[30]_PredHorizon-30_0.hdf5
   normalize_ds: true
