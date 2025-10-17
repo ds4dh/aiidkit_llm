@@ -1,6 +1,6 @@
 # Parameters file
 # Name of the experiment
-exp_id: "HeteroGAT_OPTUNA_TEAV_Cutoff-0"
+exp_id: HeteroGAT_Optuna_Cutoff-0_PredHor-30
 
 # Dataset to use
 Dataset:
@@ -24,16 +24,16 @@ epochs_step_save_preds: 10
 Model:
   model_type: GNN
   model_to_use: HeteroGAT
-  hidden_channels: null
-  num_layers: null
-  heads: null
-  dropout: null
+  hidden_channels: 8
+  num_layers: 1
+  heads: 8
+  dropout: 0.09242722776276352
   graph_pool_strategy: mean
   graph_pool_fusion: concatenation
 
 # Training parameters
 TrainingParams:
-  lr: null
+  lr: 0.00012681352169084607
   weight_decay: 1.0e-5 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
   batch_size_train: 32
   batch_size_val: 32

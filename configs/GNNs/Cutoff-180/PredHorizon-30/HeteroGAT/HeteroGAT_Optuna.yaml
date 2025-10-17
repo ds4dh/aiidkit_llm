@@ -1,6 +1,6 @@
 # Parameters file
 # Name of the experiment
-exp_id: "HeteroGAT_OPTUNA_TEAV_Cutoff-180"
+exp_id: HeteroGAT_OPTUNA_TEAV_Cutoff-180_PredHor-30
 
 # Dataset to use
 Dataset:

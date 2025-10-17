@@ -1,6 +1,6 @@
 # Parameters file
 # Name of the experiment
-exp_id: "SimpleHeteroGNN_TEAV_OPTUNA_Cutoff-60"
+exp_id: SimpleHeteroGNN_TEAV_OPTUNA_Cutoff-60_PredHor-30
 
 # Dataset to use
 Dataset:
@@ -35,7 +35,7 @@ TrainingParams:
   batch_size_train: 32
   batch_size_val: 32
   batch_size_test: 32
-  n_epochs: 2
+  n_epochs: 50
   nb_repetitions: 1
 
 # Optimization

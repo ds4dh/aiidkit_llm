@@ -203,7 +203,7 @@ class GenericExperiment(ABC):
         if ('nb_repetitions' not in parameters_exp['TrainingParams']):
             parameters_exp['TrainingParams']['nb_repetitions'] = 1
         if (parameters_exp['Optimization']['Optuna']['use_optuna'] and parameters_exp['TrainingParams']['nb_repetitions'] > 1):
-            raise RecursionError("When doing Optuna hyperparameter search, you cannot select mora than one repetition of a single training and evaluation")
+            raise RecursionError("When doing Optuna hyperparameter search, you cannot select more than one repetition of a single training and evaluation")
         if ('weight_decay' not in parameters_exp['TrainingParams']):
             parameters_exp['TrainingParams']['weight_decay'] = 1e-5
         if ('batch_size_train' not in parameters_exp['TrainingParams']):
@@ -245,8 +245,12 @@ class GenericExperiment(ABC):
                     parameters_exp['Optimization']['EvidentialLoss']['lambda_evidential'] = 0
                 else:
                     parameters_exp['Optimization']['EvidentialLoss']['lambda_evidential'] = 1e-3
-            if(parameters_exp['Optimization']['EvidentialLoss']['lambda_evidential']) and (parameters_exp['Optimization']['EvidentialLoss']['lambda_evidential'] > 0):
-                print(f"\nWARNING: Trying to used both scheduling and fixed value for lambda_evidential. In this case, scheduling is used by default.")
+
+            if(parameters_exp['Optimization']['EvidentialLoss']['lambda_evidential_sched']) and (parameters_exp['Optimization']['EvidentialLoss']['lambda_evidential'] is not None):
+                if (parameters_exp['Optimization']['EvidentialLoss']['lambda_evidential'] > 0):
+                    print(f"\nWARNING: Trying to used both scheduling and fixed value for lambda_evidential. In this case, scheduling is used by default.")
+                else:
+                    parameters_exp['Optimization']['EvidentialLoss']['lambda_evidential'] = 0
             self.criterion = EvidentialClassification(lamb=parameters_exp['Optimization']['EvidentialLoss']['lambda_evidential'])
         else:
             raise ValueError(f"\nLoss function {parameters_exp['Optimization']['loss_function']} is not valid\n")
@@ -439,15 +443,21 @@ class GenericExperiment(ABC):
 
         return loss, preds
 
-    def initSingleTrain(self):
+    def initSingleTrain(self, create_new_model=True):
         """
             Initialize the parameters for a single train
         """
         # Creating the dataloaders
         self.dataloadersCreation()
 
+        # Add class weights
+        self.addClassWeightsLoss(multiclass_strategy='balanced')
+        #self.addClassWeightsLoss(multiclass_strategy='inverse')
+        #self.addClassWeightsLoss(multiclass_strategy='sqrt_inv')
+
         # Creating the model
-        self.modelCreation()
+        if (create_new_model):
+            self.modelCreation()
 
         # Creating the optimizer
         self.createOptimizer()
@@ -465,7 +475,7 @@ class GenericExperiment(ABC):
                                                     )
 
     @abstractmethod
-    def singleTrain(self, rep_ID):
+    def singleTrain(self, rep_ID, create_new_model=True):
         """
             Trains a model one time during self.parameters_exp['TrainingParams']['n_epochs'] epochs
         """
@@ -507,7 +517,7 @@ class GenericExperiment(ABC):
             print("======================================================================")
             # Doing single train
             self.repetition_id = nb_repetition
-            self.singleTrain(nb_repetition)
+            self.singleTrain(nb_repetition, create_new_model=True)
 
             # Saving the final model and the results
             # Model
@@ -576,7 +586,7 @@ class GenericExperiment(ABC):
         try:
             # Training the model
             for nb_repetition in range(self.parameters_exp['TrainingParams']['nb_repetitions']):
-                self.singleTrain(nb_repetition)
+                self.singleTrain(nb_repetition, create_new_model=True)
 
             # Load results HDF5 file
             results_h5_file = h5py.File(self.repetitions_results_fn, 'r')
@@ -653,7 +663,7 @@ class GenericExperiment(ABC):
         except Exception as e:
             print(f"Trial {trial.number} failed with error: {e}. Returning 0.0 as metric.")
 
-            raise e
+            #raise e
 
             return 0.0  # <- only works for metrics to maximize and > 0.0!
         

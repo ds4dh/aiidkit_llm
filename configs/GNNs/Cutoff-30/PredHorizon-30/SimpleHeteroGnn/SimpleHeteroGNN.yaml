@@ -1,6 +1,6 @@
 # Parameters file
 # Name of the experiment
-exp_id: "SimpleHeteroGNN_TEAV_Cutoff-30"
+exp_id: SimpleHeteroGNN_TEAV_Cutoff-30_PredHor-30
 
 # Dataset to use
 Dataset:

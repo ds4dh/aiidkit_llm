@@ -1,6 +1,6 @@
 # Parameters file
 # Name of the experiment
-exp_id: "HeteroGraphSAGE_OPTUNA_TEAV_Cutoff-0"
+exp_id: HeteroGraphSAGE_Optuna_Cutoff-0_PredHor-30
 
 # Dataset to use
 Dataset:

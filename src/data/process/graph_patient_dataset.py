@@ -337,16 +337,19 @@ def create_HDF5_file_graph_DS(
     n_patients = patients_dataset[data_split.lower()].shape[0]
     if (perc_patients_keep < 1.0):
         n_patients = int(perc_patients_keep*n_patients)
-    for pat_ID in tqdm(range(n_patients)):
+    for pat_seq_ID in tqdm(range(n_patients)):
         # Create group for the current patient
-        current_pat_group = hdf5_file.create_group(str(pat_ID))
+        current_pat_group = hdf5_file.create_group(str(pat_seq_ID))
         
         # Get data
         pat_data_dict, pat_data_dict_regrouped = get_patient_data_dicts(
-                                                                            patient_ID=pat_ID,
+                                                                            patient_ID=pat_seq_ID,
                                                                             patients_dataset=patients_dataset,
                                                                             data_split=data_split
                                                                         )
+        pat_ID = int(pat_data_dict['patient_csv_path'].split('patient_')[-1].split('.csv')[0])
+        current_pat_group.attrs['Patient_ID'] = pat_ID
+
     
         # Build HeteroData
         pat_data_graph = build_hetero_graph_without_embeddings(
@@ -434,50 +437,54 @@ def create_PyGeo_Graph_DS_from_HDF5(h5_fn, label_type="infection_label_binary_ba
 
     # Iterating over the file
     dataset = []
-    pats_ids = sorted([int(str_pat_ID) for str_pat_ID in hdf5_file]) # To iterate the patients in the same order
-    for pat_ID in tqdm(pats_ids):
-        # Transform pat_ID to string 
-        str_pat_ID = str(pat_ID)
+    pats_seqs_ids = sorted([int(str_pat_seq_ID) for str_pat_seq_ID in hdf5_file]) # To iterate the patients in the same order
+    for pat_seq_ID in tqdm(pats_seqs_ids):
+        # Transform pat_seq_ID to string 
+        str_pat_seq_ID = str(pat_seq_ID)
         
         # Create patient hetero data
         pat_data_graph = HeteroData()
 
+        # Getting the patient ID
+        pat_ID = hdf5_file[str_pat_seq_ID].attrs.get("Patient_ID")
+        pat_data_graph.pat_ID = pat_ID
+
         # Central nodes
-        pat_data_graph["central"].x = torch.from_numpy(hdf5_file[str_pat_ID]["central"]["x"][:])
-        pat_data_graph['central'].ent_attr_ids = torch.from_numpy(hdf5_file[str_pat_ID]["central"]["ent_attr_ids"][:]).to(torch.long)
-        pat_data_graph['central'].vals = torch.from_numpy(hdf5_file[str_pat_ID]["central"]["vals"][:])
-        pat_data_graph['central'].vocab_ids = torch.from_numpy(hdf5_file[str_pat_ID]["central"]["vocab_ids"][:])
-        pat_data_graph['central'].days_since_tpx = torch.from_numpy(hdf5_file[str_pat_ID]["central"]["days_since_tpx"][:])
+        pat_data_graph["central"].x = torch.from_numpy(hdf5_file[str_pat_seq_ID]["central"]["x"][:])
+        pat_data_graph['central'].ent_attr_ids = torch.from_numpy(hdf5_file[str_pat_seq_ID]["central"]["ent_attr_ids"][:]).to(torch.long)
+        pat_data_graph['central'].vals = torch.from_numpy(hdf5_file[str_pat_seq_ID]["central"]["vals"][:])
+        pat_data_graph['central'].vocab_ids = torch.from_numpy(hdf5_file[str_pat_seq_ID]["central"]["vocab_ids"][:])
+        pat_data_graph['central'].days_since_tpx = torch.from_numpy(hdf5_file[str_pat_seq_ID]["central"]["days_since_tpx"][:])
 
         # Continuous children nodes
-        pat_data_graph["child_cont"].x = torch.from_numpy(hdf5_file[str_pat_ID]["child_cont"]["x"][:])
-        pat_data_graph['child_cont'].ent_attr_ids = torch.from_numpy(hdf5_file[str_pat_ID]["child_cont"]["ent_attr_ids"][:]).to(torch.long)
-        pat_data_graph['child_cont'].vals = torch.from_numpy(hdf5_file[str_pat_ID]["child_cont"]["vals"][:])
-        pat_data_graph['child_cont'].vocab_ids = torch.from_numpy(hdf5_file[str_pat_ID]["child_cont"]["vocab_ids"][:])
-        pat_data_graph['child_cont'].days_since_tpx = torch.from_numpy(hdf5_file[str_pat_ID]["child_cont"]["days_since_tpx"][:])
+        pat_data_graph["child_cont"].x = torch.from_numpy(hdf5_file[str_pat_seq_ID]["child_cont"]["x"][:])
+        pat_data_graph['child_cont'].ent_attr_ids = torch.from_numpy(hdf5_file[str_pat_seq_ID]["child_cont"]["ent_attr_ids"][:]).to(torch.long)
+        pat_data_graph['child_cont'].vals = torch.from_numpy(hdf5_file[str_pat_seq_ID]["child_cont"]["vals"][:])
+        pat_data_graph['child_cont'].vocab_ids = torch.from_numpy(hdf5_file[str_pat_seq_ID]["child_cont"]["vocab_ids"][:])
+        pat_data_graph['child_cont'].days_since_tpx = torch.from_numpy(hdf5_file[str_pat_seq_ID]["child_cont"]["days_since_tpx"][:])
 
         # Categorical children nodes
-        pat_data_graph["child_categ"].x = torch.from_numpy(hdf5_file[str_pat_ID]["child_categ"]["x"][:])
-        pat_data_graph['child_categ'].ent_attr_ids = torch.from_numpy(hdf5_file[str_pat_ID]["child_categ"]["ent_attr_ids"][:]).to(torch.long)
-        pat_data_graph['child_categ'].vals = torch.from_numpy(hdf5_file[str_pat_ID]["child_categ"]["vals"][:])
-        pat_data_graph['child_categ'].vocab_ids = torch.from_numpy(hdf5_file[str_pat_ID]["child_categ"]["vocab_ids"][:])
-        pat_data_graph['child_categ'].days_since_tpx = torch.from_numpy(hdf5_file[str_pat_ID]["child_categ"]["days_since_tpx"][:])
+        pat_data_graph["child_categ"].x = torch.from_numpy(hdf5_file[str_pat_seq_ID]["child_categ"]["x"][:])
+        pat_data_graph['child_categ'].ent_attr_ids = torch.from_numpy(hdf5_file[str_pat_seq_ID]["child_categ"]["ent_attr_ids"][:]).to(torch.long)
+        pat_data_graph['child_categ'].vals = torch.from_numpy(hdf5_file[str_pat_seq_ID]["child_categ"]["vals"][:])
+        pat_data_graph['child_categ'].vocab_ids = torch.from_numpy(hdf5_file[str_pat_seq_ID]["child_categ"]["vocab_ids"][:])
+        pat_data_graph['child_categ'].days_since_tpx = torch.from_numpy(hdf5_file[str_pat_seq_ID]["child_categ"]["days_since_tpx"][:])
 
         # Central to central edges
-        pat_data_graph["central", "sequence", "central"].edge_index = torch.from_numpy(hdf5_file[str_pat_ID]["central_to_central"]["edge_index"][:]).to(torch.long)
-        pat_data_graph["central", "sequence", "central"].edge_attr = torch.from_numpy(hdf5_file[str_pat_ID]["central_to_central"]["edge_attr"][:])
+        pat_data_graph["central", "sequence", "central"].edge_index = torch.from_numpy(hdf5_file[str_pat_seq_ID]["central_to_central"]["edge_index"][:]).to(torch.long)
+        pat_data_graph["central", "sequence", "central"].edge_attr = torch.from_numpy(hdf5_file[str_pat_seq_ID]["central_to_central"]["edge_attr"][:])
         # Central to central child_cont
-        pat_data_graph["central", "has_child", "child_cont"].edge_index = torch.from_numpy(hdf5_file[str_pat_ID]["central_to_child_cont"]["edge_index"][:]).to(torch.long)
-        pat_data_graph["central", "has_child", "child_cont"].edge_attr = torch.from_numpy(hdf5_file[str_pat_ID]["central_to_child_cont"]["edge_attr"][:]).T # Transpose as should be of shape (num_features, 1) and not (1, num_features) to be able to do batching
+        pat_data_graph["central", "has_child", "child_cont"].edge_index = torch.from_numpy(hdf5_file[str_pat_seq_ID]["central_to_child_cont"]["edge_index"][:]).to(torch.long)
+        pat_data_graph["central", "has_child", "child_cont"].edge_attr = torch.from_numpy(hdf5_file[str_pat_seq_ID]["central_to_child_cont"]["edge_attr"][:]).T # Transpose as should be of shape (num_features, 1) and not (1, num_features) to be able to do batching
         # Central to central child_categ
-        pat_data_graph["central", "has_child", "child_categ"].edge_index = torch.from_numpy(hdf5_file[str_pat_ID]["central_to_child_categ"]["edge_index"][:]).to(torch.long)
-        pat_data_graph["central", "has_child", "child_categ"].edge_attr = torch.from_numpy(hdf5_file[str_pat_ID]["central_to_child_categ"]["edge_attr"][:]).T # Transpose as should be of shape (num_features, 1) and not (1, num_features) to be able to do batching
+        pat_data_graph["central", "has_child", "child_categ"].edge_index = torch.from_numpy(hdf5_file[str_pat_seq_ID]["central_to_child_categ"]["edge_index"][:]).to(torch.long)
+        pat_data_graph["central", "has_child", "child_categ"].edge_attr = torch.from_numpy(hdf5_file[str_pat_seq_ID]["central_to_child_categ"]["edge_attr"][:]).T # Transpose as should be of shape (num_features, 1) and not (1, num_features) to be able to do batching
 
         # Label
         try:
-            label = torch.tensor(hdf5_file[str_pat_ID][label_type][()])
+            label = torch.tensor(hdf5_file[str_pat_seq_ID][label_type][()])
         except:
-            label = torch.tensor(hdf5_file[str_pat_ID][label_type][:])
+            label = torch.tensor(hdf5_file[str_pat_seq_ID][label_type][:])
             
         pat_data_graph.y = torch.tensor(label)
 

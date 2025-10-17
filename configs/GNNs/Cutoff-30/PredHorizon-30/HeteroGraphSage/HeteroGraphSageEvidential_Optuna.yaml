@@ -1,6 +1,6 @@
 # Parameters file
 # Name of the experiment
-exp_id: "HeteroGraphSAGE_Evidential_OPTUNA_TEAV_Cutoff-30"
+exp_id: HeteroGraphSAGE_Evidential_OPTUNA_TEAV_Cutoff-30_PredHor-30
 
 # Dataset to use
 Dataset:
@@ -38,7 +38,7 @@ TrainingParams:
   batch_size_val: 32
   batch_size_test: 32
   n_epochs: 50
-  nb_repetitions: 10
+  nb_repetitions: 1
 
 # Optimization
 Optimization:

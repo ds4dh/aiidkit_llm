@@ -260,6 +260,8 @@ class InfectionRiskPred(GenericExperiment):
                                         ).to(self.device) 
             else:
                 raise ValueError("Model to use {} is not valid".format(self.parameters_exp['Model']['model_to_use']))
+            
+        print(f"\n\n =========> A NEW MODEL HAS BEEN CREATED WITH RANDOMLY INITIALIZED WEIGHTS <========= \n\n")
 
 
     def computeForwardPass(self, batch, epoch_nb, batch_ID=None):
@@ -273,9 +275,7 @@ class InfectionRiskPred(GenericExperiment):
             for edge_type, edge_index in batch.edge_index_dict.items():
                 # Ensure the tensor is integer type
                 if (batch.edge_index_dict[edge_type].dtype == torch.float32):
-                    print(f"\n\n\n\n AAAAAAAAA {batch.edge_index_dict[edge_type]} {batch.edge_index_dict[edge_type].dtype} {edge_type}\n\n\n\n")
                     batch.edge_index_dict[edge_type] = edge_index.to(torch.long)
-                    print(f"\n\n\n\n BBBBBBBBB {batch.edge_index_dict[edge_type]} {batch.edge_index_dict[edge_type].dtype} {batch.edge_index_dict[edge_type].long().dtype} {edge_type}\n\n\n\n")
 
             # Putting batch to correct device
             batch = batch.to(self.device)
@@ -338,14 +338,14 @@ class InfectionRiskPred(GenericExperiment):
         return loss, preds
 
     
-    def singleTrain(self, rep_ID):
+    def singleTrain(self, rep_ID, create_new_model=True):
         """
             Trains a model one time during self.parameters_exp['TrainingParams']['n_epochs'] epochs
         """
         # Doing all on the hdf5 files result
         with h5py.File(self.repetitions_results_fn, 'a') as h5f_rep_results:
             # Initialization
-            self.initSingleTrain()
+            self.initSingleTrain(create_new_model=create_new_model)
 
             # Data structures for the losses and predictions
             # Losses
@@ -549,11 +549,6 @@ def main():
     # Dataset Loading
     exp.createTorchDatasets()
 
-    # Add class weights
-    exp.addClassWeightsLoss(multiclass_strategy='balanced')
-    #exp.addClassWeightsLoss(multiclass_strategy='inverse')
-    #exp.addClassWeightsLoss(multiclass_strategy='sqrt_inv')
-
     # Creating directories for the trained models, the training and testing metrics
     # and the parameters of the model (i.e. the training parameters and the network
     # architecture)
@@ -625,102 +620,103 @@ def main():
     if ('Optimization' in parameters_exp):
         if ('Optuna' in parameters_exp['Optimization']):
             if ('use_optuna' in parameters_exp['Optimization']['Optuna']):
-                # Get Cutoff Value and pred Horizon
-                cutoff_val = int([el.split('-') for el in parameters_file.split('/') if 'Cutoff' in el][0][-1])
-                pred_hor_val = int([el.split('-') for el in parameters_file.split('/') if 'PredHorizon' in el][0][-1])
-                if ('Evidential_Optuna' not in parameters_file):
-                    # Getting the path of the file to modify or create
-                    # Simple holdout train (without Optuna nor Evidential Learning)
-                    simple_train_yaml = ''.join(parameters_file.split('_Optuna'))
-                    if (os.path.exists(simple_train_yaml)):
-                        with open(simple_train_yaml, "r") as file:
-                            simple_train_params = yaml.safe_load(file)  # Loads YAML as Python dict 
-                    else:
-                        simple_train_params = deepcopy(parameters_exp)
-                    # Optuna for evidential learning
-                    optuna_evidential_yaml = parameters_file.split('_Optuna')[0] + "Evidential_Optuna.yaml"
-                    if (os.path.exists(optuna_evidential_yaml)):
-                        with open(optuna_evidential_yaml, "r") as file:
-                            optuna_evidential_params = yaml.safe_load(file)  # Loads YAML as Python dict 
-                    else:
-                        optuna_evidential_params = deepcopy(parameters_exp)
-
-                    # Getting the parameters of the best trial
-                    best_params = exp.study.best_params
-                    # Define global parameters (common to all experiments)
-                    simple_train_params['TrainingParams']['lr'] = best_params['learning_rate']
-                    #simple_train_params['TrainingParams']['weight_decay'] = best_params['weight_decay']
-                    #simple_train_params['Optimization']['optimizer'] = best_params['optimizer']
-                    # Define per-model parameters
-                    if (not exp.use_evidential_learning):
-                        simple_train_params['Model']['hidden_channels'] = best_params["hidden_channels"]
-                        #simple_train_params['Model']['graph_pool_strategy'] = best_params["graph_pool_strategy"]
-                        simple_train_params['Model']['graph_pool_fusion'] = best_params["graph_pool_fusion"]
-                        if (simple_train_params['Model']['model_to_use'].lower() == 'simpleheterognn'):
-                            pass # All the parameters where already defined
-                        elif (simple_train_params['Model']['model_to_use'].lower() == 'heterographsage'):
-                            simple_train_params['Model']['dropout'] = best_params["dropout"]
-                            simple_train_params['Model']["num_layers"] = best_params["num_layers"]
-                        elif (simple_train_params['Model']['model_to_use'].lower() == "heterogat"):
-                            simple_train_params['Model']['dropout'] = best_params["dropout"]
-                            simple_train_params['Model']["num_layers"] = best_params["num_layers"]
-                            simple_train_params['Model']["heads"] = best_params["heads"]
+                if (parameters_exp['Optimization']['Optuna']['use_optuna']):
+                    # Get Cutoff Value and pred Horizon
+                    cutoff_val = int([el.split('-') for el in parameters_file.split('/') if 'Cutoff' in el][0][-1])
+                    pred_hor_val = int([el.split('-') for el in parameters_file.split('/') if 'PredHorizon' in el][0][-1])
+                    if ('Evidential_Optuna' not in parameters_file):
+                        # Getting the path of the file to modify or create
+                        # Simple holdout train (without Optuna nor Evidential Learning)
+                        simple_train_yaml = ''.join(parameters_file.split('_Optuna'))
+                        if (os.path.exists(simple_train_yaml)):
+                            with open(simple_train_yaml, "r") as file:
+                                simple_train_params = yaml.safe_load(file)  # Loads YAML as Python dict 
                         else:
-                            raise ValueError(f"\nModel to use {simple_train_params['Model']['model_to_use'].lower()} is not valid for Optuna hyper-parameter tuning\n.")    
-                    simple_train_params['Optimization']['Optuna']['use_optuna'] = False
-                    simple_train_params['Optimization']['Optuna']['optuna_starting_point_fn'] = None
-                    simple_train_params['Optimization']['EarlyStopping']['use_early_stopping'] = False
-                    simple_train_params['exp_id'] = simple_train_yaml.split('/')[-1].split('.yaml')[0] + f"_Cutoff-{cutoff_val}_PredHor-{pred_hor_val}"
-                        
-                    # Add the LR for the single train parameters
-                    optuna_evidential_params = deepcopy(simple_train_params)
-                    optuna_evidential_params['TrainingParams']['lr'] = None
-                    optuna_evidential_params['Optimization']['Optuna']['use_optuna'] = True
-                    optuna_evidential_params['Optimization']['EarlyStopping']['use_early_stopping'] = True
-                    optuna_evidential_params['Optimization']['loss_function'] = "EvidentialLearningLoss"
-                    optuna_evidential_params['Optimization']['EvidentialLoss'] = {
-                                                                                    "lambda_evidential_sched": True,
-                                                                                    "lambda_evidential": None
-                                                                                 }
+                            simple_train_params = deepcopy(parameters_exp)
+                        # Optuna for evidential learning
+                        optuna_evidential_yaml = parameters_file.split('_Optuna')[0] + "Evidential_Optuna.yaml"
+                        if (os.path.exists(optuna_evidential_yaml)):
+                            with open(optuna_evidential_yaml, "r") as file:
+                                optuna_evidential_params = yaml.safe_load(file)  # Loads YAML as Python dict 
+                        else:
+                            optuna_evidential_params = deepcopy(parameters_exp)
 
-                    optuna_evidential_params['exp_id'] = optuna_evidential_yaml.split('/')[-1].split('.yaml')[0] + f"_Cutoff-{cutoff_val}_PredHor-{pred_hor_val}"
-                    
-                    # Write back the Yaml params files
-                    # Simple holdout train (without Optuna nor Evidential Learning)
-                    with open(simple_train_yaml, "w") as file:
-                        yaml.safe_dump(simple_train_params, file)
-                    print(f"\n ===> New config file created or modified at location: {simple_train_yaml} \n")
-                    # Optuna for evidential learning
-                    with open(optuna_evidential_yaml, "w") as file:
-                        yaml.safe_dump(optuna_evidential_params, file)
-                    print(f"\n ===> New config file created or modified at location: {optuna_evidential_yaml} \n")
+                        # Getting the parameters of the best trial
+                        best_params = exp.study.best_params
+                        # Define global parameters (common to all experiments)
+                        simple_train_params['TrainingParams']['lr'] = best_params['learning_rate']
+                        #simple_train_params['TrainingParams']['weight_decay'] = best_params['weight_decay']
+                        #simple_train_params['Optimization']['optimizer'] = best_params['optimizer']
+                        # Define per-model parameters
+                        if (not exp.use_evidential_learning):
+                            simple_train_params['Model']['hidden_channels'] = best_params["hidden_channels"]
+                            #simple_train_params['Model']['graph_pool_strategy'] = best_params["graph_pool_strategy"]
+                            simple_train_params['Model']['graph_pool_fusion'] = best_params["graph_pool_fusion"]
+                            if (simple_train_params['Model']['model_to_use'].lower() == 'simpleheterognn'):
+                                pass # All the parameters where already defined
+                            elif (simple_train_params['Model']['model_to_use'].lower() == 'heterographsage'):
+                                simple_train_params['Model']['dropout'] = best_params["dropout"]
+                                simple_train_params['Model']["num_layers"] = best_params["num_layers"]
+                            elif (simple_train_params['Model']['model_to_use'].lower() == "heterogat"):
+                                simple_train_params['Model']['dropout'] = best_params["dropout"]
+                                simple_train_params['Model']["num_layers"] = best_params["num_layers"]
+                                simple_train_params['Model']["heads"] = best_params["heads"]
+                            else:
+                                raise ValueError(f"\nModel to use {simple_train_params['Model']['model_to_use'].lower()} is not valid for Optuna hyper-parameter tuning\n.")    
+                        simple_train_params['Optimization']['Optuna']['use_optuna'] = False
+                        simple_train_params['Optimization']['Optuna']['optuna_starting_point_fn'] = None
+                        simple_train_params['Optimization']['EarlyStopping']['use_early_stopping'] = False
+                        simple_train_params['exp_id'] = simple_train_yaml.split('/')[-1].split('.yaml')[0] + f"_Cutoff-{cutoff_val}_PredHor-{pred_hor_val}"
+                            
+                        # Add the LR for the single train parameters
+                        optuna_evidential_params = deepcopy(simple_train_params)
+                        optuna_evidential_params['TrainingParams']['lr'] = None
+                        optuna_evidential_params['Optimization']['Optuna']['use_optuna'] = True
+                        optuna_evidential_params['Optimization']['EarlyStopping']['use_early_stopping'] = True
+                        optuna_evidential_params['Optimization']['loss_function'] = "EvidentialLearningLoss"
+                        optuna_evidential_params['Optimization']['EvidentialLoss'] = {
+                                                                                        "lambda_evidential_sched": True,
+                                                                                        "lambda_evidential": None
+                                                                                    }
+
+                        optuna_evidential_params['exp_id'] = optuna_evidential_yaml.split('/')[-1].split('.yaml')[0] + f"_Cutoff-{cutoff_val}_PredHor-{pred_hor_val}"
                         
-                else:
-                    # Getting the path of the file to modify or create
-                    # Simple holdout train (without Optuna but with Evidential Learning)
-                    simple_evidential_train_yaml = ''.join(parameters_file.split('_Optuna'))
-                    if (os.path.exists(simple_evidential_train_yaml)):
-                        with open(simple_evidential_train_yaml, "r") as file:
-                            simple_evidential_train_params = yaml.safe_load(file)  # Loads YAML as Python dict 
+                        # Write back the Yaml params files
+                        # Simple holdout train (without Optuna nor Evidential Learning)
+                        with open(simple_train_yaml, "w") as file:
+                            yaml.safe_dump(simple_train_params, file)
+                        print(f"\n ===> New config file created or modified at location: {simple_train_yaml} \n")
+                        # Optuna for evidential learning
+                        with open(optuna_evidential_yaml, "w") as file:
+                            yaml.safe_dump(optuna_evidential_params, file)
+                        print(f"\n ===> New config file created or modified at location: {optuna_evidential_yaml} \n")
+                            
                     else:
-                        simple_evidential_train_params = deepcopy(parameters_exp)
+                        # Getting the path of the file to modify or create
+                        # Simple holdout train (without Optuna but with Evidential Learning)
+                        simple_evidential_train_yaml = ''.join(parameters_file.split('_Optuna'))
+                        if (os.path.exists(simple_evidential_train_yaml)):
+                            with open(simple_evidential_train_yaml, "r") as file:
+                                simple_evidential_train_params = yaml.safe_load(file)  # Loads YAML as Python dict 
+                        else:
+                            simple_evidential_train_params = deepcopy(parameters_exp)
 
-                    # Getting the parameters of the best trial
-                    best_params = exp.study.best_params
-                    # Define global parameters (common to all experiments)
-                    simple_evidential_train_params['TrainingParams']['lr'] = best_params['learning_rate']
-                    #simple_evidential_train_params['TrainingParams']['weight_decay'] = best_params['weight_decay']
-                    #simple_evidential_train_params['Optimization']['optimizer'] = best_params['optimizer']
-                    simple_evidential_train_params['Optimization']['EvidentialLoss']['lambda_evidential'] = best_params['lambda_evidential']
-                    simple_evidential_train_params['Optimization']['Optuna']['use_optuna'] = False
-                    simple_evidential_train_params['Optimization']['Optuna']['optuna_starting_point_fn'] = None
-                    simple_evidential_train_params['Optimization']['EarlyStopping']['use_early_stopping'] = False
-                    simple_evidential_train_params['exp_id'] = simple_evidential_train_yaml.split('/')[-1].split('.yaml')[0] + f"_Cutoff-{cutoff_val}_PredHor-{pred_hor_val}"
+                        # Getting the parameters of the best trial
+                        best_params = exp.study.best_params
+                        # Define global parameters (common to all experiments)
+                        simple_evidential_train_params['TrainingParams']['lr'] = best_params['learning_rate']
+                        #simple_evidential_train_params['TrainingParams']['weight_decay'] = best_params['weight_decay']
+                        #simple_evidential_train_params['Optimization']['optimizer'] = best_params['optimizer']
+                        simple_evidential_train_params['Optimization']['EvidentialLoss']['lambda_evidential'] = best_params['lambda_evidential']
+                        simple_evidential_train_params['Optimization']['Optuna']['use_optuna'] = False
+                        simple_evidential_train_params['Optimization']['Optuna']['optuna_starting_point_fn'] = None
+                        simple_evidential_train_params['Optimization']['EarlyStopping']['use_early_stopping'] = False
+                        simple_evidential_train_params['exp_id'] = simple_evidential_train_yaml.split('/')[-1].split('.yaml')[0] + f"_Cutoff-{cutoff_val}_PredHor-{pred_hor_val}"
 
-                    # Write back the Yaml params files
-                    with open(simple_evidential_train_yaml, "w") as file:
-                        yaml.safe_dump(simple_evidential_train_params, file)
-                    print(f"\n ===> New config file created or modified at location: {simple_evidential_train_yaml} \n")
+                        # Write back the Yaml params files
+                        with open(simple_evidential_train_yaml, "w") as file:
+                            yaml.safe_dump(simple_evidential_train_params, file)
+                        print(f"\n ===> New config file created or modified at location: {simple_evidential_train_yaml} \n")
 
 
 
