@@ -163,21 +163,33 @@ class InfectionRiskPred(GenericExperiment):
         elif (self.use_evidential_learning):
             self.criterion = EvidentialClassification(lamb=self. parameters_exp['Optimization']['EvidentialLoss']['lambda_evidential'], class_weights=self.class_weights_to_use)
     
-    def normalizeDataset(self):
+    def computeTrainDSStatistics(self):
         """
-            Normalize the dataset by substracting the mean and dividing by
-            the std
+            Computes the train DS statistics used to normalize the datasets
         """
         if (self.parameters_exp['Dataset']['dataset_name'].lower() == 'aiidkit') and\
             (self.parameters_exp['Dataset']['subdataset'].lower() == 'teav_static_graph_v1'):
                 # Compute statistics on the training dataset
-                train_statistics = compute_statistics_dataset(self.train_ds)
+                self.train_statistics = compute_statistics_dataset(self.train_ds)
+        else:
+            raise ValueError(f"Combination of dataset {self.parameters_exp['Dataset']['dataset_name']} and subdataset type {self.parameters_exp['Dataset']['subdataset']} is not valid.")
+
+
+    def normalizeDataset(self):
+        """
+            Computes the statistics necessary to normalize the dataset.
+        """
+        print(f"\n\n==========> NORMALIZING DATASETS <==========\n")
+        if (self.parameters_exp['Dataset']['dataset_name'].lower() == 'aiidkit') and\
+            (self.parameters_exp['Dataset']['subdataset'].lower() == 'teav_static_graph_v1'):
+                # Compute statistics on the training dataset
+                self.computeTrainDSStatistics()
 
                 # Normalize datasets
-                self.train_ds = normalize_dataset(dataset=self.train_ds, statistics=train_statistics)
+                self.train_ds = normalize_dataset(dataset=self.train_ds, statistics=self.train_statistics)
                 if (len(self.val_ds) > 0):
-                    self.val_ds = normalize_dataset(dataset=self.val_ds, statistics=train_statistics)
-                self.test_ds = normalize_dataset(dataset=self.test_ds, statistics=train_statistics)
+                    self.val_ds = normalize_dataset(dataset=self.val_ds, statistics=self.train_statistics)
+                self.test_ds = normalize_dataset(dataset=self.test_ds, statistics=self.train_statistics)
         else:
             raise ValueError(f"Combination of dataset {self.parameters_exp['Dataset']['dataset_name']} and subdataset type {self.parameters_exp['Dataset']['subdataset']} is not valid.")
 
@@ -555,10 +567,6 @@ def main():
     os.mkdir(resultsFolder + '/model/')
     os.mkdir(resultsFolder + '/params_exp/')
     os.mkdir(resultsFolder + '/metrics/')
-
-    # Normalizing the dataset
-    #exp.computeDatasetMeanStd()
-    #exp.normalizeDataset()
 
     # Saving the training parameters in the folder of the results
     inc = 0

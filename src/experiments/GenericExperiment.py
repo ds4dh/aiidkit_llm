@@ -7,9 +7,8 @@
     be generic.
 """
 import os
-import pickle
+import yaml
 from abc import ABC, abstractmethod
-from datetime import datetime
 from tqdm import tqdm
 from random import shuffle
 from pathlib import Path
@@ -170,7 +169,8 @@ class GenericExperiment(ABC):
         # Parameter to know if we have to normalize or not the dataset
         if ("normalize_ds" not in parameters_exp['Dataset']):
             parameters_exp['Dataset']['normalize_ds'] = False
-        self.normalize_ds = parameters_exp['Dataset']['normalize_ds']
+        self.are_DS_normalized = False
+        
             
                 
         # Optuna params
@@ -333,10 +333,17 @@ class GenericExperiment(ABC):
         pass
 
     @abstractmethod
+    def computeTrainDSStatistics(self):
+        """
+            Computes the train DS statistics used to normalize the datasets
+        """
+        # TODO
+        raise NotImplementedError()
+
+    @abstractmethod
     def normalizeDataset(self):
         """
-            Normalize the dataset by substracting the mean and dividing by
-            the std
+            Computes the statistics necessary to normalize the dataset.
         """
         # TODO
         raise NotImplementedError()
@@ -447,6 +454,11 @@ class GenericExperiment(ABC):
         """
             Initialize the parameters for a single train
         """
+        # Normalize the datasets
+        if (not self.are_DS_normalized):
+            self.normalizeDataset()
+            self.are_DS_normalized = True
+
         # Creating the dataloaders
         self.dataloadersCreation()
 
@@ -702,12 +714,20 @@ class GenericExperiment(ABC):
                                         )
         else: # Continue study
             print(f"\n\n=========> LOADING OPTUNA STUDY TO CONTINUE IT ({self.parameters_exp['Optimization']['Optuna']['optuna_starting_point_fn']}) <=========\n")
+            # Getting the path of the study file
             optuna_study_path = Path(self.parameters_exp['Optimization']['Optuna']['optuna_starting_point_fn'])
+            # Getting the name of the study
+            tmp_params_file = '/'.join(self.parameters_exp['Optimization']['Optuna']['optuna_starting_point_fn'].split('/')[:-2]) + '/params_exp/params_beginning_0.yaml'
+            with open(tmp_params_file, 'r') as file:
+                tmp_params_exp = yaml.safe_load(file)
+                tmp_exp_id = tmp_params_exp['exp_id']
+            study_name = f'OptunaHyperParamOptim_{tmp_exp_id}'
             self.study = optuna.load_study(
-                                        study_name=f'OptunaHyperParamOptim_{self.exp_id}',
-                                        sampler=optuna.samplers.TPESampler(seed=42), # Fix seed for reproducibility
-                                        storage=f"sqlite:///{optuna_study_path}"
-                                    )
+                                            study_name=study_name,
+                                            sampler=optuna.samplers.TPESampler(seed=42), # Fix seed for reproducibility
+                                            storage=f"sqlite:///{optuna_study_path}"
+                                        )
+        self.normalized_ds = False
         self.study.optimize(self.optuna_objective, n_trials=self.parameters_exp['Optimization']['Optuna']['n_trials'])
         print("Best Trial:")
         trial = self.study.best_trial

@@ -543,6 +543,9 @@ def normalize_dataset(dataset, statistics):
         # For times between measurments (central to central edge attribute) we to Log transform + standarziation or min-max
         normalized_hetero_graph[('central', 'sequence', 'central')].edge_attr = (torch.log(normalized_hetero_graph[('central', 'sequence', 'central')].edge_attr + 1) - statistics["central_to_central_edge_attr"]["LogMin"])/(statistics["central_to_central_edge_attr"]["LogMax"] - statistics["central_to_central_edge_attr"]["LogMin"])
 
+        # Data origin (necessary for replay CL)
+        normalized_hetero_graph.data_origin = 'dataset'
+
         # Adding the normalized hetero graph into the new list of normalized graphs
         normalized_dataset.append(normalized_hetero_graph)
 
@@ -585,7 +588,10 @@ def compute_statistics_dataset(dataset):
     for hetero_graph in tqdm(dataset):
         # Getting the values of the features that we want to normalize
         # Central nodes
-        central_nodes_x_list.extend(hetero_graph['central'].x.cpu().numpy().squeeze().tolist())
+        if (type(hetero_graph['central'].x.cpu().numpy().squeeze().tolist()) == float):
+            central_nodes_x_list.append(hetero_graph['central'].x.cpu().numpy().squeeze().tolist())
+        else:
+            central_nodes_x_list.extend(hetero_graph['central'].x.cpu().numpy().squeeze().tolist())
         # Children with continuous/float values
         # IMPORTANT: for child_cont_nodes_vals_list we do append as we are going to normalize PER FEATURE and each value is a different feature
         # Values 
@@ -606,7 +612,10 @@ def compute_statistics_dataset(dataset):
         # Children with categorical values
         child_categ_nodes_days_since_tpx_list.extend(hetero_graph['child_categ'].days_since_tpx.cpu().numpy().squeeze().tolist()) 
         # Edges between central nodes
-        central_to_central_edge_attr_list.extend(hetero_graph[('central', 'sequence', 'central')].edge_attr.cpu().numpy().squeeze().tolist())
+        if (type(hetero_graph[('central', 'sequence', 'central')].edge_attr.cpu().numpy().squeeze().tolist()) == int):
+            central_to_central_edge_attr_list.append(hetero_graph[('central', 'sequence', 'central')].edge_attr.cpu().numpy().squeeze().tolist())
+        else:
+            central_to_central_edge_attr_list.extend(hetero_graph[('central', 'sequence', 'central')].edge_attr.cpu().numpy().squeeze().tolist())
 
     # Transform into np.array
     central_nodes_x_list = np.array(central_nodes_x_list)
@@ -631,6 +640,6 @@ def compute_statistics_dataset(dataset):
     statistics["child_cont_nodes_days_since_tpx"] = {"Min": np.min(child_cont_nodes_days_since_tpx_list), "Max": np.max(child_cont_nodes_days_since_tpx_list), "Mean": np.mean(child_cont_nodes_days_since_tpx_list), "Std": np.std(child_cont_nodes_days_since_tpx_list)}
     statistics["child_categ_nodes_days_since_tpx"] = {"Min": np.min(child_categ_nodes_days_since_tpx_list), "Max": np.max(child_categ_nodes_days_since_tpx_list), "Mean": np.mean(child_categ_nodes_days_since_tpx_list), "Std": np.std(child_categ_nodes_days_since_tpx_list)}
     statistics["central_to_central_edge_attr"] = {"Min": np.min(central_to_central_edge_attr_list), "Max": np.max(central_to_central_edge_attr_list), "Mean": np.mean(central_to_central_edge_attr_list), "Std": np.std(central_to_central_edge_attr_list)}
-    statistics["central_to_central_edge_attr"] = {"LogMin": np.min(np.log(central_to_central_edge_attr_list+1)), "LogMax": np.max(np.log(central_to_central_edge_attr_list+1)), "LogMean": np.mean(np.log(central_to_central_edge_attr_list+1)), "LogStd": np.std(np.log(central_to_central_edge_attr_list+1))}
+    statistics["central_to_central_edge_attr"] = {"LogMin": np.min(np.log(central_to_central_edge_attr_list + 1 + 1e-6)), "LogMax": np.max(np.log(central_to_central_edge_attr_list + 1 + 1e-6)), "LogMean": np.mean(np.log(central_to_central_edge_attr_list + 1 + 1e-6)), "LogStd": np.std(np.log(central_to_central_edge_attr_list + 1 + 1e-6))}
 
     return statistics

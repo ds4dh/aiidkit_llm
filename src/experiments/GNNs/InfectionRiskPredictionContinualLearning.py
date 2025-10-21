@@ -78,13 +78,29 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
             #self.parameters_exp['incremental_ds_strategy'] = 'EqualNoPatients'
             self.parameters_exp['incremental_ds_strategy'] = 'FirstDSHalfPatients'
 
+        # Parameters for continual learning
+        if ('ContinualLearning' not in self.parameters_exp):
+            self.parameters_exp['ContinualLearning'] = {
+                                                            'replay': False,
+                                                            'memory_capacity': 0
+                                                       }
+
         # Parameters for the replay-based strategy
         self.memory = None   
-        if ('replay_CL' not in self.parameters_exp):
-            self.parameters_exp['replay_CL'] = False 
-        if (self.parameters_exp['replay_CL']):
-            if ('memory_capacity' not in self.parameters_exp):
-                self.parameters_exp['memory_capacity'] = 100
+        if ('replay' not in self.parameters_exp['ContinualLearning']):
+            self.parameters_exp['ContinualLearning']['replay'] = False
+        if (self.parameters_exp['ContinualLearning']['replay']):
+            # Memory capacity
+            if ('memory_capacity' not in self.parameters_exp['ContinualLearning']):
+                self.parameters_exp['ContinualLearning']['memory_capacity'] = 100
+            # Replay strategy
+            if ('replay_strategy' not in self.parameters_exp['ContinualLearning']):
+                self.parameters_exp['ContinualLearning']['replay_strategy'] = None
+            # Weights of the losses
+            if ('lambda_dataset' not in self.parameters_exp['ContinualLearning']):
+                self.parameters_exp['ContinualLearning']['lambda_dataset'] = 1
+            if ('lambda_replay' not in self.parameters_exp['ContinualLearning']):
+                self.parameters_exp['ContinualLearning']['lambda_replay'] = 1e-1
 
 
     def createIncrementalDatasets(self):
@@ -99,9 +115,15 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
                 - FirstDSHalfPatients : In this case, the first dataset contain half of the total training patients and the
                 rest of the datasets contain the same number of patients.
         """
+        #====================================================================================================#
+        #====================================================================================================#
         # Creating full datasets
         self.createTorchDatasets()
         self.full_train_ds = deepcopy(self.train_ds)
+
+        # Create a copy of the val and test datasets (as normalization changes over time)
+        self.raw_val_ds = deepcopy(self.val_ds)
+        self.raw_test_ds = deepcopy(self.test_ds)
 
         # Getting the patients IDs
         patients_IDs = []
@@ -129,6 +151,8 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
                 if (pat_seq_graph.pat_ID in pats_IDs_per_DS[DS_ID]):
                     self.train_incremental_ds[DS_ID].append(deepcopy(pat_seq_graph))
 
+        #====================================================================================================#
+        #====================================================================================================#
         # Print number of patients and samples per DS
         n_DS = len(self.train_incremental_ds)
         for DS_ID in range(n_DS):
@@ -138,136 +162,429 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
             # Number of samples
             n_samples_in_current_DS = len(self.train_incremental_ds[DS_ID])
             print(f"\t=========> In DS {DS_ID} there are {n_samples_in_current_DS} samples")
-
-        # Sanity check: the number of different patients and their IDs in each dataset of self.train_incremental_ds should be the same as pats_IDs_per_DS
-        for DS_ID in range(self.parameters_exp['n_incrementa_ds']):
-            # Getting the patients IDs in the dataset
-            tmp_pats_IDs = []
+            # Number of samples per class
+            n_samples_per_class_current_DS = {}
             for pat_seq_graph in self.train_incremental_ds[DS_ID]:
-                tmp_pats_IDs.append(int(pat_seq_graph.pat_ID))
-            tmp_pats_IDs = np.array(tmp_pats_IDs)
-            print(f"\n=========> In DS {DS_ID} there are {len(tmp_pats_IDs)} patients (computed using self.train_incremental_ds[{DS_ID}])")
-            print(f"\t=========> Same patients IDs in pats_IDs_per_DS[{DS_ID}] and self.train_incremental_ds[{DS_ID}]: {np.array_equal(np.unique(pats_IDs_per_DS[DS_ID]), np.unique(tmp_pats_IDs))}")
+                tmp_class = int(pat_seq_graph.y)
+                if (tmp_class not in n_samples_per_class_current_DS):
+                    n_samples_per_class_current_DS[tmp_class] = 0
+                n_samples_per_class_current_DS[tmp_class] += 1
+            print(f"\t=========> In DS {DS_ID} there are:")
+            for tmp_class in n_samples_per_class_current_DS:
+                print(f"\t===> {n_samples_per_class_current_DS[tmp_class]} samples of class {tmp_class}")
 
-        
+        # # Sanity check: the number of different patients and their IDs in each dataset of self.train_incremental_ds should be the same as pats_IDs_per_DS
+        # for DS_ID in range(self.parameters_exp['n_incrementa_ds']):
+        #     # Getting the patients IDs in the dataset
+        #     tmp_pats_IDs = []
+        #     for pat_seq_graph in self.train_incremental_ds[DS_ID]:
+        #         tmp_pats_IDs.append(int(pat_seq_graph.pat_ID))
+        #     tmp_pats_IDs = np.array(tmp_pats_IDs)
+        #     print(f"\n=========> In DS {DS_ID} there are {len(tmp_pats_IDs)} patients (computed using self.train_incremental_ds[{DS_ID}])")
+        #     print(f"\t=========> Same patients IDs in pats_IDs_per_DS[{DS_ID}] and self.train_incremental_ds[{DS_ID}]: {np.array_equal(np.unique(pats_IDs_per_DS[DS_ID]), np.unique(tmp_pats_IDs))}")
+
     
     def addClassWeightsLoss(self, multiclass_strategy='balanced'):
         """
             Compute class weights and redefines the loss function using
             these class weights to handle imbalanced classes.
         """
-        # TODO: SHOULD BE COMPUTE USING THE MEMORY + THE CURRENT TRAIN DATASET
-        # TODO: IMPORTANT: have a list of training datasets. THEN, the class weights
-        # TODO: IMPORTANT: should be recomputed for each dataset !
-        raise NotImplementedError()
+        # Get the current training dataset
+        self.createCombinedTrainingDS()
 
-    def normalizeDataset(self):
+        # Get class weights and new losses for the current training dataset
+        super().addClassWeightsLoss(multiclass_strategy='balanced')
+
+
+    def computeTrainDSStatistics(self):
         """
-            Normalize the dataset by substracting the mean and dividing by
-            the std
+            Computes the statistics necessary to normalize the dataset.
+            IMPORTANT: In a continual learning setting, we do not have access
+            to all the data at once. Therefore, we cannot compute the global 
+            statistics of the datasets at once.
+            Instead we propose to compute Online normalization statistics
+            as the new data arrive, and do a replay-buffer (memory) aided
+            normalization.
         """
-        # TODO: BE CAREFUL TO NOT NORMALIZE USING THE FULL DATASET !
-        # TODO: IS IT POSSIBLE TO UPDATE THE STATISTICS USED FOR NORMALIZATION OVER THE DATASETS ???
-        raise NotImplementedError()
-    
-    def memory_update(self):
+        print(f"\n\n==========> NORMALIZING DATASETS <==========\n")
+        if (self.parameters_exp['Dataset']['dataset_name'].lower() == 'aiidkit') and\
+            (self.parameters_exp['Dataset']['subdataset'].lower() == 'teav_static_graph_v1'):
+                # Compute statistics on the current incremental dataset                    
+                current_combined_DS_statistics = compute_statistics_dataset(self.train_ds) # Normally, here the train_ds is the combination of the memory and current incremental DS (if the memory is empty, it is only the current incremental DS)
+                self.n_seen_samples += len(self.train_ds)
+                if (self.train_statistics is None):
+                    self.train_statistics = current_combined_DS_statistics
+                else:
+                    # Updating the statistics per feature
+                    for feature_type in self.train_statistics:
+                        # Number of features in the current DS
+                        n_current_samples = len(self.train_ds)
+
+                        # Update the global statistics
+                        if ('Mean' in current_combined_DS_statistics[feature_type]) or ('LogMean' in current_combined_DS_statistics[feature_type]):
+                            try:
+                                # Mean
+                                new_mean = ( self.n_seen_samples * self.train_statistics[feature_type]['Mean'] + n_current_samples*current_combined_DS_statistics['Mean'] ) / (self.n_seen_samples + n_current_samples)
+                                # Std
+                                new_std = (
+                                            self.n_seen_samples*(self.train_statistics[feature_type]['Std'] + (self.train_statistics[feature_type]['Mean'] - new_mean)**2) + n_current_samples*(current_combined_DS_statistics['Std'] + (current_combined_DS_statistics['Mean'] - new_mean)**2)
+                                        ) / (self.n_seen_samples + n_current_samples)
+                                # Min
+                                new_min = min(self.train_statistics[feature_type]['Min'], current_combined_DS_statistics['Min'])
+                                # Max
+                                new_max = min(self.train_statistics[feature_type]['Max'], current_combined_DS_statistics['Max'])
+                            except:
+                                pass
+                        
+
+                            # Particular case of central_to_central_edge_attr where we also have to compute the min, max, mean, and std of the logs
+                            try:
+                                # Log Mean
+                                new_log_mean = ( self.n_seen_samples * self.train_statistics[feature_type]['LogMean'] + n_current_samples*current_combined_DS_statistics['LogMean'] ) / (self.n_seen_samples + n_current_samples)
+                                # Log Std
+                                new_log_std = (
+                                            self.n_seen_samples*(self.train_statistics[feature_type]['LogStd'] + (self.train_statistics[feature_type]['LogMean'] - new_mean)**2) + n_current_samples*(current_combined_DS_statistics['LogStd'] + (current_combined_DS_statistics['LogMean'] - new_mean)**2)
+                                        ) / (self.n_seen_samples + n_current_samples)
+                                # Log Min
+                                new_log_min = min(self.train_statistics[feature_type]['LogMin'], current_combined_DS_statistics['LogMin'])
+                                # Log Max
+                                new_log_max = min(self.train_statistics[feature_type]['LogMax'], current_combined_DS_statistics['LogMax'])
+                            
+                                # Update the with the new values
+                                self.train_statistics[feature_type]['LogMean'] = new_log_mean
+                                self.train_statistics[feature_type]['LogStd'] = new_log_std
+                                self.train_statistics[feature_type]['LogMin'] = new_log_min
+                                self.train_statistics[feature_type]['LogMax'] = new_log_max
+                            except:
+                                pass
+
+
+                            # Update with the new values
+                            try:
+                                self.train_statistics[feature_type]['Mean'] = new_mean
+                                self.train_statistics[feature_type]['Std'] = new_std
+                                self.train_statistics[feature_type]['Min'] = new_min
+                                self.train_statistics[feature_type]['Max'] = new_max
+                            except:
+                                pass
+                    else:
+                        # We do what we do before for each subfeature
+                        for tmp_cont_feat_id in current_combined_DS_statistics[feature_type]:
+                            try:
+                                # Mean
+                                new_mean = ( self.n_seen_samples * self.train_statistics[feature_type][tmp_cont_feat_id]['Mean'] + n_current_samples*current_combined_DS_statistics[tmp_cont_feat_id]['Mean'] ) / (self.n_seen_samples + n_current_samples)
+                                # Std
+                                new_std = (
+                                            self.n_seen_samples*(self.train_statistics[feature_type][tmp_cont_feat_id]['Std'] + (self.train_statistics[feature_type][tmp_cont_feat_id]['Mean'] - new_mean)**2) + n_current_samples*(current_combined_DS_statistics[tmp_cont_feat_id]['Std'] + (current_combined_DS_statistics[tmp_cont_feat_id]['Mean'] - new_mean)**2)
+                                        ) / (self.n_seen_samples + n_current_samples)
+                                # Min
+                                new_min = min(self.train_statistics[feature_type][tmp_cont_feat_id]['Min'], current_combined_DS_statistics[tmp_cont_feat_id]['Min'])
+                                # Max
+                                new_max = min(self.train_statistics[feature_type][tmp_cont_feat_id]['Max'], current_combined_DS_statistics[tmp_cont_feat_id]['Max'])
+                            except:
+                                pass
+                        
+
+                            # Particular case of central_to_central_edge_attr where we also have to compute the min, max, mean, and std of the logs
+                            try:
+                                # Log Mean
+                                new_log_mean = ( self.n_seen_samples * self.train_statistics[feature_type][tmp_cont_feat_id]['LogMean'] + n_current_samples*current_combined_DS_statistics[tmp_cont_feat_id]['LogMean'] ) / (self.n_seen_samples + n_current_samples)
+                                # Log Std
+                                new_log_std = (
+                                            self.n_seen_samples*(self.train_statistics[feature_type][tmp_cont_feat_id]['LogStd'] + (self.train_statistics[feature_type][tmp_cont_feat_id]['LogMean'] - new_mean)**2) + n_current_samples*(current_combined_DS_statistics[tmp_cont_feat_id]['LogStd'] + (current_combined_DS_statistics[tmp_cont_feat_id]['LogMean'] - new_mean)**2)
+                                        ) / (self.n_seen_samples + n_current_samples)
+                                # Log Min
+                                new_log_min = min(self.train_statistics[feature_type][tmp_cont_feat_id]['LogMin'], current_combined_DS_statistics[tmp_cont_feat_id]['LogMin'])
+                                # Log Max
+                                new_log_max = min(self.train_statistics[feature_type][tmp_cont_feat_id]['LogMax'], current_combined_DS_statistics[tmp_cont_feat_id]['LogMax'])
+                            
+                                # Update the with the new values
+                                self.train_statistics[feature_type][tmp_cont_feat_id]['LogMean'] = new_log_mean
+                                self.train_statistics[feature_type][tmp_cont_feat_id]['LogStd'] = new_log_std
+                                self.train_statistics[feature_type][tmp_cont_feat_id]['LogMin'] = new_log_min
+                                self.train_statistics[feature_type][tmp_cont_feat_id]['LogMax'] = new_log_max
+                            except:
+                                pass
+
+
+                            # Update with the new values
+                            try:
+                                self.train_statistics[feature_type][tmp_cont_feat_id]['Mean'] = new_mean
+                                self.train_statistics[feature_type][tmp_cont_feat_id]['Std'] = new_std
+                                self.train_statistics[feature_type][tmp_cont_feat_id]['Min'] = new_min
+                                self.train_statistics[feature_type][tmp_cont_feat_id]['Max'] = new_max
+                            except:
+                                pass
+
+        else:
+            raise ValueError(f"Combination of dataset {self.parameters_exp['Dataset']['dataset_name']} and subdataset type {self.parameters_exp['Dataset']['subdataset']} is not valid.")
+
+    def memoryUpdate(self):
         """
-            Updates the memory for a replay-based CL experiment
+            Updates the memory for a replay-based CL experiment.
+            IMPORTANT: The memory stores the raw samples, not the normalized ones, as they are going to 
+            be normalized in the combined dataset.
         """
-        raise NotImplementedError()
+        if (self.parameters_exp['ContinualLearning']['replay']):
+            # Initialize memory if necessary
+            if (self.memory is None):
+                self.memory = {}
+            # Add samples if the memory is not full
+            if (len(self.memory) < self.parameters_exp['ContinualLearning']['memory_capacity']):
+                # Iterating over the sample in the current incremental dataset
+                for i in range(len(self.train_ds)):
+                    # Getting the original sample (not the normalized one as it is going to be re-normalized with the updated statistics in the next round)
+                    sample = self.train_ds[i]
+                    ID_in_origin = self.train_samples_IDs_in_origin[i]
+
+                    # Getting the origin
+                    sample_origin = sample.data_origin
+
+                    # Getting the original sample
+                    if (sample_origin == 'dataset'):
+                        original_sample = self.train_incremental_ds[self.current_DS_ID][ID_in_origin]
+                        self.memory[len(self.memory)] = deepcopy(original_sample) # len(self.memory) is always the ID of the last sample as the memory increases
+            else:
+                if (self.parameters_exp['ContinualLearning']['replay_strategy'] is None):
+                    self.memory = {}
+                elif (self.parameters_exp['ContinualLearning']['replay_strategy'].lower() == 'random'):
+                    # Iterating over the sample in the current incremental dataset
+                    for i in range(len(self.train_ds)):
+                        # Getting the original sample (not the normalized one as it is going to be re-normalized with the updated statistics in the next round)
+                        sample = self.train_ds[i]
+                        ID_in_origin = self.train_samples_IDs_in_origin[i]
+
+                        # Getting the origin
+                        sample_origin = sample.data_origin
+
+                        # Getting the original sample
+                        if (sample_origin == 'dataset'):
+                            original_sample = self.train_incremental_ds[self.current_DS_ID][ID_in_origin]
+                        elif (sample_origin == 'memory'):
+                            original_sample = self.memory[ID_in_origin]
+                        
+                        # If it is a new sample, we randomly decide to add it or not to the memory
+                        if (sample_origin == 'dataset'):
+                            if (np.random.random() < 0.5):
+                                # Randomly choose a sample in memory to remove
+                                list_mem_samples_IDs = list(self.memory.keys())
+                                sample_ID_memory_remove = np.random.choice(list_mem_samples_IDs)
+                                self.memory[sample_ID_memory_remove] = deepcopy(original_sample)
+
+
+                elif (self.parameters_exp['ContinualLearning']['replay_strategy'].lower() == 'sims'):
+                    pass
+                    # TODO
+                    raise NotImplementedError()
+                elif (self.parameters_exp['ContinualLearning']['replay_strategy'].lower() == 'simsmodel'):
+                    pass
+                    # TODO
+                    raise NotImplementedError()
+                else:
+                    raise ValueError(f"Replay strategy {self.parameters_exp['ContinualLearning']['replay_strategy']} is not valid.")
+        else:
+            self.memory = {}
+            
+        # TODO: FIND A WAY TO TRACK MEMORY TO SEE IF WE CAN SEE THE CATASTROPHIC FORGETTING IN THE MEMORY???
+
+    def createCombinedTrainingDS(self):
+        """
+            Combines the current available training data with the data in the memory to 
+            create the current training DS. It stores the origin of the data to be able
+            to weight the different losses.
+        """
+        #======================================================================#
+        # Current training DS
+        self.train_ds = []
+
+        # Ids of the samples in their original dataset or memory
+        self.train_samples_IDs_in_origin = []
+
+
+        # Iterating over the samples in the current incremental DS
+        for tmp_sample_ID in range(len(self.train_incremental_ds[self.current_DS_ID])):
+            tmp_sample = self.train_incremental_ds[self.current_DS_ID][tmp_sample_ID]
+            sample_to_add = deepcopy(tmp_sample)
+            sample_to_add.data_origin = "dataset"
+            self.train_ds.append(sample_to_add)
+            self.train_samples_IDs_in_origin.append(tmp_sample_ID)
+
+        # Iterating over the samples in the memory
+        if (self.memory is not None):
+            for tmp_sample_ID in self.memory:
+                sample_to_add = self.memory[tmp_sample_ID]
+                sample_to_add.data_origin = "memory"
+                self.train_ds.append(deepcopy(sample_to_add))
+                self.train_samples_IDs_in_origin.append(tmp_sample_ID)
+
+
+
+        # Mix the samples
+        tmp_idx_train_samples = [i for i in range(len(self.train_ds))]
+        shuffle(tmp_idx_train_samples)
+        self.train_ds = [self.train_ds[i] for i in tmp_idx_train_samples]
+        self.train_samples_IDs_in_origin = [self.train_samples_IDs_in_origin[i] for i in tmp_idx_train_samples]
+
+        #======================================================================#
+        # Get the original unnormalized validation and test datasets as they 
+        # are going to be re-normalized with the updated statistics
+        self.val_ds = self.raw_val_ds
+        self.test_ds = self.raw_test_ds
+        
     
 
     def computeForwardPass(self, batch, epoch_nb, batch_ID=None):
-        # TODO: adapt to create and update the memory
-        # TODO: CREATE A CHECKPOING EACH TIME A NEW DATASET IS INTRODUCED AND AN OLD ONE DISAPPEARS 
-        # TODO: to be able to follow the evolution of the performance over the datasets.
-        raise NotImplementedError()
-        # #======================================================================#
-        # #======================================================================#
-        # #======================================================================#
-        # if (self.parameters_exp['Dataset']['dataset_name'].lower() == 'aiidkit') and\
-        #     (self.parameters_exp['Dataset']['subdataset'].lower() == 'teav_static_graph_v1'):
+        #======================================================================#
+        #======================================================================#
+        #======================================================================#
+        if (self.parameters_exp['Dataset']['dataset_name'].lower() == 'aiidkit') and\
+            (self.parameters_exp['Dataset']['subdataset'].lower() == 'teav_static_graph_v1'):
 
-        #     # Transform edge indices into ints
-        #     for edge_type, edge_index in batch.edge_index_dict.items():
-        #         # Ensure the tensor is integer type
-        #         if (batch.edge_index_dict[edge_type].dtype == torch.float32):
-        #             batch.edge_index_dict[edge_type] = edge_index.to(torch.long)
+            # Transform edge indices into ints
+            for edge_type, edge_index in batch.edge_index_dict.items():
+                # Ensure the tensor is integer type
+                if (batch.edge_index_dict[edge_type].dtype == torch.float32):
+                    batch.edge_index_dict[edge_type] = edge_index.to(torch.long)
 
-        #     # Putting batch to correct device
-        #     batch = batch.to(self.device)
+            # Putting batch to correct device
+            batch = batch.to(self.device)
 
-        #     # Computing output
-        #     out = self.model(batch) # shape [batch_size, out_channels]
+            # Computing output
+            out = self.model(batch) # shape [batch_size, out_channels]
 
-        #     # Getting the loss function
-        #     if (self.num_classes == 2):
-        #         if (not self.use_evidential_learning):
-        #             loss_classif = self.criterion(out.view(-1), batch.y.float())
-        #         else:
-        #             loss_classif = self.criterion(out, batch.y)
-        #     else:
-        #         loss_classif = self.criterion(out, batch.y.squeeze())
+            # Separating the samples by origin (memory or current dataset) to compute the different losses, it necessary
+            if (self.parameters_exp['ContinualLearning']['replay']):
+                # Separate predictions
+                unique_data_origins = np.unique(batch.data_origin)
 
-        #     # Adding the loss to the dictionary of losses
-        #     loss = {
-        #                 "total_loss": loss_classif # DO NOT USE .item() unless you do not want to compute the gradient on it!
-        #             }
+                # Creating masks for eac
+                grouped_outputs = {i: out[batch.data_origin == np.array(i)] for i in unique_data_origins}
+                grouped_labels = {i: batch.y[batch.data_origin == np.array(i)] for i in unique_data_origins}
 
-        #     # Getting the predictions
-        #     if (self.num_classes == 2):
-        #         if (self.use_evidential_learning):
-        #             # Getting the prediction probabilities
-        #             alphas = out # out is the alpha (evidence+1) as indicated in the code of Dirichlet layer of edl_pytorch
-        #             predictions_probs = alphas / torch.sum(alphas, dim=1, keepdim=True)
-        #             # Predictions
-        #             predictions = torch.argmax(predictions_probs, dim=1).detach().cpu().numpy()
-        #             predictions_probs = predictions_probs.detach().cpu().numpy()
-        #         else:
-        #             # Prediction probabilities
-        #             decision_treshold = 0.5
-        #             if (out.ndim > 1 and out.size(-1) == 1):
-        #                 predictions_probs = torch.sigmoid(out.view(-1)).detach().cpu().numpy()
-        #             else:
-        #                 predictions_probs = torch.sigmoid(out).view(-1).detach().cpu().numpy()
-        #             # Predictions
-        #             predictions = (predictions_probs >= decision_treshold).astype(int)
+                # Get the loss
+                loss_replay = 0
+                if (self.num_classes == 2):
+                    if (not self.use_evidential_learning):
+                        loss_dataset = self.criterion(grouped_outputs['dataset'].view(-1), grouped_labels['dataset'].float())
+                        if ('memory' in grouped_outputs):
+                            loss_replay = self.criterion(grouped_outputs['memory'].view(-1), grouped_labels['memory'].float())
+                    else:
+                        loss_dataset = self.criterion(grouped_outputs['dataset'], grouped_labels['dataset'])
+                        if ('memory' in grouped_outputs):
+                            loss_replay = self.criterion(grouped_outputs['memory'], grouped_labels['memory'])
+                else:
+                    loss_dataset = self.criterion(grouped_outputs['dataset'], grouped_labels['dataset'].squeeze())
+                    if ('memory' in grouped_outputs):
+                        loss_replay = self.criterion(grouped_outputs['memory'], grouped_labels['memory'].squeeze())
 
-        #         # Get true labels (must be 0/1 tensor)
-        #         targets = batch.y.view(-1).cpu().numpy()
+                total_loss = self.parameters_exp['ContinualLearning']['lambda_dataset']*loss_dataset + self.parameters_exp['ContinualLearning']['lambda_replay']*loss_replay
+            else:
+                # Getting the loss 
+                if (self.num_classes == 2):
+                    if (not self.use_evidential_learning):
+                        loss_classif = self.criterion(out.view(-1), batch.y.float())
+                    else:
+                        loss_classif = self.criterion(out, batch.y)
+                else:
+                    loss_classif = self.criterion(out, batch.y.squeeze())
+                total_loss = loss_classif
 
-        #         # Fill the predictions dictionary
-        #         preds = {
-        #                     "targets": targets,
-        #                     "predictions": predictions,
-        #                     "predictions_probs": predictions_probs
-        #                 }
-        #         if (self.use_evidential_learning):
-        #             epistemic_uncert, aleatoric_uncert, total_uncert = get_uncertainties(alphas)
-        #             preds["epistemic_uncert"] = epistemic_uncert.detach().cpu().numpy()
-        #             preds["aleatoric_uncert"] = aleatoric_uncert.detach().cpu().numpy()
-        #             preds["total_uncert"] = total_uncert.detach().cpu().numpy()
-        #     else:
-        #         raise NotImplementedError("Not implemented yet, see code epidemio_informed_gnns.")
-        # else:
-        #     raise ValueError(f"Combination of dataset {self.parameters_exp['Dataset']['dataset_name']} and subdataset type {self.parameters_exp['Dataset']['subdataset']} is not valid.")
+            # Adding the loss to the dictionary of losses
+            loss = {
+                        "total_loss": total_loss # DO NOT USE .item() unless you do not want to compute the gradient on it!
+                    }
+            if (self.parameters_exp['ContinualLearning']['replay']):
+                loss['loss_dataset'] = loss_dataset
+                loss['loss_replay'] = loss_replay
 
-        # return loss, preds
+            # Getting the predictions
+            if (self.num_classes == 2):
+                if (self.use_evidential_learning):
+                    # Getting the prediction probabilities
+                    alphas = out # out is the alpha (evidence+1) as indicated in the code of Dirichlet layer of edl_pytorch
+                    predictions_probs = alphas / torch.sum(alphas, dim=1, keepdim=True)
+                    # Predictions
+                    predictions = torch.argmax(predictions_probs, dim=1).detach().cpu().numpy()
+                    predictions_probs = predictions_probs.detach().cpu().numpy()
+                else:
+                    # Prediction probabilities
+                    decision_treshold = 0.5
+                    if (out.ndim > 1 and out.size(-1) == 1):
+                        predictions_probs = torch.sigmoid(out.view(-1)).detach().cpu().numpy()
+                    else:
+                        predictions_probs = torch.sigmoid(out).view(-1).detach().cpu().numpy()
+                    # Predictions
+                    predictions = (predictions_probs >= decision_treshold).astype(int)
+
+                # Get true labels (must be 0/1 tensor)
+                targets = batch.y.view(-1).cpu().numpy()
+
+                # Fill the predictions dictionary
+                preds = {
+                            "targets": targets,
+                            "predictions": predictions,
+                            "predictions_probs": predictions_probs
+                        }
+                if (self.use_evidential_learning):
+                    epistemic_uncert, aleatoric_uncert, total_uncert = get_uncertainties(alphas)
+                    preds["epistemic_uncert"] = epistemic_uncert.detach().cpu().numpy()
+                    preds["aleatoric_uncert"] = aleatoric_uncert.detach().cpu().numpy()
+                    preds["total_uncert"] = total_uncert.detach().cpu().numpy()
+            else:
+                raise NotImplementedError("Not implemented yet, see code epidemio_informed_gnns.")
+        else:
+            raise ValueError(f"Combination of dataset {self.parameters_exp['Dataset']['dataset_name']} and subdataset type {self.parameters_exp['Dataset']['subdataset']} is not valid.")
+
+        return loss, preds
+
+    def initSingleTrain(self, create_new_model=True):
+        """
+            Initialize the parameters for a single train
+        """
+        print(f"\n\n==========> Initialize the single traininf for a CONTINUAL LEARNING setting <==========")
+        # Create new combined training daset
+        self.createCombinedTrainingDS()
+
+        # Initialize the training with th classical parameters
+        super().initSingleTrain(create_new_model=create_new_model)
+
+        # Add data origin to val and test datasets for consistence
+
 
     def singleTrain(self, rep_ID, create_new_model=True):
         """
             Trains a model one time during self.parameters_exp['TrainingParams']['n_epochs'] epochs
         """
+        # Indicate that no statistics have been compute to noramlize the datasets
+        self.train_statistics = None
+        self.n_seen_samples = 0
+
         # Reinitialize the model's weights
-        super().initSingleTrain(create_new_model=True)
+        reinitialize_model_weights = True
 
         # Iterating over the incremental datasets
-        for train_ds in self.train_incremental_ds:
-            # Initialize the training WITHOUT reinitialization of the weights of the model
-            super().initSingleTrain(create_new_model=False)
-            # TODO: VERY IMPORTANT: DO AN initSingleTrain FOR EACH NEW DATASET BUT DO NOT REINITIALIZE THE WEIGHTS OF THE MODEL
-            pass
-        raise NotImplementedError()
+        original_repetition_id = self.repetition_id
+        for train_DS_ID in range(self.parameters_exp['n_incrementa_ds']):
+            # Creating an ID for the training with the current DS
+            self.repetition_id = f"{original_repetition_id}_DS-{train_DS_ID}"
+
+            # Dataset is not normalized when new data arrive
+            self.are_DS_normalized = False 
+
+            # Set the current incremental DS to use
+            self.current_DS_ID = train_DS_ID
+
+            # Normally, the initSingleTrain should be done inside super().singleTrain
+            # # Initialize the training WITHOUT reinitialization of the weights of the model
+            # self.initSingleTrain(create_new_model=reinitialize_model_weights)
+            # reinitialize_model_weights = False # We intialize the model's weights only once per training
+
+            # Do a classic training with the current combined dataset
+            super().singleTrain(rep_ID=rep_ID, create_new_model=reinitialize_model_weights)
+            reinitialize_model_weights = False # We intialize the model's weights only once per training
+
+            # Update memory
+            self.memoryUpdate()
 
 
     def holdoutTrain(self, save_results=True):
@@ -341,7 +658,6 @@ def main():
     # Dataset Loading
     exp.createIncrementalDatasets()
 
-    raise NotImplemented("THE REST OF CONTINUAL LEARNING WITH GRAPHS HAS NOT BEEN IMPLEMENTED YET")
 
     # Creating directories for the trained models, the training and testing metrics
     # and the parameters of the model (i.e. the training parameters and the network
@@ -351,8 +667,7 @@ def main():
     os.mkdir(resultsFolder + '/metrics/')
 
     # Normalizing the dataset
-    #exp.computeDatasetMeanStd()
-    #exp.normalizeDataset()
+    # Done each time a new dataset is received
 
     # Saving the training parameters in the folder of the results
     inc = 0
