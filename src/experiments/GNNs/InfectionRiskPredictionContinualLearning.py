@@ -417,8 +417,6 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
                 self.train_ds.append(deepcopy(sample_to_add))
                 self.train_samples_IDs_in_origin.append(tmp_sample_ID)
 
-
-
         # Mix the samples
         tmp_idx_train_samples = [i for i in range(len(self.train_ds))]
         shuffle(tmp_idx_train_samples)
@@ -536,6 +534,26 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
             raise ValueError(f"Combination of dataset {self.parameters_exp['Dataset']['dataset_name']} and subdataset type {self.parameters_exp['Dataset']['subdataset']} is not valid.")
 
         return loss, preds
+    
+
+    def dataloadersCreation(self):
+        """
+            Create the train and test dataloader necessary to train and test a
+            deep learning model
+        """
+        # Add data origin to val and test datasets for consistence
+        for tmp_pat_seq_graph_ID in range(len(self.val_ds)):
+            tmp_sample = deepcopy(self.val_ds[tmp_pat_seq_graph_ID])
+            tmp_sample.data_origin = 'dataset'
+            self.val_ds[tmp_pat_seq_graph_ID] = tmp_sample
+        for tmp_pat_seq_graph_ID in range(len(self.test_ds)):
+            tmp_sample = deepcopy(self.test_ds[tmp_pat_seq_graph_ID])
+            tmp_sample.data_origin = 'dataset'
+            self.test_ds[tmp_pat_seq_graph_ID] = tmp_sample
+
+        # Create data loaders
+        super().dataloadersCreation()
+
 
     def initSingleTrain(self, create_new_model=True):
         """
@@ -547,8 +565,6 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
 
         # Initialize the training with th classical parameters
         super().initSingleTrain(create_new_model=create_new_model)
-
-        # Add data origin to val and test datasets for consistence
 
 
     def singleTrain(self, rep_ID, create_new_model=True):

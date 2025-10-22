@@ -674,11 +674,13 @@ def main():
                         simple_train_params['Optimization']['Optuna']['use_optuna'] = False
                         simple_train_params['Optimization']['Optuna']['optuna_starting_point_fn'] = None
                         simple_train_params['Optimization']['EarlyStopping']['use_early_stopping'] = False
+                        simple_train_params['TrainingParams']['nb_repetitions'] = 10
                         simple_train_params['exp_id'] = simple_train_yaml.split('/')[-1].split('.yaml')[0] + f"_Cutoff-{cutoff_val}_PredHor-{pred_hor_val}"
                             
                         # Add the LR for the single train parameters
                         optuna_evidential_params = deepcopy(simple_train_params)
                         optuna_evidential_params['TrainingParams']['lr'] = None
+                        optuna_evidential_params['TrainingParams']['nb_repetitions'] = 1
                         optuna_evidential_params['Optimization']['Optuna']['use_optuna'] = True
                         optuna_evidential_params['Optimization']['EarlyStopping']['use_early_stopping'] = True
                         optuna_evidential_params['Optimization']['loss_function'] = "EvidentialLearningLoss"
@@ -713,6 +715,7 @@ def main():
                         best_params = exp.study.best_params
                         # Define global parameters (common to all experiments)
                         simple_evidential_train_params['TrainingParams']['lr'] = best_params['learning_rate']
+                        simple_evidential_train_params['TrainingParams']['nb_repetitions'] = 10
                         #simple_evidential_train_params['TrainingParams']['weight_decay'] = best_params['weight_decay']
                         #simple_evidential_train_params['Optimization']['optimizer'] = best_params['optimizer']
                         simple_evidential_train_params['Optimization']['EvidentialLoss']['lambda_evidential'] = best_params['lambda_evidential']

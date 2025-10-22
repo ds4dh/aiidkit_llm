@@ -543,9 +543,6 @@ def normalize_dataset(dataset, statistics):
         # For times between measurments (central to central edge attribute) we to Log transform + standarziation or min-max
         normalized_hetero_graph[('central', 'sequence', 'central')].edge_attr = (torch.log(normalized_hetero_graph[('central', 'sequence', 'central')].edge_attr + 1) - statistics["central_to_central_edge_attr"]["LogMin"])/(statistics["central_to_central_edge_attr"]["LogMax"] - statistics["central_to_central_edge_attr"]["LogMin"])
 
-        # Data origin (necessary for replay CL)
-        normalized_hetero_graph.data_origin = 'dataset'
-
         # Adding the normalized hetero graph into the new list of normalized graphs
         normalized_dataset.append(normalized_hetero_graph)
 
