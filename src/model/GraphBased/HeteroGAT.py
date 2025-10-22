@@ -84,10 +84,7 @@ class HeteroGAT(nn.Module):
                 n_nodes = len(in_channels)
                 self.graph_lin = nn.Linear(n_nodes*hidden_channels, out_channels)
 
-
-    #def forward(self, x, ids, edge_index, edge_attr, timestamps):
-    def forward(self, data):
-        """Forward pass."""
+    def compute_graph_embedding(self, data):
         x_dict = {}
         # Central node
         x_dict['central'] = self.in_proj_layer['central'](data['central'].x)
@@ -121,5 +118,16 @@ class HeteroGAT(nn.Module):
         else:
             raise ValueError(f"Graph pool fusion strategy {self.graph_pool_fusion} is not valid")
         
-        return self.graph_lin(graph_emb)  # graph-level prediction
+        return graph_emb
+
+    #def forward(self, x, ids, edge_index, edge_attr, timestamps):
+    def forward(self, data):
+        """Forward pass."""
+        # Get graph embedding
+        graph_emb = self.compute_graph_embedding(data)
+
+        # Compute classification output
+        out = self.graph_lin(graph_emb)  # graph-level prediction
+        
+        return out
 

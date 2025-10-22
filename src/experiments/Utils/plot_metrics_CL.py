@@ -129,14 +129,27 @@ def main():
     #======================================================================#
     #========================Get performance metrics========================#
     #======================================================================#
+    # Getting the number of iterations per repetition FOR THE PREDICTIONS 
+    # As we are in a CL framework, the total number of iterations is the sum of the number of epochs per training dataset
+    n_iterations_preds_per_rep_per_data_split = {} 
+    for rep_id in range(n_repetitions):
+        n_iterations_preds_per_rep_per_data_split[rep_id] = {}
+        for data_split in list(results_h5_file[base_name_main_group+f'{rep_id}_DS-0']['Preds'].keys()):
+            n_iterations = 0
+            for DS_ID in incremental_DS_IDs: # WE HAVE TO ITERATE FIRST OVER DS AS THE MODELS ARE TRAINED SEQUENTIALLY ON THE INCREMENTAL DS (so the epochs of model in DS-0 are the first iterations, then there are those of DS-1, etc.)
+                if (len(results_h5_file[base_name_main_group+f'{rep_id}_DS-{DS_ID}']['Preds'][data_split].keys()) > 0):
+                    n_epochs = len(results_h5_file[base_name_main_group+f'{rep_id}_DS-{DS_ID}']['Preds'][data_split])
+                    n_iterations += n_epochs
+            n_iterations_preds_per_rep_per_data_split[rep_id][data_split] = n_iterations
+
     # Getting the predictions for each iteration 
     metrics_per_data_split = {
-                                "MCC": {"Train": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_per_rep_per_data_split[0]['Train'])}, "Val": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_per_rep_per_data_split[0]['Val'])}, "Test": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_per_rep_per_data_split[0]['Test'])}},
-                                "F1Score": {"Train": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_per_rep_per_data_split[0]['Train'])}, "Val": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_per_rep_per_data_split[0]['Val'])}, "Test": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_per_rep_per_data_split[0]['Test'])}},
-                                "BalancedAccuracy": {"Train": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_per_rep_per_data_split[0]['Train'])}, "Val": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_per_rep_per_data_split[0]['Val'])}, "Test": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_per_rep_per_data_split[0]['Test'])}},
-                                "BalancedAccuracyAdjusted": {"Train": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_per_rep_per_data_split[0]['Train'])}, "Val": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_per_rep_per_data_split[0]['Val'])}, "Test": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_per_rep_per_data_split[0]['Test'])}},
-                                "AUC": {"Train": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_per_rep_per_data_split[0]['Train'])}, "Val": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_per_rep_per_data_split[0]['Val'])}, "Test": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_per_rep_per_data_split[0]['Test'])}},
-                                "PerClassAUC": {"Train": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_per_rep_per_data_split[0]['Train'])}, "Val": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_per_rep_per_data_split[0]['Val'])}, "Test": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_per_rep_per_data_split[0]['Test'])}}
+                                "MCC": {"Train": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_preds_per_rep_per_data_split[0]['Train'])}, "Val": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_preds_per_rep_per_data_split[0]['Val'])}, "Test": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_preds_per_rep_per_data_split[0]['Test'])}},
+                                "F1Score": {"Train": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_preds_per_rep_per_data_split[0]['Train'])}, "Val": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_preds_per_rep_per_data_split[0]['Val'])}, "Test": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_preds_per_rep_per_data_split[0]['Test'])}},
+                                "BalancedAccuracy": {"Train": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_preds_per_rep_per_data_split[0]['Train'])}, "Val": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_preds_per_rep_per_data_split[0]['Val'])}, "Test": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_preds_per_rep_per_data_split[0]['Test'])}},
+                                "BalancedAccuracyAdjusted": {"Train": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_preds_per_rep_per_data_split[0]['Train'])}, "Val": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_preds_per_rep_per_data_split[0]['Val'])}, "Test": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_preds_per_rep_per_data_split[0]['Test'])}},
+                                "AUC": {"Train": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_preds_per_rep_per_data_split[0]['Train'])}, "Val": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_preds_per_rep_per_data_split[0]['Val'])}, "Test": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_preds_per_rep_per_data_split[0]['Test'])}},
+                                "PerClassAUC": {"Train": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_preds_per_rep_per_data_split[0]['Train'])}, "Val": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_preds_per_rep_per_data_split[0]['Val'])}, "Test": {iteration: [None for _ in range(n_repetitions)] for iteration in range(n_iterations_preds_per_rep_per_data_split[0]['Test'])}}
                             }
     targets_last_iteration = {rep_id : {data_split: None for data_split in list(results_h5_file[base_name_main_group+f'{rep_id}_DS-0']["Preds"].keys())} for rep_id in range(n_repetitions)}
     preds_last_iteration = {rep_id : {data_split: None for data_split in list(results_h5_file[base_name_main_group+f'{rep_id}_DS-0']["Preds"].keys())} for rep_id in range(n_repetitions)}
@@ -144,7 +157,7 @@ def main():
     for rep_id in range(n_repetitions):
         for data_split in list(results_h5_file[base_name_main_group+f'{rep_id}_DS-0']["Preds"].keys()):
             current_iteration = 0
-            n_iter = n_iterations_per_rep_per_data_split[rep_id][data_split]
+            n_iter = n_iterations_preds_per_rep_per_data_split[rep_id][data_split]
             for DS_ID in incremental_DS_IDs: # WE HAVE TO ITERATE FIRST OVER DS AS THE MODELS ARE TRAINED SEQUENTIALLY ON THE INCREMENTAL DS (so the epochs of model in DS-0 are the first iterations, then there are those of DS-1, etc.)
                 if (len(results_h5_file[base_name_main_group+f'{rep_id}_DS-{DS_ID}']["Preds"][data_split].keys()) > 0):
                     epochs_list = sorted([int(epoch_str.split('-')[-1]) for epoch_str in list(results_h5_file[base_name_main_group+f'{rep_id}_DS-{DS_ID}']["Preds"][data_split].keys())])

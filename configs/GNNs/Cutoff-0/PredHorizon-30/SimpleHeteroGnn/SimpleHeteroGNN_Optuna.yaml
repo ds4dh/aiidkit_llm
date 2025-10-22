@@ -42,7 +42,7 @@ TrainingParams:
 Optimization:
   Optuna:
     use_optuna: true
-    n_trials: 1
+    n_trials: 30
     optuna_starting_point_fn: results/InfectionRiskPred/SimpleHeteroGNN_Optuna_Cutoff-0_PredHor-30_21.10.2025_101947_0/metrics/optuna_results.db
   optimizer: Adam
   loss_function: CE

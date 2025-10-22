@@ -19,7 +19,7 @@ Optimization:
     patience: 5
     use_early_stopping: false
   Optuna:
-    n_trials: 0
+    n_trials: 30
     optuna_starting_point_fn: null
     use_optuna: false
   loss_function: CE

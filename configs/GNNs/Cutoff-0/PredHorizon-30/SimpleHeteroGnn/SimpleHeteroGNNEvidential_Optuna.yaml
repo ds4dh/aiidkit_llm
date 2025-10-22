@@ -22,7 +22,7 @@ Optimization:
     lambda_evidential: null
     lambda_evidential_sched: true
   Optuna:
-    n_trials: 0
+    n_trials: 30
     optuna_starting_point_fn: null
     use_optuna: true
   loss_function: EvidentialLearningLoss
@@ -33,7 +33,7 @@ TrainingParams:
   batch_size_val: 32
   lr: null
   n_epochs: 50
-  nb_repetitions: 10
+  nb_repetitions: 1
   weight_decay: 1.0e-05
 device: cuda:0
 epochs_step_save_preds: 10

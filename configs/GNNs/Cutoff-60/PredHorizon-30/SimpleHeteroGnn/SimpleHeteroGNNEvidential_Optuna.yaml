@@ -8,9 +8,9 @@ Dataset:
   normalize_ds: true
   subdataset: TEAV_Static_Graph_v1
 Model:
-  graph_pool_fusion: stack
+  graph_pool_fusion: concatenation
   graph_pool_strategy: mean
-  hidden_channels: 8
+  hidden_channels: 32
   model_to_use: SimpleHeteroGNN
   model_type: GNN
   out_channels: 1
@@ -23,8 +23,8 @@ Optimization:
     lambda_evidential: null
     lambda_evidential_sched: true
   Optuna:
-    n_trials: 30
-    optuna_starting_point_fn: null
+    n_trials: 5
+    optuna_starting_point_fn: results/InfectionRiskPred/SimpleHeteroGNNEvidential_Optuna_Cutoff-60_PredHor-30_22.10.2025_034853_0/metrics/optuna_results.db
     use_optuna: true
   loss_function: EvidentialLearningLoss
   optimizer: Adam

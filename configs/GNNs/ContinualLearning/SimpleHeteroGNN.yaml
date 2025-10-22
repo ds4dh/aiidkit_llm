@@ -17,15 +17,15 @@ Dataset:
 device: cuda:0
 
 # Save information
-epochs_step_save_preds: 10
+epochs_step_save_preds: 5
 
 # Continual learning
 ContinualLearning:
   replay: true
-  replay_strategy: random
-  memory_capacity: 100
+  replay_strategy: SimSModel
+  memory_capacity: 300
   lambda_dataset: 1.0
-  lambda_replay: 1.0e-1
+  lambda_replay: 1.0
 
 # Architecture to use
 Model:
@@ -37,19 +37,19 @@ Model:
 
 # Training parameters
 TrainingParams:
-  lr: 0.0011534292083758735
+  lr: 1.0e-2
   weight_decay: 1.0e-5 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
   batch_size_train: 32
   batch_size_val: 32
   batch_size_test: 32
-  n_epochs: 2
-  nb_repetitions: 2
+  n_epochs: 16
+  nb_repetitions: 1
 
 # Optimization
 Optimization:
   Optuna:
     use_optuna: false
-    n_trials: 0
+    n_trials: 30
     optuna_starting_point_fn: null
   optimizer: Adam
   loss_function: CE

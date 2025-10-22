@@ -23,6 +23,8 @@ import numpy as np
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.utils.class_weight import compute_class_weight
 
+from sklearn.metrics import pairwise_distances
+
 import torch
 import torch_geometric
 
@@ -330,12 +332,14 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
             if (self.memory is None):
                 self.memory = {}
             # Add samples if the memory is not full
+            last_processed_sample_in_curr_ds = -1
             if (len(self.memory) < self.parameters_exp['ContinualLearning']['memory_capacity']):
                 # Iterating over the sample in the current incremental dataset
                 for i in range(len(self.train_ds)):
                     # Getting the original sample (not the normalized one as it is going to be re-normalized with the updated statistics in the next round)
                     sample = self.train_ds[i]
-                    ID_in_origin = self.train_samples_IDs_in_origin[i]
+                    #ID_in_origin = self.train_samples_IDs_in_origin[i]
+                    ID_in_origin = sample.ID_in_origin
 
                     # Getting the origin
                     sample_origin = sample.data_origin
@@ -343,47 +347,166 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
                     # Getting the original sample
                     if (sample_origin == 'dataset'):
                         original_sample = self.train_incremental_ds[self.current_DS_ID][ID_in_origin]
+                        original_sample.ID_in_origin = i
+                        original_sample.data_origin = 'memory'
                         self.memory[len(self.memory)] = deepcopy(original_sample) # len(self.memory) is always the ID of the last sample as the memory increases
+
+                    # Indicate that the memory is not longer in the dataset (necessary for SimS and other methods)
+                    sample.data_origin = 'memory'
+
+                    # Memory full?
+                    if (len(self.memory) == self.parameters_exp['ContinualLearning']['memory_capacity']):
+                        last_processed_sample_in_curr_ds = i
+                        break
+            
+            # Update train data loader as the origin of the samples could have change if sample were added into initial memory
+            self.dataloadersCreation()
+
+            # Update memory with the remaining samples
+            if (self.parameters_exp['ContinualLearning']['replay_strategy'] is None):
+                self.memory = {}
+            elif (self.parameters_exp['ContinualLearning']['replay_strategy'].lower() == 'random'):
+                # Iterating over the sample in the current incremental dataset
+                for i in range(last_processed_sample_in_curr_ds+1, len(self.train_ds)):
+                    # Getting the original sample (not the normalized one as it is going to be re-normalized with the updated statistics in the next round)
+                    sample = self.train_ds[i]
+                    #ID_in_origin = self.train_samples_IDs_in_origin[i]
+                    ID_in_origin = sample.ID_in_origin
+
+                    # Getting the origin
+                    sample_origin = sample.data_origin
+
+                    # Getting the original sample
+                    if (sample_origin == 'dataset'):
+                        original_sample = self.train_incremental_ds[self.current_DS_ID][ID_in_origin]
+                    elif (sample_origin == 'memory'):
+                        original_sample = self.memory[ID_in_origin]
+                    
+                    # If it is a new sample, we randomly decide to add it or not to the memory
+                    if (sample_origin == 'dataset'):
+                        if (np.random.random() < 0.5):
+                            # Randomly choose a sample in memory to remove
+                            list_mem_samples_IDs = list(self.memory.keys())
+                            sample_ID_memory_remove = np.random.choice(list_mem_samples_IDs)
+                            self.memory[sample_ID_memory_remove] = deepcopy(original_sample)
+
+
+            elif (self.parameters_exp['ContinualLearning']['replay_strategy'].lower() == 'sims'):
+                pass
+                # TODO
+                raise NotImplementedError()
+            
+            elif (self.parameters_exp['ContinualLearning']['replay_strategy'].lower() == 'simsmodel'):
+                # Computing the current embeddings of all the samples in the memory and current incremental DS
+                pat_seq_graphs_emb = []
+                pat_seq_graphs_origin = []
+                pat_seq_graphs_ID_in_origin = []
+                for batch in tqdm(self.train_loader):
+                    self.model.eval()
+                    with torch.no_grad():
+                        # Transform edge indices into ints
+                        for edge_type, edge_index in batch.edge_index_dict.items():
+                            # Ensure the tensor is integer type
+                            if (batch.edge_index_dict[edge_type].dtype == torch.float32):
+                                batch.edge_index_dict[edge_type] = edge_index.to(torch.long)
+
+                        # Putting batch to correct device
+                        batch = batch.to(self.device)
+
+                        # Computing output
+                        graph_embeds = self.model.compute_graph_embedding(batch).detach().cpu().numpy()
+
+                        # Adding it to the list of embeddings
+                        pat_seq_graphs_emb.append(graph_embeds)
+
+                        # Add data storage origin and ID in it
+                        pat_seq_graphs_origin.append(batch.data_origin)
+                        pat_seq_graphs_ID_in_origin.append(batch.ID_in_origin.detach().cpu().numpy())
+
+                # Transforming into list of samples
+                pat_seq_graphs_emb = np.concatenate(pat_seq_graphs_emb)
+                pat_seq_graphs_origin = np.concatenate(pat_seq_graphs_origin)
+                pat_seq_graphs_ID_in_origin = np.concatenate(pat_seq_graphs_ID_in_origin)
+
+                # Separate memory and current incremental dataset samples
+                samples_per_origin = {
+                                        'dataset': {'ID_in_origin': [], 'Embedding': []},
+                                        'memory': {'ID_in_origin': [], 'Embedding': []}
+                                        }
+                for i in range(len(pat_seq_graphs_origin)):
+                    origin = pat_seq_graphs_origin[i]
+                    samples_per_origin[origin]['ID_in_origin'].append(pat_seq_graphs_ID_in_origin[i])
+                    samples_per_origin[origin]['Embedding'].append(pat_seq_graphs_emb[i])
+                samples_per_origin['dataset']['Embedding'] = np.array(samples_per_origin['dataset']['Embedding'])
+                samples_per_origin['memory']['Embedding'] = np.array(samples_per_origin['memory']['Embedding'])
+
+                # Get distances matrices
+                pairwise_dist_dataset_mem = pairwise_distances(samples_per_origin['dataset']['Embedding'], samples_per_origin['memory']['Embedding'], metric='euclidean')
+                pairwise_dist_mem_mem = pairwise_distances(samples_per_origin['memory']['Embedding'], samples_per_origin['memory']['Embedding'], metric='euclidean')
+                # For memory to memory distances, fill the diagonal with +infinity as by default the closest sample to a given sample is the sample itself
+                # IMPORTANT: NOT NECESSARY TO DO IT FOR THE DISTANCES BETWEEN SAMPLES IN THE CURRENT INCREMENTAL DATASET AND THE MEMORY
+                np.fill_diagonal(pairwise_dist_mem_mem, np.inf)
+
+                # Iterating over the samples in the dataset to see if we add them to the memory
+                sorted_IDs_dist_dataset_to_mem = np.argsort(pairwise_dist_dataset_mem, axis=1)
+                sorted_IDs_dist_mem_to_mem = np.argsort(pairwise_dist_mem_mem, axis=1)
+                for local_sample_ID in tqdm(range(len(samples_per_origin['dataset']['ID_in_origin']))):
+                    # Getting the ID in origin and raw non normalized sample
+                    sample_ID_in_origin = samples_per_origin['dataset']['ID_in_origin'][local_sample_ID]
+                    raw_sample = deepcopy(self.train_incremental_ds[self.current_DS_ID][sample_ID_in_origin])
+
+                    # Getting its closest neighbor in memory
+                    ref_sample_in_mem_ID_in_dist_matrix = sorted_IDs_dist_dataset_to_mem[local_sample_ID, 0]
+                    dist_to_ref_sample_in_mem = pairwise_dist_dataset_mem[local_sample_ID, ref_sample_in_mem_ID_in_dist_matrix]
+
+                    # Getting the two samples in the memory with the closest distance
+                    # Flatten and find the two smallest values
+                    flat_indices = np.argsort(pairwise_dist_mem_mem, axis=None)[:2]
+                    # Convert back to matrix coordinates
+                    row_idx, col_idx = np.unravel_index(flat_indices, pairwise_dist_mem_mem.shape)
+                    sample_i_in_mem_ID_in_dist_mat = row_idx[0]
+                    sample_j_in_mem_ID_in_dist_mat = col_idx[0]
+                    # Getting the distance
+                    dist_closest_samples_in_mem = pairwise_dist_mem_mem[sample_i_in_mem_ID_in_dist_mat, sample_j_in_mem_ID_in_dist_mat]
+
+                    # Add sample to memory?
+                    if (dist_closest_samples_in_mem < dist_to_ref_sample_in_mem):
+                        # Add sample to memory
+                        # Find the ID of the sample in memory to remove, based on the second closest neighbour
+                        second_closest_neigh_i_ID_in_dist_matrix = sorted_IDs_dist_mem_to_mem[sample_i_in_mem_ID_in_dist_mat, 1]
+                        dist_i_second_closest_neigh = pairwise_dist_mem_mem[sample_i_in_mem_ID_in_dist_mat, second_closest_neigh_i_ID_in_dist_matrix]
+                        second_closest_neigh_j_ID_in_dist_matrix = sorted_IDs_dist_mem_to_mem[sample_j_in_mem_ID_in_dist_mat, 1]
+                        dist_j_second_closest_neigh = pairwise_dist_mem_mem[sample_j_in_mem_ID_in_dist_mat, second_closest_neigh_j_ID_in_dist_matrix]
+                        if (dist_i_second_closest_neigh < dist_j_second_closest_neigh):
+                            sample_to_remove_ID_in_dist_mat = sample_i_in_mem_ID_in_dist_mat
+                        else:
+                            sample_to_remove_ID_in_dist_mat = sample_j_in_mem_ID_in_dist_mat
+                        sample_to_remove_ID_in_memory = samples_per_origin['memory']['ID_in_origin'][sample_to_remove_ID_in_dist_mat]
+
+                        # Update mem dist matrix
+                        for tmp_mem_i in range(pairwise_dist_mem_mem.shape[0]):
+                            pairwise_dist_mem_mem[sample_to_remove_ID_in_dist_mat, tmp_mem_i] = pairwise_dist_dataset_mem[local_sample_ID, tmp_mem_i]
+                            pairwise_dist_mem_mem[tmp_mem_i, sample_to_remove_ID_in_dist_mat] = pairwise_dist_dataset_mem[local_sample_ID, tmp_mem_i]
+
+                        # Update origin and ID in origin
+                        # We replace using the local IDs (and not the ID in the origin) the values in the samples_per_origin for the sample in memory to update
+                        samples_per_origin['memory']['Embedding'][sample_to_remove_ID_in_dist_mat] = samples_per_origin['dataset']['Embedding'][local_sample_ID]
+                        samples_per_origin['memory']['ID_in_origin'][sample_to_remove_ID_in_dist_mat] = sample_to_remove_ID_in_memory
+
+                        # Update memory
+                        raw_sample.data_origin = 'memory'
+                        raw_sample.ID_in_origin = sample_to_remove_ID_in_memory
+                        self.memory[sample_to_remove_ID_in_memory] = raw_sample
+
+
+                exit()
+
             else:
-                if (self.parameters_exp['ContinualLearning']['replay_strategy'] is None):
-                    self.memory = {}
-                elif (self.parameters_exp['ContinualLearning']['replay_strategy'].lower() == 'random'):
-                    # Iterating over the sample in the current incremental dataset
-                    for i in range(len(self.train_ds)):
-                        # Getting the original sample (not the normalized one as it is going to be re-normalized with the updated statistics in the next round)
-                        sample = self.train_ds[i]
-                        ID_in_origin = self.train_samples_IDs_in_origin[i]
-
-                        # Getting the origin
-                        sample_origin = sample.data_origin
-
-                        # Getting the original sample
-                        if (sample_origin == 'dataset'):
-                            original_sample = self.train_incremental_ds[self.current_DS_ID][ID_in_origin]
-                        elif (sample_origin == 'memory'):
-                            original_sample = self.memory[ID_in_origin]
-                        
-                        # If it is a new sample, we randomly decide to add it or not to the memory
-                        if (sample_origin == 'dataset'):
-                            if (np.random.random() < 0.5):
-                                # Randomly choose a sample in memory to remove
-                                list_mem_samples_IDs = list(self.memory.keys())
-                                sample_ID_memory_remove = np.random.choice(list_mem_samples_IDs)
-                                self.memory[sample_ID_memory_remove] = deepcopy(original_sample)
-
-
-                elif (self.parameters_exp['ContinualLearning']['replay_strategy'].lower() == 'sims'):
-                    pass
-                    # TODO
-                    raise NotImplementedError()
-                elif (self.parameters_exp['ContinualLearning']['replay_strategy'].lower() == 'simsmodel'):
-                    pass
-                    # TODO
-                    raise NotImplementedError()
-                else:
-                    raise ValueError(f"Replay strategy {self.parameters_exp['ContinualLearning']['replay_strategy']} is not valid.")
+                raise ValueError(f"Replay strategy {self.parameters_exp['ContinualLearning']['replay_strategy']} is not valid.")
         else:
             self.memory = {}
+
+        self.model.train()
             
         # TODO: FIND A WAY TO TRACK MEMORY TO SEE IF WE CAN SEE THE CATASTROPHIC FORGETTING IN THE MEMORY???
 
@@ -406,6 +529,7 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
             tmp_sample = self.train_incremental_ds[self.current_DS_ID][tmp_sample_ID]
             sample_to_add = deepcopy(tmp_sample)
             sample_to_add.data_origin = "dataset"
+            sample_to_add.ID_in_origin = tmp_sample_ID
             self.train_ds.append(sample_to_add)
             self.train_samples_IDs_in_origin.append(tmp_sample_ID)
 
@@ -414,6 +538,7 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
             for tmp_sample_ID in self.memory:
                 sample_to_add = self.memory[tmp_sample_ID]
                 sample_to_add.data_origin = "memory"
+                sample_to_add.ID_in_origin = tmp_sample_ID
                 self.train_ds.append(deepcopy(sample_to_add))
                 self.train_samples_IDs_in_origin.append(tmp_sample_ID)
 

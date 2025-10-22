@@ -19,10 +19,10 @@ Optimization:
     patience: 5
     use_early_stopping: false
   EvidentialLoss:
-    lambda_evidential: 0.001732176721741715
+    lambda_evidential: 0.00021269893373437778
     lambda_evidential_sched: true
   Optuna:
-    n_trials: 0
+    n_trials: 30
     optuna_starting_point_fn: null
     use_optuna: false
   loss_function: EvidentialLearningLoss
@@ -31,7 +31,7 @@ TrainingParams:
   batch_size_test: 32
   batch_size_train: 32
   batch_size_val: 32
-  lr: 0.0001901421408578314
+  lr: 0.0013780276649271875
   n_epochs: 50
   nb_repetitions: 10
   weight_decay: 1.0e-05

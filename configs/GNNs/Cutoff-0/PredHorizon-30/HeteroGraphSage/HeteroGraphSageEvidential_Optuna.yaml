@@ -24,7 +24,7 @@ Optimization:
     lambda_evidential: null
     lambda_evidential_sched: true
   Optuna:
-    n_trials: 0
+    n_trials: 30
     optuna_starting_point_fn: null
     use_optuna: true
   loss_function: EvidentialLearningLoss

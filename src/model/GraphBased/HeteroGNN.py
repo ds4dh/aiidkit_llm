@@ -66,7 +66,7 @@ class HeteroGNN(nn.Module):
                 n_nodes = len(in_channels)
                 self.graph_lin = nn.Linear(n_nodes*hidden_channels, out_channels)
 
-    def forward(self, data):
+    def compute_graph_embedding(self, data):
         x_dict = {}
         # Central node
         x_dict['central'] = self.lin_dict['central'](data['central'].x)
@@ -99,5 +99,14 @@ class HeteroGNN(nn.Module):
             graph_emb = torch.cat(graph_embeds, dim=-1) 
         else:
             raise ValueError(f"Graph pool fusion strategy {self.graph_pool_fusion} is not valid")
+        
+        return graph_emb
 
-        return self.graph_lin(graph_emb)  # graph-level prediction
+    def forward(self, data):
+        # Get graph embedding
+        graph_emb = self.compute_graph_embedding(data)
+
+        # Compute classification output
+        out = self.graph_lin(graph_emb)  # graph-level prediction
+        
+        return out
