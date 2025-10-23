@@ -676,7 +676,7 @@ class GenericExperiment(ABC):
         except Exception as e:
             print(f"Trial {trial.number} failed with error: {e}. Returning 0.0 as metric.")
 
-            #raise e
+            raise e
 
             return 0.0  # <- only works for metrics to maximize and > 0.0!
         

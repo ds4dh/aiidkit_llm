@@ -32,9 +32,9 @@ ContinualLearning:
 Model:
   model_type: GNN
   model_to_use: SimpleHeteroGNN
-  hidden_channels: 16
+  hidden_channels: 8
   graph_pool_strategy: mean
-  graph_pool_fusion: concatenation
+  graph_pool_fusion: stack
 
 # Training parameters
 TrainingParams:
@@ -43,7 +43,7 @@ TrainingParams:
   batch_size_train: 4096
   batch_size_val: 4096
   batch_size_test: 4096
-  n_epochs: 30
+  n_epochs: 10
   nb_repetitions: 1
 
 # Optimization

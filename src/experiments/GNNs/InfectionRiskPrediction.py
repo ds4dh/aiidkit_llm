@@ -54,10 +54,15 @@ def init_weights(m):
         if m.bias is not None:
             torch.nn.init.zeros_(m.bias)
 
-    elif isinstance(m, (GCNConv, SAGEConv)):
+    elif isinstance(m, GCNConv):
         torch.nn.init.xavier_uniform_(m.lin.weight)
         if m.lin.bias is not None:
             torch.nn.init.zeros_(m.lin.bias)
+
+    elif isinstance(m, SAGEConv):
+        torch.nn.init.xavier_uniform_(m.lin_l.weight)
+        if m.lin_r is not None:
+            torch.nn.init.xavier_uniform_(m.lin_r.weight)
 
     # GATConv (Graph Attention Network)
     elif isinstance(m, GATConv):

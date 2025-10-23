@@ -31,7 +31,7 @@ TrainingParams:
   batch_size_val: 32
   lr: 0.00020324405164211072
   n_epochs: 50
-  0
+  nb_repetitions: 10
   weight_decay: 1.0e-05
 device: cuda:0
 epochs_step_save_preds: 10
