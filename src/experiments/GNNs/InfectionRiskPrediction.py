@@ -25,6 +25,8 @@ from sklearn.utils.class_weight import compute_class_weight
 
 import torch
 import torch_geometric
+from torch_geometric.nn import GATConv, GCNConv, SAGEConv
+
 
 # Internal imports
 from src.experiments.GenericExperiment import GenericExperiment
@@ -36,6 +38,40 @@ from src.model.GraphBased.HeteroGraphSage import HeteroGraphSage
 from src.model.GraphBased.HeteroGAT import HeteroGAT
 from src.experiments.Utils.EvidentialClassification import EvidentialClassification
 from src.experiments.Utils.tools import get_uncertainties
+
+
+#====================================================================================================#
+#====================================================================================================#
+#====================================================================================================#
+# Model weights initialization function
+def init_weights(m):
+    # Standard linear layers
+    if isinstance(m, torch.nn.Linear):
+        #torch.nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
+        #torch.nn.init.xavier_uniform_(m.weight)
+        torch.nn.init.xavier_normal_(m.weight)
+        if m.bias is not None:
+            torch.nn.init.zeros_(m.bias)
+
+    elif isinstance(m, (GCNConv, SAGEConv)):
+        torch.nn.init.xavier_uniform_(m.lin.weight)
+        if m.lin.bias is not None:
+            torch.nn.init.zeros_(m.lin.bias)
+
+    # GATConv (Graph Attention Network)
+    elif isinstance(m, GATConv):
+        if hasattr(m, 'lin_l'):
+            torch.nn.init.xavier_uniform_(m.lin_l.weight)
+            if m.lin_l.bias is not None:
+                torch.nn.init.zeros_(m.lin_l.bias)
+        if hasattr(m, 'lin_r'):
+            torch.nn.init.xavier_uniform_(m.lin_r.weight)
+            if m.lin_r.bias is not None:
+                torch.nn.init.zeros_(m.lin_r.bias)
+        if hasattr(m, 'att_src'):
+            torch.nn.init.xavier_uniform_(m.att_src)
+        if hasattr(m, 'att_dst'):
+            torch.nn.init.xavier_uniform_(m.att_dst)
 
 #====================================================================================================#
 #====================================================================================================#
@@ -274,6 +310,9 @@ class InfectionRiskPred(GenericExperiment):
                 raise ValueError("Model to use {} is not valid".format(self.parameters_exp['Model']['model_to_use']))
             
         print(f"\n\n =========> A NEW MODEL HAS BEEN CREATED WITH RANDOMLY INITIALIZED WEIGHTS <========= \n\n")
+
+        # Initialize weights
+        self.model.apply(init_weights)
 
 
     def computeForwardPass(self, batch, epoch_nb, batch_ID=None):

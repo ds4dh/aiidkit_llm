@@ -15,6 +15,11 @@ from src.experiments.Utils.uncertainty_quantification import get_evidential_unce
                                                               plot_calibration_uncertainty_correctness,\
                                                               plot_calibrated_uncertainty_correctness
 
+# Ignore all warnings
+import warnings
+warnings.filterwarnings("ignore")
+
+
 # To use if plots are not showing after plt.shoy()
 # import matplotlib
 # matplotlib.use("Qt5Agg")  # or "Qt5Agg" if you have PyQt installed
@@ -255,13 +260,33 @@ def main():
     if (len(N_UNIQUE_CLASSES) > 2):
         last_per_class_auc_test_mean = np.mean(metrics_per_data_split["PerClassAUC"]["Test"][last_epoch], axis=0)
         last_per_class_auc_test_std = np.std(metrics_per_data_split["PerClassAUC"]["Test"][last_epoch], axis=0)
-    print("\n=========> TEST MCC in the last epoch: {} +- {}%".format(last_mcc_test_mean, last_mcc_test_std))
-    print("\tTEST F1 Score in the last epoch: {} +- {}%".format(last_f1_score_test_mean, last_f1_score_test_std))
-    print("\tTEST Balanced Accuracy in the last epoch: {} +- {}%".format(last_balanced_acc_test_mean, last_balanced_acc_test_std))
-    print("\tTEST Balanced Accuracy Adjusted in the last epoch: {} +- {}%".format(last_balanced_acc_adj_test_mean, last_balanced_acc_adj_test_std))
-    print("\tTEST AUC in the last epoch: {} +- {}%".format(last_auc_test_mean, last_auc_test_std))
+    print("\n\n\n\n=========> METRICS AT LAST EPOCH <=========")
+    print("\n==========")
+    print("MCC:")
+    print("\t Mean performance: {} +- {}%".format(last_mcc_test_mean, last_mcc_test_std))
+    print("\tValues: {}".format(metrics_per_data_split["MCC"]["Test"][last_epoch]))
+    print("\n==========")
+    print("F1 Score:")
+    print("\t Mean performance: {} +- {}%".format(last_f1_score_test_mean, last_f1_score_test_std))
+    print("\tValues: {}".format(metrics_per_data_split["F1Score"]["Test"][last_epoch]))
+    print("\n==========")
+    print("Balanced Accuracy:")
+    print("\t Mean performance: {} +- {}%".format(last_balanced_acc_test_mean, last_balanced_acc_test_std))
+    print("\tValues: {}".format(metrics_per_data_split["BalancedAccuracy"]["Test"][last_epoch]))
+    print("\n==========")
+    print("Balanced Accuracy Adjusted:")
+    print("\t Mean performance: {} +- {}%".format(last_balanced_acc_adj_test_mean, last_balanced_acc_adj_test_std))
+    print("\tValues: {}".format(metrics_per_data_split["BalancedAccuracyAdjusted"]["Test"][last_epoch]))
+    print("\n==========")
+    print("AUC ROC:")
+    print("\t Mean performance: {} +- {}%".format(last_auc_test_mean, last_auc_test_std))
+    print("\tValues: {}".format(metrics_per_data_split["AUC"]["Test"][last_epoch]))
     if (len(N_UNIQUE_CLASSES) > 2):
-        print("\tTEST PER CLASS AUC in the last epoch: {} +- {}%".format(last_per_class_auc_test_mean, last_per_class_auc_test_std))
+        for tmp_class in range(len(last_per_class_auc_test_mean)):
+            print("\n==========")
+            print(f"AUC ROC FOR CLASS {tmp_class}:")
+            print("\t Mean performance: {} +- {}%".format(last_per_class_auc_test_mean[tmp_class], last_per_class_auc_test_std[tmp_class]))
+            print("\tValues: {}".format(metrics_per_data_split["PerClassAUC"]["Test"][last_epoch][:, tmp_class]))
     
     #======================================================================#
     #===========================Calibration error===========================#

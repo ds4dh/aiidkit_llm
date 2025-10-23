@@ -16,6 +16,11 @@ from src.experiments.Utils.uncertainty_quantification import get_evidential_unce
                                                               plot_calibration_uncertainty_correctness,\
                                                               plot_calibrated_uncertainty_correctness
 
+
+# Ignore all warnings
+import warnings
+warnings.filterwarnings("ignore")
+
 # To use if plots are not showing after plt.shoy()
 # import matplotlib
 # matplotlib.use("Qt5Agg")  # or "Qt5Agg" if you have PyQt installed

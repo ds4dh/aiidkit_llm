@@ -70,23 +70,24 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
                 Dictionary containing the parameters of the experiment.
         """
         # Parent constructor
-        super().__init__(parameters_exp)    
-
-        # Parameters for the number of incremental/continual DS to create
-        if ('n_incrementa_ds' not in self.parameters_exp):
-            # It includes the first training dataset (50% of the training patients and the rest of the datasets)
-            self.parameters_exp['n_incrementa_ds'] = 4
-        if ('incremental_ds_strategy' not in self.parameters_exp):
-            #self.parameters_exp['incremental_ds_strategy'] = 'EqualNoPatients'
-            self.parameters_exp['incremental_ds_strategy'] = 'FirstDSHalfPatients'
+        super().__init__(parameters_exp)  
 
         # Parameters for continual learning
         if ('ContinualLearning' not in self.parameters_exp):
             self.parameters_exp['ContinualLearning'] = {
                                                             'replay': False,
                                                             'memory_capacity': 0
-                                                       }
+                                                       }  
 
+        # Parameters for the number of incremental/continual DS to create
+        if ('n_incrementa_ds' not in self.parameters_exp):
+            # It includes the first training dataset (50% of the training patients and the rest of the datasets)
+            self.parameters_exp['n_incrementa_ds'] = 4
+        if ('incremental_ds_strategy' not in self.parameters_exp['ContinualLearning']):
+            #self.parameters_exp['ContinualLearning']['incremental_ds_strategy'] = 'EqualNoPatients'
+            self.parameters_exp['ContinualLearning']['incremental_ds_strategy'] = 'FirstDSHalfPatients'
+
+        
         # Parameters for the replay-based strategy
         self.memory = None   
         if ('replay' not in self.parameters_exp['ContinualLearning']):
@@ -135,15 +136,15 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
         np.random.shuffle(patients_IDs) # Shuffle in-place the list of indices
 
         # Creating the distribution of patients among the different datasets
-        if (self.parameters_exp['incremental_ds_strategy'].lower() == 'equalnopatients'):
+        if (self.parameters_exp['ContinualLearning']['incremental_ds_strategy'].lower() == 'equalnopatients'):
             pats_IDs_per_DS = split_into_n_lists(patients_IDs, self.parameters_exp['n_incrementa_ds'])
-        elif (self.parameters_exp['incremental_ds_strategy'].lower() == 'firstdshalfpatients'):
+        elif (self.parameters_exp['ContinualLearning']['incremental_ds_strategy'].lower() == 'firstdshalfpatients'):
             first_DS_pats_IDs = patients_IDs[:len(patients_IDs)//2]
             other_DS_pats_IDs = split_into_n_lists(patients_IDs[len(patients_IDs)//2:], self.parameters_exp['n_incrementa_ds']-1) # -1 as the first dataset was created manually
             pats_IDs_per_DS = [first_DS_pats_IDs]
             pats_IDs_per_DS.extend(other_DS_pats_IDs)
         else:
-            ValueError(f"Strategy {self.parameters_exp['incremental_ds_strategy']} to create the incremental DS is not valid")
+            ValueError(f"Strategy {self.parameters_exp['ContinualLearning']['incremental_ds_strategy']} to create the incremental DS is not valid")
 
         # Creating the different Pytorch datasets datasets
         self.train_incremental_ds = [[] for _ in range(self.parameters_exp['n_incrementa_ds'])]
@@ -327,6 +328,10 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
             IMPORTANT: The memory stores the raw samples, not the normalized ones, as they are going to 
             be normalized in the combined dataset.
         """
+        print("\n\n\n====================> STARTING MEMORY UPDATE <====================\n\n")
+        if (self.memory is not None):
+            print(f"\n==========> Memory size BEFORE UPDATE {len(self.memory)} <=========\n")
+        
         if (self.parameters_exp['ContinualLearning']['replay']):
             # Initialize memory if necessary
             if (self.memory is None):
@@ -338,26 +343,31 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
                 for i in range(len(self.train_ds)):
                     # Getting the original sample (not the normalized one as it is going to be re-normalized with the updated statistics in the next round)
                     sample = self.train_ds[i]
-                    #ID_in_origin = self.train_samples_IDs_in_origin[i]
-                    ID_in_origin = sample.ID_in_origin
 
                     # Getting the origin
                     sample_origin = sample.data_origin
 
                     # Getting the original sample
                     if (sample_origin == 'dataset'):
-                        original_sample = self.train_incremental_ds[self.current_DS_ID][ID_in_origin]
-                        original_sample.ID_in_origin = i
+                        # Store the raw sample
+                        original_sample = deepcopy(self.train_incremental_ds[self.current_DS_ID][sample.ID_in_origin])
+                        ID_in_memory = len(self.memory)
+                        original_sample.ID_in_origin = ID_in_memory # Update origin of the sample now that it is in the memory
                         original_sample.data_origin = 'memory'
-                        self.memory[len(self.memory)] = deepcopy(original_sample) # len(self.memory) is always the ID of the last sample as the memory increases
+                        self.memory[ID_in_memory] = original_sample # len(self.memory) is always the ID of the last sample as the memory increases
 
-                    # Indicate that the memory is not longer in the dataset (necessary for SimS and other methods)
-                    sample.data_origin = 'memory'
+                        # Indicate that the memory is not longer in the dataset (necessary for SimS and other methods)
+                        sample.data_origin = 'memory'
+                        sample.ID_in_origin = ID_in_memory
 
                     # Memory full?
                     if (len(self.memory) == self.parameters_exp['ContinualLearning']['memory_capacity']):
                         last_processed_sample_in_curr_ds = i
                         break
+
+                    # Verify memory capcity
+                    if (len(self.memory) > self.parameters_exp['ContinualLearning']['memory_capacity']):
+                        raise RuntimeError(f"The memory has more samples ({len(self.memory)}) than its capacity ({self.parameters_exp['ContinualLearning']['memory_capacity']})")
             
             # Update train data loader as the origin of the samples could have change if sample were added into initial memory
             self.dataloadersCreation()
@@ -390,6 +400,10 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
                             sample_ID_memory_remove = np.random.choice(list_mem_samples_IDs)
                             self.memory[sample_ID_memory_remove] = deepcopy(original_sample)
 
+                            # Verify memory capcity
+                            if (len(self.memory) > self.parameters_exp['ContinualLearning']['memory_capacity']):
+                                raise RuntimeError(f"The memory has more samples ({len(self.memory)}) than its capacity ({self.parameters_exp['ContinualLearning']['memory_capacity']})")
+
 
             elif (self.parameters_exp['ContinualLearning']['replay_strategy'].lower() == 'sims'):
                 pass
@@ -421,7 +435,10 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
 
                         # Add data storage origin and ID in it
                         pat_seq_graphs_origin.append(batch.data_origin)
-                        pat_seq_graphs_ID_in_origin.append(batch.ID_in_origin.detach().cpu().numpy())
+                        try:
+                            pat_seq_graphs_ID_in_origin.append(batch.ID_in_origin.detach().cpu().numpy())
+                        except:
+                            pat_seq_graphs_ID_in_origin.append(batch.ID_in_origin)
 
                 # Transforming into list of samples
                 pat_seq_graphs_emb = np.concatenate(pat_seq_graphs_emb)
@@ -497,9 +514,10 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
                         raw_sample.data_origin = 'memory'
                         raw_sample.ID_in_origin = sample_to_remove_ID_in_memory
                         self.memory[sample_to_remove_ID_in_memory] = raw_sample
-
-
-                exit()
+                        # Verify memory capcity
+                        if (len(self.memory) > self.parameters_exp['ContinualLearning']['memory_capacity']):
+                            print(f"\n\n\t=========> ID of the raw sample in its origin {raw_sample.data_origin} is {raw_sample.ID_in_origin} whereas the ID of the sample in memory to remove is {sample_to_remove_ID_in_memory} \n\n")
+                            raise RuntimeError(f"The memory has more samples ({len(self.memory)}) than its capacity ({self.parameters_exp['ContinualLearning']['memory_capacity']})")
 
             else:
                 raise ValueError(f"Replay strategy {self.parameters_exp['ContinualLearning']['replay_strategy']} is not valid.")
@@ -507,8 +525,10 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
             self.memory = {}
 
         self.model.train()
+
+        print(f"\n\n ==========> Memory size AFTER UPDATE {len(self.memory)} <=========\n\n")
+        print("\n====================> ENDING MEMORY UPDATE <====================\n\n\n\n")
             
-        # TODO: FIND A WAY TO TRACK MEMORY TO SEE IF WE CAN SEE THE CATASTROPHIC FORGETTING IN THE MEMORY???
 
     def createCombinedTrainingDS(self):
         """
@@ -535,6 +555,10 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
 
         # Iterating over the samples in the memory
         if (self.memory is not None):
+            # Verify memory capcity
+            if (len(self.memory) > self.parameters_exp['ContinualLearning']['memory_capacity']):
+                raise RuntimeError(f"The memory has more samples ({len(self.memory)}) than its capacity ({self.parameters_exp['ContinualLearning']['memory_capacity']})")
+            # Iterate over the samples in the memory
             for tmp_sample_ID in self.memory:
                 sample_to_add = self.memory[tmp_sample_ID]
                 sample_to_add.data_origin = "memory"
@@ -684,7 +708,7 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
         """
             Initialize the parameters for a single train
         """
-        print(f"\n\n==========> Initialize the single traininf for a CONTINUAL LEARNING setting <==========")
+        print(f"\n\n==========> Initialize the single training for a CONTINUAL LEARNING setting <==========")
         # Create new combined training daset
         self.createCombinedTrainingDS()
 
@@ -706,6 +730,7 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
         # Iterating over the incremental datasets
         original_repetition_id = self.repetition_id
         for train_DS_ID in range(self.parameters_exp['n_incrementa_ds']):
+            print(f"\n\n =========> PROCESSING INCREMENTAL DS {train_DS_ID} \n\n")
             # Creating an ID for the training with the current DS
             self.repetition_id = f"{original_repetition_id}_DS-{train_DS_ID}"
 

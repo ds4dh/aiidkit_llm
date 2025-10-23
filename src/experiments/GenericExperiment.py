@@ -443,7 +443,8 @@ class GenericExperiment(ABC):
 
         # Applying gradient clipping to solve some
         # gradient problems
-        # nn.utils.clip_grad_value_(self.model.parameters(), clip_value=0.1)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=2.0)
+        # torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
 
         # Updating the weights
         self.optimizer.step()
