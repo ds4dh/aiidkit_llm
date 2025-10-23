@@ -35,14 +35,14 @@ TrainingParams:
   batch_size_train: 32
   batch_size_val: 32
   batch_size_test: 32
-  n_epochs: 2
+  n_epochs: 50
   nb_repetitions: 1
 
 # Optimization
 Optimization:
   Optuna:
     use_optuna: true
-    n_trials: 2
+    n_trials: 30
     optuna_starting_point_fn: null
   optimizer: Adam
   loss_function: CE

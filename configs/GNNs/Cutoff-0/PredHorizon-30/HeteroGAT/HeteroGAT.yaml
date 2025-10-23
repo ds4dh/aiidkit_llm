@@ -39,7 +39,7 @@ TrainingParams:
   batch_size_val: 32
   batch_size_test: 32
   n_epochs: 50
-  nb_repetitions: 1
+  nb_repetitions: 10
 
 # Optimization
 Optimization:

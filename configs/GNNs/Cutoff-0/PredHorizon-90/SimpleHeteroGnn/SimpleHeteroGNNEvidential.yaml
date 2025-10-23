@@ -1,0 +1,41 @@
+Dataset:
+  dataset_name: AIIDKIT
+  hdf5_dataset_filename:
+    Test: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/Cutoff-0/PredHorizon-90/AIIDKIT_TEAV_Graph_TEST_CutOffTrain-[0]_CutOffVal-[0]_PredHorizon-90_0.hdf5
+    Train: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/Cutoff-0/PredHorizon-90/AIIDKIT_TEAV_Graph_TRAIN_CutOffTrain-[0]_CutOffVal-[0]_PredHorizon-90_0.hdf5
+    Validation: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/Cutoff-0/PredHorizon-90/AIIDKIT_TEAV_Graph_VALIDATION_CutOffTrain-[0]_CutOffVal-[0]_PredHorizon-90_0.hdf5
+  label_type: infection_label_binary_bacterial
+  normalize_ds: true
+  subdataset: TEAV_Static_Graph_v1
+Model:
+  graph_pool_fusion: stack
+  graph_pool_strategy: mean
+  hidden_channels: 16
+  model_to_use: SimpleHeteroGNN
+  model_type: GNN
+  out_channels: 2
+Optimization:
+  EarlyStopping:
+    min_delta: 0.0001
+    patience: 5
+    use_early_stopping: false
+  EvidentialLoss:
+    lambda_evidential: 0.0034725711967226827
+    lambda_evidential_sched: true
+  Optuna:
+    n_trials: 30
+    optuna_starting_point_fn: null
+    use_optuna: false
+  loss_function: EvidentialLearningLoss
+  optimizer: Adam
+TrainingParams:
+  batch_size_test: 32
+  batch_size_train: 32
+  batch_size_val: 32
+  lr: 0.0009882175067155593
+  n_epochs: 50
+  nb_repetitions: 10
+  weight_decay: 1.0e-05
+device: cuda:0
+epochs_step_save_preds: 10
+exp_id: SimpleHeteroGNNEvidential_Cutoff-0_PredHor-90

@@ -21,11 +21,12 @@ epochs_step_save_preds: 5
 
 # Continual learning
 ContinualLearning:
+  incremental_ds_strategy: firstdshalfpatients
   replay: true
   replay_strategy: SimSModel
   memory_capacity: 300
   lambda_dataset: 1.0
-  lambda_replay: 1.0
+  lambda_replay: 1.0e-2
 
 # Architecture to use
 Model:
@@ -38,11 +39,11 @@ Model:
 # Training parameters
 TrainingParams:
   lr: 1.0e-2
-  weight_decay: 1.0e-5 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
-  batch_size_train: 32
-  batch_size_val: 32
-  batch_size_test: 32
-  n_epochs: 16
+  weight_decay: 5.0e-4 # Cannot use notation 1e-2 as it will be interpreted as a str by PyYAML parser
+  batch_size_train: 4096
+  batch_size_val: 4096
+  batch_size_test: 4096
+  n_epochs: 30
   nb_repetitions: 1
 
 # Optimization

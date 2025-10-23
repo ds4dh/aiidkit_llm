@@ -1,18 +1,21 @@
 Dataset:
   dataset_name: AIIDKIT
   hdf5_dataset_filename:
-    Test: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/Cutoff-30/PredHorizon-30/AIIDKIT_TEAV_Graph_TEST_CutOffTrain-[30]_CutOffVal-[30]_PredHorizon-30_0.hdf5
-    Train: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/Cutoff-30/PredHorizon-30/AIIDKIT_TEAV_Graph_TRAIN_CutOffTrain-[30]_CutOffVal-[30]_PredHorizon-30_0.hdf5
-    Validation: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/Cutoff-30/PredHorizon-30/AIIDKIT_TEAV_Graph_VALIDATION_CutOffTrain-[30]_CutOffVal-[30]_PredHorizon-30_0.hdf5
+    Test: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/Cutoff-0/PredHorizon-90/AIIDKIT_TEAV_Graph_TEST_CutOffTrain-[0]_CutOffVal-[0]_PredHorizon-90_0.hdf5
+    Train: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/Cutoff-0/PredHorizon-90/AIIDKIT_TEAV_Graph_TRAIN_CutOffTrain-[0]_CutOffVal-[0]_PredHorizon-90_0.hdf5
+    Validation: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/Cutoff-0/PredHorizon-90/AIIDKIT_TEAV_Graph_VALIDATION_CutOffTrain-[0]_CutOffVal-[0]_PredHorizon-90_0.hdf5
   label_type: infection_label_binary_bacterial
   normalize_ds: true
   subdataset: TEAV_Static_Graph_v1
 Model:
-  graph_pool_fusion: concatenation
+  dropout: 0.4330880728874676
+  graph_pool_fusion: stack
   graph_pool_strategy: mean
-  hidden_channels: 64
-  model_to_use: SimpleHeteroGNN
+  hidden_channels: 8
+  model_to_use: HeteroGraphSAGE
   model_type: GNN
+  num_layers: 2
+  out_channels: 1
 Optimization:
   EarlyStopping:
     min_delta: 0.0001
@@ -37,4 +40,4 @@ TrainingParams:
   weight_decay: 1.0e-05
 device: cuda:0
 epochs_step_save_preds: 10
-exp_id: SimpleHeteroGNNEvidential_Optuna_Cutoff-30_PredHor-30
+exp_id: HeteroGraphSageEvidential_Optuna_Cutoff-0_PredHor-90

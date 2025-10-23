@@ -42,7 +42,7 @@ TrainingParams:
 Optimization:
   Optuna:
     use_optuna: true
-    n_trials: 2
+    n_trials: 30
     optuna_starting_point_fn: null
   optimizer: Adam
   loss_function: CE
