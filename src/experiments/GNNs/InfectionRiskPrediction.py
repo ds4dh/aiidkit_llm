@@ -4,6 +4,7 @@
     to fo infection risk prediction
 """
 import os
+import re
 import pickle
 import yaml
 import argparse
@@ -98,6 +99,17 @@ class InfectionRiskPred(GenericExperiment):
         if ('Train' not in self.parameters_exp['Dataset']['hdf5_dataset_filename']) or ('Test' not in self.parameters_exp['Dataset']['hdf5_dataset_filename']):
             raise RuntimeError("Train and Test datasets must be specified (Validation is optional).")
         else:
+            # Verfiying if the hdf5_dataset_filename exist
+            if (not os.path.exists(self.parameters_exp['Dataset']['hdf5_dataset_filename']['Train'])):
+                # If the file is not found then we may be executing the code in Baobab
+                if ('Train' in self.parameters_exp['Dataset']['hdf5_dataset_filename']):
+                    self.parameters_exp['Dataset']['hdf5_dataset_filename']['Train'] = re.sub(r"/home/vindasya/Baobab/", "/home/users/v/vindasya/", self.parameters_exp['Dataset']['hdf5_dataset_filename']['Train'])
+                if ('Validation' in self.parameters_exp['Dataset']['hdf5_dataset_filename']):
+                    self.parameters_exp['Dataset']['hdf5_dataset_filename']['Validation'] = re.sub(r"/home/vindasya/Baobab/", "/home/users/v/vindasya/", self.parameters_exp['Dataset']['hdf5_dataset_filename']['Validation'])
+                if ('Test' in self.parameters_exp['Dataset']['hdf5_dataset_filename']):
+                    self.parameters_exp['Dataset']['hdf5_dataset_filename']['Test'] = re.sub(r"/home/vindasya/Baobab/", "/home/users/v/vindasya/", self.parameters_exp['Dataset']['hdf5_dataset_filename']['Test'])
+                if (not os.path.exists(self.parameters_exp['Dataset']['hdf5_dataset_filename']['Train'])):
+                    raise RuntimeError(f"HDF5 dataset file {self.parameters_exp['Dataset']['hdf5_dataset_filename']} not found.")
             if (self.parameters_exp['Dataset']['dataset_name'].lower() == 'aiidkit'):
                 if (self.parameters_exp['Dataset']['subdataset'].lower() == 'teav_static_graph_v1'):
                     # Train
