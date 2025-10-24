@@ -8,9 +8,9 @@ Dataset:
   normalize_ds: true
   subdataset: TEAV_Static_Graph_v1
 Model:
-  graph_pool_fusion: stack
+  graph_pool_fusion: concatenation
   graph_pool_strategy: mean
-  hidden_channels: 64
+  hidden_channels: 8
   model_to_use: SimpleHeteroGNN
   model_type: GNN
   out_channels: 1

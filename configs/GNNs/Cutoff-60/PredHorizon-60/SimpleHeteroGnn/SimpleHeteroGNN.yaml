@@ -29,8 +29,8 @@ TrainingParams:
   batch_size_test: 32
   batch_size_train: 32
   batch_size_val: 32
-  lr: 0.0396760507705299
-  n_epochs: 2
+  lr: 0.04005179551645725
+  n_epochs: 50
   nb_repetitions: 10
   weight_decay: 1.0e-05
 device: cuda:0

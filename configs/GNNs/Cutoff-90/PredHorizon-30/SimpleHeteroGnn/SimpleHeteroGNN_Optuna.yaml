@@ -43,7 +43,7 @@ Optimization:
   Optuna:
     use_optuna: true
     n_trials: 30
-    optuna_starting_point_fn: null
+    optuna_starting_point_fn: results/InfectionRiskPred/SimpleHeteroGNN_TEAV_OPTUNA_Cutoff-90_PredHor-30_23.10.2025_120058_0/metrics/optuna_results.db
   optimizer: Adam
   loss_function: CE
   EarlyStopping:
