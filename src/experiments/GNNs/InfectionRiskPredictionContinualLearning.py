@@ -75,14 +75,15 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
         # Parameters for continual learning
         if ('ContinualLearning' not in self.parameters_exp):
             self.parameters_exp['ContinualLearning'] = {
+                                                            'n_incremental_ds': 4,
                                                             'replay': False,
                                                             'memory_capacity': 0
                                                        }  
 
         # Parameters for the number of incremental/continual DS to create
-        if ('n_incrementa_ds' not in self.parameters_exp):
+        if ('n_incremental_ds' not in self.parameters_exp['ContinualLearning']):
             # It includes the first training dataset (50% of the training patients and the rest of the datasets)
-            self.parameters_exp['n_incrementa_ds'] = 4
+            self.parameters_exp['ContinualLearning']['n_incremental_ds'] = 4
         if ('incremental_ds_strategy' not in self.parameters_exp['ContinualLearning']):
             #self.parameters_exp['ContinualLearning']['incremental_ds_strategy'] = 'EqualNoPatients'
             self.parameters_exp['ContinualLearning']['incremental_ds_strategy'] = 'FirstDSHalfPatients'
@@ -112,7 +113,7 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
             in a Continual Learning context.
             Two strategies:
                 - EqualNoPatients: each dataset contain the same (or almost) number of patients. 
-                For instance, if we have 2000 training patients and self.parameters_exp['n_incrementa_ds'] = 4
+                For instance, if we have 2000 training patients and self.parameters_exp['ContinualLearning']['n_incremental_ds'] = 4
                 Then each dataset will contain 500 patients (non overlapping, one patient can only
                 be in one dataset).
                 - FirstDSHalfPatients : In this case, the first dataset contain half of the total training patients and the
@@ -137,20 +138,20 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
 
         # Creating the distribution of patients among the different datasets
         if (self.parameters_exp['ContinualLearning']['incremental_ds_strategy'].lower() == 'equalnopatients'):
-            pats_IDs_per_DS = split_into_n_lists(patients_IDs, self.parameters_exp['n_incrementa_ds'])
+            pats_IDs_per_DS = split_into_n_lists(patients_IDs, self.parameters_exp['ContinualLearning']['n_incremental_ds'])
         elif (self.parameters_exp['ContinualLearning']['incremental_ds_strategy'].lower() == 'firstdshalfpatients'):
             first_DS_pats_IDs = patients_IDs[:len(patients_IDs)//2]
-            other_DS_pats_IDs = split_into_n_lists(patients_IDs[len(patients_IDs)//2:], self.parameters_exp['n_incrementa_ds']-1) # -1 as the first dataset was created manually
+            other_DS_pats_IDs = split_into_n_lists(patients_IDs[len(patients_IDs)//2:], self.parameters_exp['ContinualLearning']['n_incremental_ds']-1) # -1 as the first dataset was created manually
             pats_IDs_per_DS = [first_DS_pats_IDs]
             pats_IDs_per_DS.extend(other_DS_pats_IDs)
         else:
             ValueError(f"Strategy {self.parameters_exp['ContinualLearning']['incremental_ds_strategy']} to create the incremental DS is not valid")
 
         # Creating the different Pytorch datasets datasets
-        self.train_incremental_ds = [[] for _ in range(self.parameters_exp['n_incrementa_ds'])]
+        self.train_incremental_ds = [[] for _ in range(self.parameters_exp['ContinualLearning']['n_incremental_ds'])]
         for pat_seq_graph in self.full_train_ds:
             # Copying the sample in the right DS
-            for DS_ID in range(self.parameters_exp['n_incrementa_ds']):
+            for DS_ID in range(self.parameters_exp['ContinualLearning']['n_incremental_ds']):
                 if (pat_seq_graph.pat_ID in pats_IDs_per_DS[DS_ID]):
                     self.train_incremental_ds[DS_ID].append(deepcopy(pat_seq_graph))
 
@@ -177,7 +178,7 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
                 print(f"\t===> {n_samples_per_class_current_DS[tmp_class]} samples of class {tmp_class}")
 
         # # Sanity check: the number of different patients and their IDs in each dataset of self.train_incremental_ds should be the same as pats_IDs_per_DS
-        # for DS_ID in range(self.parameters_exp['n_incrementa_ds']):
+        # for DS_ID in range(self.parameters_exp['ContinualLearning']['n_incremental_ds']):
         #     # Getting the patients IDs in the dataset
         #     tmp_pats_IDs = []
         #     for pat_seq_graph in self.train_incremental_ds[DS_ID]:
@@ -729,7 +730,7 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
 
         # Iterating over the incremental datasets
         original_repetition_id = self.repetition_id
-        for train_DS_ID in range(self.parameters_exp['n_incrementa_ds']):
+        for train_DS_ID in range(self.parameters_exp['ContinualLearning']['n_incremental_ds']):
             print(f"\n\n =========> PROCESSING INCREMENTAL DS {train_DS_ID} \n\n")
             # Creating an ID for the training with the current DS
             self.repetition_id = f"{original_repetition_id}_DS-{train_DS_ID}"

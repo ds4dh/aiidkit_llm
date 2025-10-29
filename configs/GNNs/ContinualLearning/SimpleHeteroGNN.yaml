@@ -1,6 +1,6 @@
 # Parameters file
 # Name of the experiment
-exp_id: SimpleHeteroGNN_Cutoff-0_PredHor-30_ContinualLearning
+exp_id: SimpleHeteroGNN_Cutoff-0_PredHor-30_ContinualLearning_IncrementalDS-3
 
 # Dataset to use
 Dataset:
@@ -22,6 +22,7 @@ epochs_step_save_preds: 5
 # Continual learning
 ContinualLearning:
   incremental_ds_strategy: firstdshalfpatients
+  n_incremental_ds: 3
   replay: true
   replay_strategy: SimSModel
   memory_capacity: 300
@@ -43,8 +44,8 @@ TrainingParams:
   batch_size_train: 4096
   batch_size_val: 4096
   batch_size_test: 4096
-  n_epochs: 10
-  nb_repetitions: 1
+  n_epochs: 30
+  nb_repetitions: 10
 
 # Optimization
 Optimization:
