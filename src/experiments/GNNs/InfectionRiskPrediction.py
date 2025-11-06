@@ -667,16 +667,6 @@ def main():
         print(f"Successfully saved data to {parameters_file_new}")
     except Exception as e:
         print(f"An error occurred: {e}")
-
-    # Saving the python file containing the network architecture
-    if (parameters_exp['Model']['model_to_use'].lower() == "simpleheterognn"):
-        shutil.copy2('src/model/GraphBased/AiidkitTEAVGraphEmbedder.py', resultsFolder + '/model/graph_embedder_architecture.py')
-        shutil.copy2('src/model/GraphBased/HeteroGNN.py', resultsFolder + '/model/architecture.py')
-    elif (parameters_exp['Model']['model_to_use'].lower() == "heterographsage"):
-        shutil.copy2('src/model/GraphBased/AiidkitTEAVGraphEmbedder.py', resultsFolder + '/model/graph_embedder_architecture.py')
-        shutil.copy2('src/model/GraphBased/HeteroGraphSage.py', resultsFolder + '/model/graph_classifier_architecture.py')
-    else:
-        raise ValueError()
     
     # Save the data distribution
     # TODO: Copy HDF5 dataset files?
@@ -790,6 +780,20 @@ def main():
                             yaml.safe_dump(simple_evidential_train_params, file)
                         print(f"\n ===> New config file created or modified at location: {simple_evidential_train_yaml} \n")
 
+
+    #==========================================================================#
+    # Saving the python file containing the network architecture
+    if (parameters_exp['Model']['model_to_use'].lower() == "simpleheterognn"):
+        shutil.copy2('src/model/GraphBased/AiidkitTEAVGraphEmbedder.py', resultsFolder + '/model/graph_embedder_architecture.py')
+        shutil.copy2('src/model/GraphBased/HeteroGNN.py', resultsFolder + '/model/architecture.py')
+    elif (parameters_exp['Model']['model_to_use'].lower() == "heterographsage"):
+        shutil.copy2('src/model/GraphBased/AiidkitTEAVGraphEmbedder.py', resultsFolder + '/model/graph_embedder_architecture.py')
+        shutil.copy2('src/model/GraphBased/HeteroGraphSage.py', resultsFolder + '/model/graph_classifier_architecture.py')
+    elif (parameters_exp['Model']['model_to_use'].lower() == "Heterogat"):
+        shutil.copy2('src/model/GraphBased/AiidkitTEAVGraphEmbedder.py', resultsFolder + '/model/graph_embedder_architecture.py')
+        shutil.copy2('src/model/GraphBased/HeteroGAT.py', resultsFolder + '/model/graph_classifier_architecture.py')
+    else:
+        raise ValueError()
 
 
     #==========================================================================#

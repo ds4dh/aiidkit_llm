@@ -1,0 +1,65 @@
+# Parameters file
+# Name of the experiment
+exp_id: SimpleHeteroGNN_Cutoff-90_PredHor-90_ContinualLearning_IncrementalDS-4_Replay-Random
+
+# Dataset to use
+Dataset:
+  dataset_name: AIIDKIT
+  subdataset: TEAV_Static_Graph_v1
+  hdf5_dataset_filename:
+    Test: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/Cutoff-90/PredHorizon-30/AIIDKIT_TEAV_Graph_TEST_CutOffTrain-[90]_CutOffVal-[90]_PredHorizon-30_0.hdf5
+    Train: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/Cutoff-90/PredHorizon-30/AIIDKIT_TEAV_Graph_TRAIN_CutOffTrain-[90]_CutOffVal-[90]_PredHorizon-30_0.hdf5
+    Validation: /home/vindasya/Baobab/Codes/aiidkit/data/graph_h5/Cutoff-90/PredHorizon-30/AIIDKIT_TEAV_Graph_VALIDATION_CutOffTrain-[90]_CutOffVal-[90]_PredHorizon-30_0.hdf5
+  normalize_ds: true
+  label_type: infection_label_binary_bacterial
+
+# Device to use
+device: cuda:0
+
+# Save information
+epochs_step_save_preds: 5
+
+# Continual learning
+ContinualLearning:
+  incremental_ds_strategy: EqualNoPatients
+  n_incremental_ds: 4
+  replay: true
+  replay_strategy: Random
+  memory_capacity: 100
+  lambda_dataset: 1.0
+  lambda_replay: 1.0e-2
+
+# Architecture to use
+Model:
+  graph_pool_fusion: stack
+  graph_pool_strategy: mean
+  hidden_channels: 32
+  model_to_use: SimpleHeteroGNN
+  model_type: GNN
+  out_channels: 1
+
+# Training parameters
+TrainingParams:
+  lr: 0.0006145162197914339
+  weight_decay: 1.0e-05
+  batch_size_train: 4096
+  batch_size_val: 4096
+  batch_size_test: 4096
+  n_epochs: 70
+  nb_repetitions: 5
+
+# Optimization
+Optimization:
+  Optuna:
+    use_optuna: false
+    n_trials: 30
+    optuna_starting_point_fn: null
+  optimizer: Adam
+  loss_function: CE
+  EarlyStopping:
+    use_early_stopping: false
+    patience: 15
+    min_delta: 1.0e-4 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
+
+  
+

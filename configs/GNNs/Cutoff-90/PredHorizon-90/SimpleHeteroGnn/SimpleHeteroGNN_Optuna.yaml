@@ -42,13 +42,13 @@ TrainingParams:
 Optimization:
   Optuna:
     use_optuna: true
-    n_trials: 30
-    optuna_starting_point_fn: null
+    n_trials: 10
+    optuna_starting_point_fn: results/InfectionRiskPred/SimpleHeteroGNN_TEAV_OPTUNA_Cutoff-90_PredHor-90_29.10.2025_124607_0/metrics/optuna_results.db
   optimizer: Adam
   loss_function: CE
   EarlyStopping:
     use_early_stopping: true
-    patience: 5
+    patience: 15
     min_delta: 1.0e-4 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
 
   

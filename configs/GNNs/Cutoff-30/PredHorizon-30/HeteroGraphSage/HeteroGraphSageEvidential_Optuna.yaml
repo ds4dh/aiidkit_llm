@@ -53,7 +53,7 @@ Optimization:
     lambda_evidential: null
   EarlyStopping:
     use_early_stopping: true
-    patience: 5
+    patience: 15
     min_delta: 1.0e-4 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
 
   

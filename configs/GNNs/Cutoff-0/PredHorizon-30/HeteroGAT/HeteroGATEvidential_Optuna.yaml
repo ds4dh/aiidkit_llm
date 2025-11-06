@@ -24,10 +24,10 @@ epochs_step_save_preds: 10
 Model:
   model_type: GNN
   model_to_use: HeteroGAT
-  hidden_channels: 8
+  hidden_channels: 64
   num_layers: 1
   heads: 8
-  dropout: 0.09242722776276352
+  dropout: 0.14146726316208028
   graph_pool_strategy: mean
   graph_pool_fusion: concatenation
 
@@ -54,7 +54,7 @@ Optimization:
     lambda_evidential_sched: true
   EarlyStopping:
     use_early_stopping: true
-    patience: 5
+    patience: 15
     min_delta: 1.0e-4 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
 
   

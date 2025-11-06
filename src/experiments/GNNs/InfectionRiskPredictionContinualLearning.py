@@ -520,6 +520,11 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
                             print(f"\n\n\t=========> ID of the raw sample in its origin {raw_sample.data_origin} is {raw_sample.ID_in_origin} whereas the ID of the sample in memory to remove is {sample_to_remove_ID_in_memory} \n\n")
                             raise RuntimeError(f"The memory has more samples ({len(self.memory)}) than its capacity ({self.parameters_exp['ContinualLearning']['memory_capacity']})")
 
+            elif (self.parameters_exp['ContinualLearning']['replay_strategy'].lower() == 'uqbased'):
+                # Memory update based on the samples with highest (aleatoric or epistemic uncertainty)?
+                # TODO
+                raise NotImplementedError()
+            
             else:
                 raise ValueError(f"Replay strategy {self.parameters_exp['ContinualLearning']['replay_strategy']} is not valid.")
         else:
@@ -624,7 +629,6 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
                     loss_dataset = self.criterion(grouped_outputs['dataset'], grouped_labels['dataset'].squeeze())
                     if ('memory' in grouped_outputs):
                         loss_replay = self.criterion(grouped_outputs['memory'], grouped_labels['memory'].squeeze())
-
                 total_loss = self.parameters_exp['ContinualLearning']['lambda_dataset']*loss_dataset + self.parameters_exp['ContinualLearning']['lambda_replay']*loss_replay
             else:
                 # Getting the loss 
