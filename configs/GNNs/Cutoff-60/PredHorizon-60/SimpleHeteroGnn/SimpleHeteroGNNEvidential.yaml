@@ -17,7 +17,7 @@ Model:
 Optimization:
   EarlyStopping:
     min_delta: 0.0001
-    patience: 5
+    patience: 15
     use_early_stopping: false
   EvidentialLoss:
     lambda_evidential: 0.07114476009343425

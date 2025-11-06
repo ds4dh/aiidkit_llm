@@ -24,16 +24,16 @@ epochs_step_save_preds: 10
 Model:
   model_type: GNN
   model_to_use: HeteroGAT
-  hidden_channels: null
-  num_layers: null
-  heads: null
-  dropout: null
+  hidden_channels: 64
+  num_layers: 1
+  heads: 8
+  dropout: 0.14146726316208028
   graph_pool_strategy: mean
   graph_pool_fusion: concatenation
 
 # Training parameters
 TrainingParams:
-  lr: null
+  lr: 0.000993687184277073
   weight_decay: 1.0e-5 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
   batch_size_train: 32
   batch_size_val: 32
@@ -51,7 +51,7 @@ Optimization:
   loss_function: CE
   EarlyStopping:
     use_early_stopping: true
-    patience: 5
+    patience: 15
     min_delta: 1.0e-4 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
 
   

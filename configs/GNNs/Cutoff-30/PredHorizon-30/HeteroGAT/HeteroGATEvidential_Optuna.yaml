@@ -19,21 +19,20 @@ device: cuda:0
 # Save information
 epochs_step_save_preds: 10
 
-
 # Architecture to use
 Model:
   model_type: GNN
   model_to_use: HeteroGraphSAGE
   hidden_channels: 16
   num_layers: 2
-  heads: 8
-  dropout: 0.11514981677597129
+  heads: 4
+  dropout: 0.14975359222694293
   graph_pool_strategy: mean
-  graph_pool_fusion: concatenation
+  graph_pool_fusion: stack
 
 # Training parameters
 TrainingParams:
-  lr: 0.00018109168090938674
+  lr: null
   weight_decay: 1.0e-5 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
   batch_size_train: 32
   batch_size_val: 32
@@ -54,7 +53,7 @@ Optimization:
     lambda_evidential: null
   EarlyStopping:
     use_early_stopping: true
-    patience: 5
+    patience: 15
     min_delta: 1.0e-4 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
 
   
