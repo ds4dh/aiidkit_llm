@@ -8,7 +8,7 @@ Dataset:
   normalize_ds: true
   subdataset: TEAV_Static_Graph_v1
 Model:
-  dropout: 0.4330880728874676
+  dropout: 0.29895698207939464
   graph_pool_fusion: stack
   graph_pool_strategy: mean
   hidden_channels: 8
@@ -31,7 +31,7 @@ TrainingParams:
   batch_size_test: 32
   batch_size_train: 32
   batch_size_val: 32
-  lr: 0.0013292918943162175
+  lr: 0.0018166975999312708
   n_epochs: 50
   nb_repetitions: 10
   weight_decay: 1.0e-05

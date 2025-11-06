@@ -8,13 +8,13 @@ Dataset:
   normalize_ds: true
   subdataset: TEAV_Static_Graph_v1
 Model:
-  dropout: 0.4330880728874676
-  graph_pool_fusion: stack
+  dropout: 0.3875664116805573
+  graph_pool_fusion: concatenation
   graph_pool_strategy: mean
   hidden_channels: 8
   model_to_use: HeteroGraphSAGE
   model_type: GNN
-  num_layers: 2
+  num_layers: 1
   out_channels: 1
 Optimization:
   EarlyStopping:

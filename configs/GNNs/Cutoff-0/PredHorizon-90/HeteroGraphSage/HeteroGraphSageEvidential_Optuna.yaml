@@ -8,7 +8,7 @@ Dataset:
   normalize_ds: true
   subdataset: TEAV_Static_Graph_v1
 Model:
-  dropout: 0.4330880728874676
+  dropout: 0.29895698207939464
   graph_pool_fusion: stack
   graph_pool_strategy: mean
   hidden_channels: 8
