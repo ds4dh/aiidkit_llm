@@ -13,6 +13,10 @@ def get_uncertainties(dirichlet_alpha):
         for the output of an evidential learning Dirichlet-based
         classificaiton model.
 
+        IMPORTANT: The formulas for the quantification of epistemic
+        and aleatoric uncertainties come from equations 21 and 23
+        of the following paper: https://journals.ametsoc.org/view/journals/aies/3/4/AIES-D-23-0093.1.xml
+
         Parameters:
         -----------
         dirichlet_alpha: torch.tensor
@@ -34,19 +38,23 @@ def get_uncertainties(dirichlet_alpha):
             It ranges between 0 and log_e(K) where K is the number of
             classes (for 4 classes log_e(K) ~ 1.386). Smaller values are better.
     """
-    K = dirichlet_alpha.size(1)
+    # Getting number of samples N and number of classes K
+    N = dirichlet_alpha.shape[0]
+    K = dirichlet_alpha.shape[1]
+
+    # Getting the sum of alphas per sample
     S = torch.sum(dirichlet_alpha, dim=1, keepdim=True)
+
+    # Getting the probability score for each sample and class
     probs = dirichlet_alpha / S
 
-    # Epistemic: high when total evidence is low
-    epistemic = K / S.squeeze()
+    # Total uncertainty
+    total = probs - probs**2 # Obtained by summing Eqs. 21 and 23 of https://journals.ametsoc.org/view/journals/aies/3/4/AIES-D-23-0093.1.xml
 
-    # Aleatoric: expected entropy under Dirichlet
-    psi_alpha_plus_1 = digamma(dirichlet_alpha + 1)
-    psi_S_plus_1 = digamma(S + 1)
-    aleatoric = -torch.sum(probs * (psi_alpha_plus_1 - psi_S_plus_1), dim=1)
+    # Epistemic uncertainty
+    epistemic = probs*(1-probs)/(S+1)
 
-    # Total: entropy of the mean
-    total = -torch.sum(probs * torch.log(probs + 1e-8), dim=1)
+    # Aleatoric uncertainty
+    aleatoric = total - epistemic
 
     return epistemic, aleatoric, total

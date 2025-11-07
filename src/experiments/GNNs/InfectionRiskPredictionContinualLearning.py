@@ -4,7 +4,6 @@
     to fo infection risk prediction
 """
 import os
-import pickle
 import yaml
 import argparse
 from datetime import datetime
@@ -14,29 +13,18 @@ import shutil
 
 from copy import deepcopy
 
-import h5py
-
 import random
 
 import numpy as np
 
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from sklearn.utils.class_weight import compute_class_weight
-
+from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import pairwise_distances
+from sklearn.cluster import KMeans
 
 import torch
-import torch_geometric
 
 # Internal imports
-from src.experiments.GenericExperiment import GenericExperiment
-from src.data.process.graph_patient_dataset import create_PyGeo_Graph_DS_from_HDF5,\
-                                                   normalize_dataset,\
-                                                   compute_statistics_dataset
-from src.model.GraphBased.HeteroGNN import HeteroGNN
-from src.model.GraphBased.HeteroGraphSage import HeteroGraphSage
-from src.model.GraphBased.HeteroGAT import HeteroGAT
-from src.experiments.Utils.EvidentialClassification import EvidentialClassification
+from src.data.process.graph_patient_dataset import compute_statistics_dataset
 from src.experiments.Utils.tools import get_uncertainties
 from src.experiments.GNNs.InfectionRiskPrediction import InfectionRiskPred
 
@@ -54,6 +42,13 @@ def split_into_n_lists(lst, N):
     k, m = divmod(len(lst), N)
     return [lst[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(N)]
 
+def minmax_nromalization(X):
+    """
+        Applies MinMax normalization to the data in X
+    """
+    scaler = MinMaxScaler()
+    
+    return scaler.fit_transform(X)
 
 #====================================================================================================#
 #====================================================================================================#
@@ -100,6 +95,24 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
             # Replay strategy
             if ('replay_strategy' not in self.parameters_exp['ContinualLearning']):
                 self.parameters_exp['ContinualLearning']['replay_strategy'] = None
+            # Particular parameters for some replay strategies
+            if (self.parameters_exp['ContinualLearning']['replay_strategy'].lower() == 'uqbased'):
+                if ('UQWeights' not in self.parameters_exp['ContinualLearning']):
+                    self.parameters_exp['ContinualLearning']['UQWeights'] = {
+                                                                                'wH': 0.5,
+                                                                                'we': 1.0,
+                                                                                'wa': 1.0,
+                                                                                'use_model_features': False
+                                                                            }
+                else:
+                    if ('wH' not in self.parameters_exp['ContinualLearning']['UQWeights']):
+                        self.parameters_exp['ContinualLearning']['UQWeights']['wH'] = 0.5
+                    if ('we' not in self.parameters_exp['ContinualLearning']['UQWeights']):
+                        self.parameters_exp['ContinualLearning']['UQWeights']['we'] = 1.0
+                    if ('wa' not in self.parameters_exp['ContinualLearning']['UQWeights']):
+                        self.parameters_exp['ContinualLearning']['UQWeights']['wa'] = 1.0
+                    if ('use_model_features' not in self.parameters_exp['ContinualLearning']['UQWeights']):
+                        self.parameters_exp['ContinualLearning']['UQWeights']['use_model_features'] = False
             # Weights of the losses
             if ('lambda_dataset' not in self.parameters_exp['ContinualLearning']):
                 self.parameters_exp['ContinualLearning']['lambda_dataset'] = 1
@@ -521,9 +534,136 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
                             raise RuntimeError(f"The memory has more samples ({len(self.memory)}) than its capacity ({self.parameters_exp['ContinualLearning']['memory_capacity']})")
 
             elif (self.parameters_exp['ContinualLearning']['replay_strategy'].lower() == 'uqbased'):
+                # IMPORTANT: The idea here is to keep the samples with SMALL ALEATORIC UNCERTAINTY (as they are the less noisy ones)
+                # IMPORTANT: AND keep the samples with HIGH EPISTEMIC UNCERTAINTY as it is where the model lacks of knowledge
                 # Memory update based on the samples with highest (aleatoric or epistemic uncertainty)?
-                # TODO
-                raise NotImplementedError()
+                if (self.parameters_exp['Optimization']['loss_function'].lower() != "evidentiallearningloss"):
+                    raise RuntimeError("UQ based memory update strategy cannot be done without evidential learning (Monte Carlo dropout not implemented)")
+                
+                # Computing the uncertainties of all the samples in the memory and current incremental DS
+                pat_seq_graphs_emb = []
+                pat_seq_graphs_uncert = {'Total': [], 'Aleatoric': [], 'Epistemic': []}
+                pat_seq_graphs_preds_probs = []
+                pat_seq_graphs_origin = []
+                pat_seq_graphs_ID_in_origin = []
+                for batch in tqdm(self.train_loader):
+                    self.model.eval()
+                    with torch.no_grad():
+                        # Transform edge indices into ints
+                        for edge_type, edge_index in batch.edge_index_dict.items():
+                            # Ensure the tensor is integer type
+                            if (batch.edge_index_dict[edge_type].dtype == torch.float32):
+                                batch.edge_index_dict[edge_type] = edge_index.to(torch.long)
+
+                        # Putting batch to correct device
+                        batch = batch.to(self.device)
+
+                        # Computing features
+                        graph_embeds = self.model.compute_graph_embedding(batch).detach().cpu().numpy()
+                        pat_seq_graphs_emb.append(graph_embeds)
+
+                        # Computing uncertainties
+                        alphas = self.model(batch)
+                        epistemic_uncert, aleatoric_uncert, total_uncert = get_uncertainties(alphas)
+
+                        # Predictions
+                        predictions_probs = alphas / torch.sum(alphas, dim=1, keepdim=True)
+                        predictions_probs = predictions_probs.detach().cpu().numpy()
+                        pat_seq_graphs_preds_probs.append(predictions_probs)
+
+                        # Adding it to the list of embeddings
+                        pat_seq_graphs_uncert['Epistemic'].append(epistemic_uncert.detach().cpu().numpy())
+                        pat_seq_graphs_uncert['Aleatoric'].append(aleatoric_uncert.detach().cpu().numpy())
+                        pat_seq_graphs_uncert['Total'].append(total_uncert.detach().cpu().numpy())
+
+                        # Add data storage origin and ID in it
+                        pat_seq_graphs_origin.append(batch.data_origin)
+                        try:
+                            pat_seq_graphs_ID_in_origin.append(batch.ID_in_origin.detach().cpu().numpy())
+                        except:
+                            pat_seq_graphs_ID_in_origin.append(batch.ID_in_origin)
+
+                # Transforming into list of samples
+                pat_seq_graphs_emb = np.concatenate(pat_seq_graphs_emb)
+                for uncert_type in pat_seq_graphs_uncert:
+                    pat_seq_graphs_uncert[uncert_type] = np.concatenate(pat_seq_graphs_uncert[uncert_type])
+                pat_seq_graphs_preds_probs = np.concatenate(pat_seq_graphs_preds_probs)
+                pat_seq_graphs_origin = np.concatenate(pat_seq_graphs_origin)
+                pat_seq_graphs_ID_in_origin = np.concatenate(pat_seq_graphs_ID_in_origin)
+
+                # Computing scores based on the uncertainties and the predicted probabilities scores
+                # Predictive entropy
+                N, K = pat_seq_graphs_preds_probs.shape[0], pat_seq_graphs_preds_probs.shape[1]
+                eps = 1e-12
+                H = -np.sum(pat_seq_graphs_preds_probs * np.log(pat_seq_graphs_preds_probs + eps), axis=1)
+                # Probability-weighted mean uncertainties
+                ue_mean = np.sum(pat_seq_graphs_preds_probs * pat_seq_graphs_uncert['Epistemic'], axis=1)
+                ua_mean = np.sum(pat_seq_graphs_preds_probs * pat_seq_graphs_uncert['Aleatoric'], axis=1)
+                # Normalization
+                H_n = minmax_nromalization(H.reshape(-1, 1)).squeeze() # .reshape(-1, 1) as we have N samples with one single feature
+                ue_n = minmax_nromalization(ue_mean.reshape(-1, 1)).squeeze() # .reshape(-1, 1) as we have N samples with one single feature
+                ua_n = minmax_nromalization(ua_mean.reshape(-1, 1)).squeeze() # .reshape(-1, 1) as we have N samples with one single feature
+                # Final score: more weight to epistemic, penalize aleatoric
+                # We have a '-' for 'wa' because we want to penalize samples with high aleatoric uncertainty as they are noisy
+                scores = self.parameters_exp['ContinualLearning']['UQWeights']['we']*ue_n + self.parameters_exp['ContinualLearning']['UQWeights']['wH']*H_n - self.parameters_exp['ContinualLearning']['UQWeights']['wa']*ua_n
+
+                # Remove very high aleatoric uncertainty samples
+                perc_top_alea_uncert_remove = 15 # drop top 15% aleatoric if desired
+                aleatoric_cut = np.percentile(ua_mean, 100 - perc_top_alea_uncert_remove)  
+                candidate_mask = (ua_mean <= aleatoric_cut)
+                candidate_indices = np.where(candidate_mask)[0]
+                candidate_scores = scores[candidate_mask]
+
+                # Get top 2*self.parameters_exp['ContinualLearning']['memory_capacity'] by score. 
+                # IMPORTANT: We try to get more samples than the memory capacity because the final selection 
+                # IMPORTANT: is done afterwards
+                n_preselected_samples = min(2*self.parameters_exp['ContinualLearning']['memory_capacity'], len(candidate_indices))
+                # Get top n_preselected_samples (sorting by decreasing scores, that is why we have a '-' in the argsort)
+                top_n_preselected_samples = candidate_indices[np.argsort(-candidate_scores)[:n_preselected_samples]]
+
+                if (not self.parameters_exp['ContinualLearning']['UQWeights']['use_model_features']):
+                    selected_samples_IDs_for_memory = top_n_preselected_samples[:self.parameters_exp['ContinualLearning']['memory_capacity']]
+                else:
+                    # cluster top_n_preselected_samples features into memory_capacity clusters and pick highest-score sample per cluster
+                    n_clusters = self.parameters_exp['ContinualLearning']['memory_capacity']
+                    km = KMeans(n_clusters=n_clusters, random_state=0).fit(pat_seq_graphs_emb[top_n_preselected_samples])
+                    labels = km.labels_
+                    selected_samples_IDs_for_memory = []
+                    for lab in range(n_clusters):
+                        members = np.where(labels == lab)[0]
+                        if len(members)==0: continue
+                        member_global_idx = top_n_preselected_samples[members]
+                        # pick member with highest score
+                        best = member_global_idx[np.argmax(scores[member_global_idx])]
+                        selected_samples_IDs_for_memory.append(best)
+                    selected_samples_IDs_for_memory = np.array(selected_samples_IDs_for_memory)
+
+
+                # Re-create the memory with the selected samples
+                shuffle(selected_samples_IDs_for_memory)
+                current_sample_ID_in_mem = 0
+                new_memory = {}
+                for i in selected_samples_IDs_for_memory:
+                    # Getting the original sample (not the normalized one as it is going to be re-normalized with the updated statistics in the next round)
+                    sample_ID_in_origin = pat_seq_graphs_ID_in_origin[i]
+                    sample_origin = pat_seq_graphs_origin[i]
+                    if (sample_origin.lower() == 'dataset'):
+                        original_sample = deepcopy(self.train_incremental_ds[self.current_DS_ID][sample_ID_in_origin] )
+                    elif (sample_origin.lower() == 'memory'):
+                        original_sample = deepcopy(self.memory[sample_ID_in_origin])
+
+                    # Update the sample info
+                    original_sample.ID_in_origin = current_sample_ID_in_mem
+                    original_sample.data_origin = 'memory'
+
+                    # Store the sample in memory
+                    new_memory[current_sample_ID_in_mem] = original_sample
+
+
+                    # Increase the ID of the current sample in memory
+                    current_sample_ID_in_mem += 1
+
+                self.memory = new_memory
             
             else:
                 raise ValueError(f"Replay strategy {self.parameters_exp['ContinualLearning']['replay_strategy']} is not valid.")

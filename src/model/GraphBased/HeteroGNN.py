@@ -29,6 +29,7 @@ class HeteroGNN(nn.Module):
         super().__init__()
         self.graph_pool_strategy = graph_pool_strategy
         self.graph_pool_fusion = graph_pool_fusion
+        self.evidential = evidential
 
         # Graph embedder for child features
         self.graph_embedder = AiidkitTEAVGraphEmbedder(
@@ -54,6 +55,7 @@ class HeteroGNN(nn.Module):
 
         # Output layer
         if (evidential):
+            self.relu = nn.ReLU() # IMPORTANT: NECESSARY TO ENSURE NON-NEGATIVE EVIDENCE
             if (self.graph_pool_fusion.lower() == "stack"):
                 self.graph_lin = Dirichlet(hidden_channels, out_channels)
             elif (self.graph_pool_fusion.lower() == "concatenation"):
@@ -107,6 +109,8 @@ class HeteroGNN(nn.Module):
         graph_emb = self.compute_graph_embedding(data)
 
         # Compute classification output
+        if (self.evidential):
+            graph_emb = self.relu(graph_emb) # IMPORTANT: NECESSARY TO ENSURE NON-NEGATIVE EVIDENCE
         out = self.graph_lin(graph_emb)  # graph-level prediction
         
         return out
