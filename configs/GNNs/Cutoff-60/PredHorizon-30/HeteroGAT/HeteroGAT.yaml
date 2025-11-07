@@ -32,7 +32,7 @@ Model:
 
 # Training parameters
 TrainingParams:
-  lr: 	0.00010333286956475764
+  lr: 0.00010333286956475764
   weight_decay: 1.0e-5 # Cannot use 1e-2 as it will be interpreted as a str by PyYAML parser
   batch_size_train: 32
   batch_size_val: 32
