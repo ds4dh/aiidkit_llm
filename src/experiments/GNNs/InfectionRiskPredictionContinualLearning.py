@@ -96,29 +96,63 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
             if ('replay_strategy' not in self.parameters_exp['ContinualLearning']):
                 self.parameters_exp['ContinualLearning']['replay_strategy'] = None
             # Particular parameters for some replay strategies
-            if (self.parameters_exp['ContinualLearning']['replay_strategy'].lower() == 'uqbased'):
-                if ('UQWeights' not in self.parameters_exp['ContinualLearning']):
-                    self.parameters_exp['ContinualLearning']['UQWeights'] = {
-                                                                                'wH': 0.5,
-                                                                                'we': 1.0,
-                                                                                'wa': 1.0,
-                                                                                'use_model_features': False
-                                                                            }
-                else:
-                    if ('wH' not in self.parameters_exp['ContinualLearning']['UQWeights']):
-                        self.parameters_exp['ContinualLearning']['UQWeights']['wH'] = 0.5
-                    if ('we' not in self.parameters_exp['ContinualLearning']['UQWeights']):
-                        self.parameters_exp['ContinualLearning']['UQWeights']['we'] = 1.0
-                    if ('wa' not in self.parameters_exp['ContinualLearning']['UQWeights']):
-                        self.parameters_exp['ContinualLearning']['UQWeights']['wa'] = 1.0
-                    if ('use_model_features' not in self.parameters_exp['ContinualLearning']['UQWeights']):
-                        self.parameters_exp['ContinualLearning']['UQWeights']['use_model_features'] = False
+            if (self.parameters_exp['ContinualLearning']['replay_strategy'] is not None):
+                if (self.parameters_exp['ContinualLearning']['replay_strategy'].lower() == 'uqbased'):
+                    if ('UQWeights' not in self.parameters_exp['ContinualLearning']):
+                        self.parameters_exp['ContinualLearning']['UQWeights'] = {
+                                                                                    'wH': 0.5,
+                                                                                    'we': 1.0,
+                                                                                    'wa': 1.0,
+                                                                                    'use_model_features': False
+                                                                                }
+                    else:
+                        if ('wH' not in self.parameters_exp['ContinualLearning']['UQWeights']):
+                            self.parameters_exp['ContinualLearning']['UQWeights']['wH'] = 0.5
+                        if ('we' not in self.parameters_exp['ContinualLearning']['UQWeights']):
+                            self.parameters_exp['ContinualLearning']['UQWeights']['we'] = 1.0
+                        if ('wa' not in self.parameters_exp['ContinualLearning']['UQWeights']):
+                            self.parameters_exp['ContinualLearning']['UQWeights']['wa'] = 1.0
+                        if ('use_model_features' not in self.parameters_exp['ContinualLearning']['UQWeights']):
+                            self.parameters_exp['ContinualLearning']['UQWeights']['use_model_features'] = False
             # Weights of the losses
             if ('lambda_dataset' not in self.parameters_exp['ContinualLearning']):
                 self.parameters_exp['ContinualLearning']['lambda_dataset'] = 1
             if ('lambda_replay' not in self.parameters_exp['ContinualLearning']):
                 self.parameters_exp['ContinualLearning']['lambda_replay'] = 1e-1
 
+        # Lisf of parameters for each training (if you want to get different parameters per incremental DS)
+        # List of learning rates
+        if ('list_lr' not in self.parameters_exp['TrainingParams']):
+            if ('lr' not in self.parameters_exp['TrainingParams']):
+                raise RuntimeError("At least one of the TrainingParams parameters 'lr' or 'list_lr' should be specified in a CL experiment") 
+            else:
+                self.parameters_exp['TrainingParams']['list_lr'] = [self.parameters_exp['TrainingParams']['lr'] for _ in range(self.parameters_exp['ContinualLearning']['n_incremental_ds'])]
+        if (len(self.parameters_exp['TrainingParams']['list_lr']) != self.parameters_exp['ContinualLearning']['n_incremental_ds']):
+            raise ValueError(f"Then length of the list of learning rates ({len(self.parameters_exp['TrainingParams']['list_lr'])}) shoudl be the same as the number of incremental DS ({self.parameters_exp['ContinualLearning']['n_incremental_ds']})")
+        # List of epochs
+        if ('list_n_epochs' not in self.parameters_exp['TrainingParams']):
+            if ('n_epochs' not in self.parameters_exp['TrainingParams']):
+                raise RuntimeError("At least one of the TrainingParams parameters 'n_epochs' or 'list_n_epochs' should be specified in a CL experiment") 
+            else:
+                self.parameters_exp['TrainingParams']['list_n_epochs'] = [self.parameters_exp['TrainingParams']['n_epochs'] for _ in range(self.parameters_exp['ContinualLearning']['n_incremental_ds'])]
+        if (len(self.parameters_exp['TrainingParams']['list_n_epochs']) != self.parameters_exp['ContinualLearning']['n_incremental_ds']):
+            raise ValueError(f"Then length of the list of number of epochs ({len(self.parameters_exp['TrainingParams']['list_n_epochs'])}) shoudl be the same as the number of incremental DS ({self.parameters_exp['ContinualLearning']['n_incremental_ds']})")
+        # List of lambda dataset
+        if ('list_lambda_dataset' not in self.parameters_exp['ContinualLearning']):
+            if ('lambda_dataset' not in self.parameters_exp['ContinualLearning']):
+                raise RuntimeError("At least one of the ContinualLearning parameters 'lambda_dataset' or 'list_lambda_dataset' should be specified in a CL experiment") 
+            else:
+                self.parameters_exp['ContinualLearning']['list_lambda_dataset'] = [self.parameters_exp['ContinualLearning']['lambda_dataset'] for _ in range(self.parameters_exp['ContinualLearning']['n_incremental_ds'])]
+        if (len(self.parameters_exp['ContinualLearning']['list_lambda_dataset']) != self.parameters_exp['ContinualLearning']['n_incremental_ds']):
+            raise ValueError(f"Then length of the list of number of epochs ({len(self.parameters_exp['TrainingParams']['list_lambda_dataset'])}) shoudl be the same as the number of incremental DS ({self.parameters_exp['ContinualLearning']['n_incremental_ds']})")
+        # List of lambda replay
+        if ('list_lambda_replay' not in self.parameters_exp['ContinualLearning']):
+            if ('lambda_replay' not in self.parameters_exp['ContinualLearning']):
+                raise RuntimeError("At least one of the ContinualLearning parameters 'lambda_replay' or 'list_lambda_replay' should be specified in a CL experiment") 
+            else:
+                self.parameters_exp['ContinualLearning']['list_lambda_replay'] = [self.parameters_exp['ContinualLearning']['lambda_replay'] for _ in range(self.parameters_exp['ContinualLearning']['n_incremental_ds'])]
+        if (len(self.parameters_exp['ContinualLearning']['list_lambda_replay']) != self.parameters_exp['ContinualLearning']['n_incremental_ds']):
+            raise ValueError(f"Then length of the list of number of epochs ({len(self.parameters_exp['ContinualLearning']['list_lambda_replay'])}) shoudl be the same as the number of incremental DS ({self.parameters_exp['ContinualLearning']['n_incremental_ds']})")
 
     def createIncrementalDatasets(self):
         """
@@ -856,6 +890,16 @@ class InfectionRiskPredContinualLearning(InfectionRiskPred):
         print(f"\n\n==========> Initialize the single training for a CONTINUAL LEARNING setting <==========")
         # Create new combined training daset
         self.createCombinedTrainingDS()
+
+        # Getting the parameters for the current incremental DS
+        # LR
+        self.parameters_exp['TrainingParams']['lr'] = self.parameters_exp['TrainingParams']['list_lr'][self.current_DS_ID]
+        # Epochs
+        self.parameters_exp['TrainingParams']['n_epochs'] = self.parameters_exp['TrainingParams']['list_n_epochs'][self.current_DS_ID]
+        # Lambda dataset
+        self.parameters_exp['ContinualLearning']['lambda_dataset'] = self.parameters_exp['ContinualLearning']['list_lambda_dataset'][self.current_DS_ID]
+        # Lambda replay
+        self.parameters_exp['ContinualLearning']['lambda_replay'] = self.parameters_exp['ContinualLearning']['list_lambda_replay'][self.current_DS_ID]
 
         # Initialize the training with th classical parameters
         super().initSingleTrain(create_new_model=create_new_model)

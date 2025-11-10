@@ -31,8 +31,8 @@ ContinualLearning:
     wa: 1.0
     use_model_features: false
   memory_capacity: 100
-  lambda_dataset: 1.0
-  lambda_replay: 1.0e-2
+  list_lambda_dataset: [1.0, 1.0, 1.0, 1.0]
+  list_lambda_replay: [1.0e-2, 1.0e-2, 1.0e-2, 1.0e-2]
 
 # Architecture to use
 Model:
@@ -45,13 +45,13 @@ Model:
 
 # Training parameters
 TrainingParams:
-  lr: 0.0006145162197914339
+  list_lr: [1.0e-2, 1.0e-2, 1.0e-2, 1.0e-2]
   weight_decay: 1.0e-05
-  batch_size_train: 64
-  batch_size_val: 64
-  batch_size_test: 64
-  n_epochs: 5
-  nb_repetitions: 1
+  batch_size_train: 4096
+  batch_size_val: 4096
+  batch_size_test: 4096
+  list_n_epochs: [40, 30, 30, 50]
+  nb_repetitions: 5
 
 # Optimization
 Optimization:
@@ -62,7 +62,7 @@ Optimization:
   optimizer: Adam
   loss_function: EvidentialLearningLoss
   EvidentialLoss:
-    lambda_evidential: 1.0e-1
+    lambda_evidential: 1.0e-3
     lambda_evidential_sched: true
   EarlyStopping:
     use_early_stopping: false

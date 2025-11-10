@@ -214,8 +214,6 @@ class GenericExperiment(ABC):
             parameters_exp['TrainingParams']['batch_size_test'] = 4
         if ('n_epochs' not in parameters_exp['TrainingParams']):
             parameters_exp['TrainingParams']['n_epochs'] = 10
-        if (not parameters_exp['Optimization']['Optuna']['use_optuna']):
-            self.lr = parameters_exp['TrainingParams']['lr']
 
         # Results file
         self.repetitions_results_fn = None
