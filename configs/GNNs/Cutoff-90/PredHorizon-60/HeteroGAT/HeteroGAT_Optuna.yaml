@@ -45,8 +45,8 @@ TrainingParams:
 Optimization:
   Optuna:
     use_optuna: true
-    n_trials: 30
-    optuna_starting_point_fn: null
+    n_trials: 7
+    optuna_starting_point_fn: results/InfectionRiskPred/HeteroGAT_OPTUNA_TEAV_Cutoff-90_PredHor-60_18.11.2025_092121_0/metrics/optuna_results.db
   optimizer: Adam
   loss_function: CE
   EarlyStopping:
