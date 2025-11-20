@@ -4,6 +4,7 @@
 import h5py
 import argparse
 import yaml
+from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_auc_score,\
@@ -164,7 +165,7 @@ def main():
     targets_last_epoch = {rep_id : {data_split: None for data_split in list(results_h5_file[base_name_main_group+str(rep_id)]["Preds"].keys())} for rep_id in range(n_repetitions)}
     preds_last_epoch = {rep_id : {data_split: None for data_split in list(results_h5_file[base_name_main_group+str(rep_id)]["Preds"].keys())} for rep_id in range(n_repetitions)}
     preds_probs_last_epoch = {rep_id : {data_split: None for data_split in list(results_h5_file[base_name_main_group+str(rep_id)]["Preds"].keys())} for rep_id in range(n_repetitions)}
-    for rep_id in range(n_repetitions):
+    for rep_id in tqdm(range(n_repetitions)):
         for data_split in list(results_h5_file[base_name_main_group+str(rep_id)]["Preds"].keys()):
             if (len(results_h5_file[base_name_main_group+str(rep_id)]["Preds"][data_split].keys()) > 0):
                 for epoch in epochs_list:
@@ -185,7 +186,7 @@ def main():
                         preds_probs_last_epoch[rep_id][data_split] = preds_probs[:]
 
                     # Getting the metrics for the epoch
-                    print(f"\n\n=========> {data_split.upper()} DATA SPLIT FOR EPOCH {epoch} <=========\n")
+                    #print(f"\n\n=========> {data_split.upper()} DATA SPLIT FOR EPOCH {epoch} <=========\n")
                     # STATES predictions metrics
                     # MCC, F1-Score and Balanced Accuracy
                     mcc, f1_score_val, balanced_acc, balanced_acc_adjusted = get_classification_metrics(
