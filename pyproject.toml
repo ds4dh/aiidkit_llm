@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# Metadata
+[project]
+name = "aiidkit_llm"
+version = "0.1.0"
+description = "A project to train discriminative and generative LLMs to predict infections in post-transplant patient trajectories."
+readme = "README.md"
+authors = [
+    { name = "Alban Bornet", email = "alban.bornet@gmail.com" },
+    { name = "Yamil Vindas", email = "anthony.yazdani@unige.ch" },
+]
+license = { text = "MIT" }
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Dependencies (uv pip install -e .)
+dependencies = [
+    "trl[vllm]==0.25.1",
+    "peft",
+    "sentence-transformers",
+    "pandas",
+    "wandb",
+    "weave",
+]
+
+# Project links
+[project.urls]
+Homepage = "https://github.com/ds4dh/aiidkit_llm"
+Repository = "https://github.com/ds4dh/aiidkit_llm"
+
+# Development dependencies (uv pip install -e ".[dev]")
+[project.optional-dependencies]
+dev = [
+    "ipdb",
+    "pytest",
+    "pytest-mock",
+]
+
+# Package discovery
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+# # Configuration for Pytest
+# [tool.pytest.ini_options]
+# minversion = "7.0"
+# testpaths = ["tests"]

@@ -4,48 +4,24 @@ This project processes raw electronic health records (EHR) of kidney transplant 
 
 Note: This pipeline requires access to the AIIDKIT dataset. You must place the raw data file in the data/raw directory before running the code.
 
-## 📋 Table of contents
+## Installation
 
-  - [Project workflow](#-project-workflow)
-  - [Setup](#️-setup)
-  - [Usage](#-usage)
-      - [Step 1: Create datasets](#step-1-create-datasets)
-      - [Step 2: Pre-train the token embedding model](#step-2-pre-train-the-token-embedding-model)
-      - [Step 3: Run hyperparameter optimization](#step-3-run-hyperparameter-optimization)
-  - [Scripts overview](#-scripts-overview)
-  - [Configuration](#-configuration)
+1.  **Install dependencies:**
+First, install the `uv` tool and set up the virtual environment with all required packages.
 
-## 🚀 Project workflow
+```bash
+# Install uv (if not already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# Create and activate the virtual environment
+uv venv --python 3.11
+source .venv/bin/activate
+# Install the project and dependencies
+uv pip install -e ".[dev]"
+uv pip install flash-attn --no-build-isolation
+```
 
-The project follows a clear, step-by-step workflow:
-
-1.  **Data Preprocessing**: Raw patient data from a pickle file is processed into individual patient record CSVs. These are then aggregated into a structured HugginFace datasets object.
-2.  **Model Pre-training**: A custom `PatientTokenEmbeddingModel` (a transformer-based architecture) is pre-trained on the patient sequences using a Masked Language Modeling (MLM) objective. This step learns to understand the structure and patterns in the patient data.
-3.  **Hyperparameter Tuning**: Optuna is used to systematically search for the best set of hyperparameters for the model architecture and training process, maximizing performance on a validation set. The `optuna_tuning.sh` script automates running experiments across different data slices and prediction horizons.
-
-## ⚙️ Setup
-
-1.  **Clone the repository:**
-
-    ```bash
-    git clone https://github.com/albornet/aiidkit
-    cd aiidkit
-    ```
-
-2.  **Install dependencies:**
-    For example, you can use `uv` for efficient package and virtual environment management.
-
-    ```bash
-    # Download and install uv
-    wget -qO- https://astral.sh/uv/install.sh | sh
-    # Create and activate a local virtual environment
-    uv venv && source .venv/bin/activate
-    # Install dependencies
-    uv pip install -r requirements.txt
-    ```
-
-3.  **Place the data:**
-    Ensure your raw patient data file is located at the path specified in `src/constants.py` (e.g., `data/raw/stcs_data.pkl`).
+2.  **Place the data:**
+Ensure your raw patient data file is located at the path specified in `src/constants.py` (e.g., `data/raw/stcs_data.pkl`).
 
 ## 💻 Usage
 
