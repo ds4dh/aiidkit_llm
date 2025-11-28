@@ -1,293 +1,140 @@
+import os
+import types
 import random
 import numpy as np
 import torch
 import torch.nn as nn
-from transformers import AutoModelForMaskedLM, AutoModelForCausalLM, AutoConfig
-from transformers.utils import ModelOutput
+from dataclasses import dataclass, field
+from safetensors.torch import load_file
+from transformers import (
+    AutoConfig,
+    AutoModelForMaskedLM,
+    AutoModelForSequenceClassification,
+)
 from transformers.data.data_collator import DataCollatorMixin
 from sentence_transformers import SentenceTransformer
-from sentence_transformers.models import Pooling
-from dataclasses import dataclass, field
-from typing import Optional
-
-from src.model.model_utils import TimeEmbedding, PositionalEncoding, FocalLoss
-import src.constants as constants
-csts = constants.ConstantsNamespace()
+from src.model.model_utils import TimeEmbedding, PositionalEncoding
 
 
-@dataclass
-class PatientTokenEmbeddingOutput(ModelOutput):
+class PatientEmbeddingModelFactory:
     """
-    Custom output class with fields for a potiential supervised task
-    This ensures a consistent output structure:
-    - loss (total),
-    - mlm_loss, mlm_logits,
-    - supervised_task_loss, supervised_task_logits
-    - supervised_task_hidden_states, supervised_task_pooled_embeddings
+    Factory to handle the lifecycle of a patient embedding model:
+    1. create_from_backbone: hybrid HF backbone with patient input embedding layer
+    2. from_pretrained: restores pretrained patient embedding model for finetuning/inference
     """
-    loss: Optional[torch.FloatTensor] = None  # total loss
-    mlm_loss: Optional[torch.FloatTensor] = None
-    mlm_logits: Optional[torch.FloatTensor] = None
-    cutoff_days: Optional[torch.FloatTensor] = None
-    supervised_task_loss: Optional[torch.FloatTensor] = None
-    supervised_task_logits: Optional[torch.FloatTensor] = None
-    supervised_task_hidden_states: Optional[tuple[torch.Tensor]] = None
-    supervised_task_pooled_embeddings: Optional[torch.Tensor] = None
-
-
-class PatientTokenEmbeddingModel(nn.Module):
-    def __init__(
-        self,
-        vocabs: dict[str, dict[str, int]],
-        original_model_id: str,
-        original_model_task: str,
-        original_model_params: dict[str, int]=None,
-        send_hidden_states_to_cpu: bool=True,
-        use_supervised_task: bool=False,
-        use_uncertainty_weighting: bool=False,    
-        supervised_task_type: str="binary",
-        supervised_task_weight: float=0.0,
-        use_positional_encoding_for_input_layer: bool=True,
-        use_pretrained_embeddings_for_input_layer: bool=True,
-        pretrained_model_name_for_input_layer: str="NeuML/pubmedbert-base-embeddings",
-        *args, **kwargs,
+    @classmethod
+    def create_from_backbone(
+        cls,
+        model_id: str,
+        task: str,
+        embedding_layer_config: dict,
+        config_args: dict={},
+        model_args: dict={},
+        load_backbone_weights: bool=False,
     ):
-        super().__init__()
-        assert original_model_task in ["masked", "causal"],\
-            "original_model_task must be masked or causal"
-        self.is_causal = original_model_task == "causal"
-        self.send_hidden_states_to_cpu = send_hidden_states_to_cpu
-
-        # Load parameters of the given model and modify them as required
-        config = AutoConfig.from_pretrained(original_model_id)
-        if original_model_params is not None:
-            for value, key in original_model_params.items():
-                setattr(config, value, key)
-
-        # Initialize model from an original pre-trained LLM and return hidden states
-        if original_model_task == "masked":
-            self.llm = AutoModelForMaskedLM.from_config(config)
-        elif original_model_task == "causal":
-            self.llm = AutoModelForCausalLM.from_config(config)
-        self.hidden_size = self.llm.config.hidden_size
-        self.num_tokens_max = self.llm.config.max_position_embeddings
-
-        # Create embedding layer and replace the LLM one to prevent incompatibility
-        self.input_embedding_layer = PatientEmbeddingLayer(
-            embedding_dim=self.hidden_size,
-            vocabs=vocabs,
-            use_positional_encoding=use_positional_encoding_for_input_layer,
-            use_pretrained_embeddings=use_pretrained_embeddings_for_input_layer,
-            pretrained_model_name=pretrained_model_name_for_input_layer,
-        )
-
-        # Modify the LLM head (classifier) to match the number of value tokens
-        num_value_tokens = len(vocabs["value_binned"])
-        self.llm.config.vocab_size = num_value_tokens
-        new_decoder_layer = nn.Linear(
-            in_features=self.hidden_size, 
-            out_features=num_value_tokens,
-            bias=True,
-        )
-        self.llm.set_output_embeddings(new_decoder_layer)
-
-        # Supervised task setup, if required
-        self.use_supervised_task = use_supervised_task
-        self.use_uncertainty_weighting = use_uncertainty_weighting
-        self.supervised_task_weight = supervised_task_weight
-        if use_supervised_task:
-            self._init_supervised_modules_and_loss(supervised_task_type)
-
-    def _init_supervised_modules_and_loss(
-        self,
-        supervised_task_type: str,
-    ) -> None:
         """
-        Initialize modules and loss function for a potential supervised task
+        Creates a new patient model by grafting a custom embedding layer onto a standard backbone
         """
-        # Module to pool token embeddings into a single vector
-        self.pooler = Pooling(
-            word_embedding_dimension=self.hidden_size,
-            pooling_mode_cls_token=False,
-            pooling_mode_max_tokens=True,
-            pooling_mode_mean_tokens=False,
-        )
+        # Parse potential complex-type arguments
+        for key in ["dtype", "torch_dtype"]:
+            if isinstance(model_args.get(key), str):
+                model_args[key] = getattr(torch, model_args[key])
 
-        # Classifier for the supervised task, taking pooled embeddings as input
-        self.supervised_task_num_classes = 2 if supervised_task_type == "binary" else 4
-        # self.supervised_task_decoder = nn.Sequential(
-        #         nn.Linear(self.pooler.pooling_output_dimension, self.hidden_size),
-        #         nn.LayerNorm(self.hidden_size),
-        #         nn.GELU(),
-        #         nn.Dropout(0.1),
-        #         nn.Linear(self.hidden_size, self.supervised_task_num_classes),
-        #     )
-        self.supervised_task_decoders = nn.ModuleDict({
-            str(cutoff_day): nn.Sequential(
-                nn.Linear(self.pooler.pooling_output_dimension, self.hidden_size),
-                nn.LayerNorm(self.hidden_size),
-                nn.GELU(),
-                nn.Dropout(0.1),
-                nn.Linear(self.hidden_size, self.supervised_task_num_classes),
+        # Load model configuration from huggingface's directory
+        config = AutoConfig.from_pretrained(model_id, **config_args, **model_args)
+
+        # Initialize the Backbone (Pre-trained or Random)
+        model_cls = cls._get_model_class(task)
+        if load_backbone_weights:
+            print(f"Initializing {model_id} backbone with pre-trained weights.")
+            model = model_cls.from_pretrained(
+                model_id, config=config, ignore_mismatched_sizes=True, **model_args
             )
-            for cutoff_day in csts.CUTOFF_DAYS
-        })
-
-        # Uncertainty weighting parameters, if required
-        if self.use_uncertainty_weighting:
-            self.log_var_mlm = nn.Parameter(torch.tensor(0.0))
-            self.log_var_sup = nn.Parameter(torch.tensor(0.0))
-
-        # Loss to learn the supervised task
-        self.supervised_task_loss_fn = FocalLoss(gamma=2.0)
-
-    def forward(
-        self,
-        unmasked_input_dict: dict[str: list[str|int]],
-        masked_input_dict: dict[str: list[str|int]],
-        attention_mask: Optional[torch.Tensor]=None,
-        mlm_labels: Optional[torch.LongTensor]=None,
-        supervised_task_labels: Optional[torch.LongTensor]=None,
-        output_attentions: Optional[bool]=None,
-        **kwargs,
-    ) -> PatientTokenEmbeddingOutput:
-        """
-        Forward function of the patient embedding model
-        - during training: use masked inputs for both the MLM and supervised task
-        - during inference: use unmasked inputs for the supervised task
-        """
-        # Initialize conditional outputs to default values
-        # This prevents inconsistencies when collecting predictions in an evaluation loop
-        device = attention_mask.device if attention_mask is not None else "cpu"
-        hidden_states, pooled_embeddings = torch.empty(0), torch.empty(0)
-        cutoff_days = torch.empty(0)
-        sup_logits, mlm_logits = torch.empty(0), torch.empty(0)
-        sup_loss = torch.tensor(0.0, device=device)
-
-        # Perform forward pass through the embedding layer and the LLM
-        output_mlm_hidden_states = self.training and self.use_supervised_task
-        mlm_input_embeddings = self.input_embedding_layer(**masked_input_dict)
-        mlm_outputs = self.llm(
-            inputs_embeds=mlm_input_embeddings,
-            attention_mask=attention_mask,
-            labels=mlm_labels,
-            output_hidden_states=output_mlm_hidden_states,
-            output_attentions=output_attentions,
-        )
-
-        # Extract necessary outputs
-        mlm_loss = mlm_outputs.loss
-        mlm_logits = mlm_outputs.logits
-        if output_mlm_hidden_states:
-            hidden_states = self._lighten_hidden_states(mlm_outputs.hidden_states, attention_mask)
-
-        # Process supervised task outputs
-        if self.use_supervised_task:
-
-            # If in evaluation mode, use unmasked embeddings as input
-            if not self.training:
-                llm_input_embeddings = self.input_embedding_layer(**unmasked_input_dict)
-                llm_outputs = self.llm(
-                    inputs_embeds=llm_input_embeddings,
-                    attention_mask=attention_mask,
-                    output_hidden_states=True,
-                    output_attentions=output_attentions,
-                )
-                hidden_states = self._lighten_hidden_states(
-                    hidden_states=llm_outputs.hidden_states,
-                    attention_mask=attention_mask,
-                )
-
-            # Pool the embeddings to get a single vector representation for the sequence
-            pooled_embeddings = self.pooler({
-                "token_embeddings": hidden_states[-1],
-                "attention_mask": attention_mask,
-            })["sentence_embedding"]
-
-            # # /!\ DEBUG /!\ #
-            # linear_readout_mode = True
-            # if linear_readout_mode:
-            #     pooled_embeddings = pooled_embeddings.detach()
-            # # /!\ DEBUG /!\ #
-
-            # Compute supervised logits and loss if labels are provided
-            # sup_logits = self.supervised_task_decoder(pooled_embeddings)
-            sup_logits = torch.empty(
-                pooled_embeddings.size(0),
-                self.supervised_task_num_classes,
-                device=pooled_embeddings.device,
-            )
-            cutoffs = [str(c) for c in kwargs["cutoff"]]
-            for cutoff_day in set(cutoffs):
-                indices = [i for i, c in enumerate(cutoffs) if c == cutoff_day]
-                cutoff_embeddings = pooled_embeddings[indices]
-                cutoff_decoder = self.supervised_task_decoders[cutoff_day]
-                cutoff_logits = cutoff_decoder(cutoff_embeddings)
-                sup_logits[indices] = cutoff_logits.to(sup_logits.dtype)
-            
-            cutoffs = [int(c) if c != "full" else -1 for c in cutoffs]
-            cutoff_days = torch.tensor(cutoffs, device=device)
-
-            sup_loss = self.supervised_task_loss_fn(sup_logits, supervised_task_labels)
-
-        # Compute final loss (case where there is no supervised task)
-        if not self.use_supervised_task:
-            total_loss = mlm_loss
-
-        # Use uncertainty weighting to mix losses, see in Kandall et al. (2018)
-        elif self.use_uncertainty_weighting:
-
-            # The first part of the loss is the precision-weighted task losses
-            weighted_mlm_loss = torch.exp(-self.log_var_mlm) * mlm_loss
-            weighted_sup_loss = torch.exp(-self.log_var_sup) * sup_loss
-            regularization = 0.5 * (self.log_var_mlm + self.log_var_sup)
-            total_loss = weighted_mlm_loss + weighted_sup_loss + regularization
-
-        # Combine losses with a "fixed" task weight (might be modified by callback scheduler)
         else:
-            weighted_mlm_loss = (1 - self.supervised_task_weight) * mlm_loss  # mlm_loss
-            weighted_sup_loss = self.supervised_task_weight * sup_loss
-            total_loss = weighted_mlm_loss + weighted_sup_loss
+            print(f"Initializing {model_id} backbone with random weights.")
+            model = model_cls.from_config(config, **model_args)
 
-        # Optionally, send hidden states to CPU to save GPU memory
-        if self.send_hidden_states_to_cpu:
-            hidden_states = tuple(h.detach().cpu() for h in hidden_states)
-
-        # Return all relevant outputs in a structured object
-        return PatientTokenEmbeddingOutput(
-            loss=total_loss,
-            mlm_loss=mlm_loss,
-            mlm_logits=mlm_logits,
-            cutoff_days=cutoff_days,
-            supervised_task_loss=sup_loss,
-            supervised_task_logits=sup_logits,
-            supervised_task_hidden_states=hidden_states,
-            supervised_task_pooled_embeddings=pooled_embeddings,
+        # Initialize Custom Layer (Always random at creation)
+        custom_embed = PatientEmbeddingLayer(
+            embedding_dim=config.hidden_size, **embedding_layer_config
         )
 
-    def _lighten_hidden_states(
-        self,
-        hidden_states: tuple[torch.Tensor],
-        attention_mask: torch.Tensor,
-    ):
-        """ Avoid keeping all hidden states in memory (only the last one)
-        """
-        # Extract last hidden states
-        last_hidden_state = hidden_states[-1]
+        # Graft custom input patient embedding layer to the classic backbone
+        return cls._patch_model(model, custom_embed, embedding_layer_config)
 
-        # Exceptions for some models when using flash-attn-2
-        if last_hidden_state.ndim != 3:
-            batch_size, seq_len = attention_mask.shape
-            hidden_size = last_hidden_state.shape[-1]
-            unflattened = torch.zeros(
-                batch_size, seq_len, hidden_size,
-                device=last_hidden_state.device,
-                dtype=last_hidden_state.dtype
-            )
-            unflattened[attention_mask.bool()] = last_hidden_state
-            last_hidden_state = unflattened  # chelou non
-        
-        return (last_hidden_state,)
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_dir: str,
+        task: str,
+        embedding_layer_config: dict,
+        model_args: dict = {},
+        **kwargs,
+    ):
+        """
+        Restores a patient model from a local directory where it was saved
+        """
+        print(f"From pretrained unused arguments: {kwargs}")
+        # Load Config from the local directory
+        config = AutoConfig.from_pretrained(pretrained_dir, **model_args)
+
+        # Build the skeleton with random weights
+        model_cls = cls._get_model_class(task)
+        model = model_cls.from_config(config, **model_args)
+
+        # Re-create the custom Layer
+        custom_embed = PatientEmbeddingLayer(
+            embedding_dim=config.hidden_size, **embedding_layer_config
+        )
+
+        # Patch model structure before loading weights
+        model = cls._patch_model(model, custom_embed, embedding_layer_config)
+
+        # Load all weights (backbone and custom embedding layer)
+        safe_path = os.path.join(pretrained_dir, "model.safetensors")
+        if os.path.exists(safe_path):
+            print(f"Loading patient model weights from {safe_path}...")
+            state_dict = load_file(safe_path)
+            # strict=False allows switching from MLM head (saved) to classification head (new)
+            model.load_state_dict(state_dict, strict=False)
+        else:
+            raise FileNotFoundError(f"No model.safetensors found in {pretrained_dir}")
+
+        return model
+
+    @staticmethod
+    def _get_model_class(task: str):
+        if task == "masked": return AutoModelForMaskedLM
+        if task == "classification": return AutoModelForSequenceClassification
+        raise ValueError("Task must be 'masked' or 'classification'")
+
+    @staticmethod
+    def _patch_model(model, custom_embed, config_dict):
+        """
+        Attaches the custom layer and overrides the forward method.
+        """
+        # Attach layer as a submodule so it saves/loads with state_dict
+        custom_embed.to(dtype=model.dtype, device=model.device)
+        model.patient_embedder = custom_embed
+
+        # Define custom forward
+        def custom_forward(self, input_dict=None, inputs_embeds=None, **kwargs):
+            inputs_embeds = self.patient_embedder(**input_dict)
+            outputs = self.original_forward(inputs_embeds=inputs_embeds, **kwargs)
+            if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
+                outputs.hidden_states = (outputs.hidden_states[-1],)
+            return outputs
+
+        # Apply Monkey Patch
+        model.original_forward = model.forward
+        model.forward = types.MethodType(custom_forward, model)
+
+        # Expose config attributes
+        model.use_pretrained_embeddings = custom_embed.use_pretrained_embeddings
+        model.pretrained_model_name = custom_embed.pretrained_model_name
+        model.config.max_position_embeddings = config_dict.get("max_position_embeddings", 512)
+
+        return model
 
 
 class PatientEmbeddingLayer(nn.Module):
@@ -340,6 +187,7 @@ class PatientEmbeddingLayer(nn.Module):
         self.time_embedding = TimeEmbedding(embedding_dim)
 
         # Positional encoding to encode relative position between events
+        self.use_positional_encoding = use_positional_encoding
         if use_positional_encoding:
             self.positional_encoding = PositionalEncoding(embedding_dim)
         else:
@@ -509,28 +357,37 @@ class PatientEmbeddingLayer(nn.Module):
 
 
 @dataclass
-class PatientDataCollatorForLanguageModelling(DataCollatorMixin):
+class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
     """
     Data collator used for the PatientEmbedding-based language model
     Modified from transformers.data.data_collator.py
     """
-    mlm: bool=True
-    pad_id: int=0
-    mask_id: int=1
-    bos_id: int=2
-    eos_id: int=3
-    unk_id: int=4
+    pad_token_id: int=0
+    mask_token_id: int=1
+    bos_token_id: int=2
+    eos_token_id: int=3
+    unk_token_id: int=4
     input_keys: list[str] = field(default_factory=lambda: ["entity_id", "attribute_id"])
     mlm_masked_key: str="value_id"
     mlm_label_key: str="value_id"
     time_key: str="days_since_tpx"
-    use_supervised_task: bool=False
-    supervised_task_key: str="infection_label_binary"
     use_pretrained_embeddings: bool=True
-    num_tokens_max: int=512
-    num_mlm_labels: Optional[int]=None
+    max_position_embeddings: int=512
     mlm_probability: float=0.15
+    truncation_probability: float=0.5
     return_tensors: str="pt"
+
+    @classmethod
+    def from_kwargs(cls, **kwargs):
+        """
+        Filter the kwargs to only include keys that exist in the dataclass
+        Valid keys will automatically include keys from the subclass if called on the subclass
+        """
+        # cls.__dataclass_fields__ contains fields from the class and its parents
+        return cls(**{
+            k: v for k, v in kwargs.items() 
+            if k in cls.__dataclass_fields__
+        })
 
     def __post_init__(self):
         """
@@ -539,11 +396,11 @@ class PatientDataCollatorForLanguageModelling(DataCollatorMixin):
         if self.use_pretrained_embeddings:
 
             # Replace input keys by their corresponding text
-            self.pad_id = "[PAD]"  # no ids, but texts
-            self.mask_id = "[MASK]"  # no ids, but texts
-            self.bos_id = "[BOS]"  # no ids, but texts
-            self.eos_id = "[EOS]"  # no ids, but texts
-            self.unk_id = "[UNK]"  # no ids, but texts
+            self.pad_token_id = "[PAD]"  # no ids, but texts
+            self.mask_token_id = "[MASK]"  # no ids, but texts
+            self.bos_token_id = "[BOS]"  # no ids, but texts
+            self.eos_token_id = "[EOS]"  # no ids, but texts
+            self.unk_token_id = "[UNK]"  # no ids, but texts
             self.input_keys = ["entity", "attribute"]
             self.mlm_masked_key = "value_binned"
 
@@ -580,9 +437,17 @@ class PatientDataCollatorForLanguageModelling(DataCollatorMixin):
         """
         Truncate samples longer than the maximum allowed sequence length
         """
-        effective_max_len = self.num_tokens_max - 2  # for bos and eos tokens
+        effective_max_len = self.max_position_embeddings - 2  # for bos and eos tokens
         for i, sample in enumerate(samples):
             seq_len = next(iter(sample.values())).shape[0]
+
+            # Augment the data by taking partial sequences only
+            if self.truncation_probability is not None and self.truncation_probability > 0:
+                if random.random() < self.truncation_probability:
+                    truncated_len = random.randint(1, seq_len - 1)
+                    samples[i] = {key: val[:truncated_len] for key, val in sample.items()}
+
+            # Ensure the sequence does not go past the maximum model length
             if seq_len > effective_max_len:
                 start_idx = random.randint(0, seq_len - effective_max_len)
                 end_idx = start_idx + effective_max_len
@@ -590,7 +455,7 @@ class PatientDataCollatorForLanguageModelling(DataCollatorMixin):
 
         return samples
 
-    def _add_bos_eos_ids(
+    def _add_bos_eos_token_ids(
         self,
         sequence: np.ndarray,
         data_key: str,
@@ -602,12 +467,12 @@ class PatientDataCollatorForLanguageModelling(DataCollatorMixin):
         if data_key == self.time_key:
             to_add = ([sequence[0]], [sequence[-1]])
         else:
-            to_add = ([self.bos_id], [self.eos_id])
+            to_add = ([self.bos_token_id], [self.eos_token_id])
 
         return np.concatenate([to_add[0], sequence, to_add[-1]], axis=0)
         # return torch.cat([to_add[0], sequence, to_add[-1]], dim=0)
         
-    def _add_special_tokens(
+    def _add_special_token_ids(
         self,
         samples: list[dict[str, np.ndarray]],
     ) -> list[dict[str, np.ndarray]]:
@@ -615,7 +480,7 @@ class PatientDataCollatorForLanguageModelling(DataCollatorMixin):
         For now, only add BOS and EOS tokens to each sequence in all samples
         """
         for i, sample in enumerate(samples):
-            samples[i] = {k: self._add_bos_eos_ids(v, k) for k, v in sample.items()}
+            samples[i] = {k: self._add_bos_eos_token_ids(v, k) for k, v in sample.items()}
         return samples
 
     def _pad_batch(
@@ -629,13 +494,13 @@ class PatientDataCollatorForLanguageModelling(DataCollatorMixin):
         padded_batch: dict[str, np.ndarray] = {}
         for key in self.features_to_process:
             sequences = [s[key] for s in samples]
-            padding_value = 0.0 if key == self.time_key else self.pad_id
+            padding_value = 0.0 if key == self.time_key else self.pad_token_id
             padded_batch[key] = self._pad_sequences_numpy(
                 sequences, batch_first=True, padding_value=padding_value,
             )
 
         # Compute attention mask, given the padding performed on the sequences
-        attention_mask = padded_batch[self.features_to_process[0]] != self.pad_id
+        attention_mask = padded_batch[self.features_to_process[0]] != self.pad_token_id
         attention_mask = attention_mask.astype(int)
 
         return padded_batch, attention_mask
@@ -648,7 +513,7 @@ class PatientDataCollatorForLanguageModelling(DataCollatorMixin):
         Pipeline to truncate, encapsulate, pad samples, and compute attention masks
         """
         samples = self._truncate_sequences(samples)
-        samples = self._add_special_tokens(samples)
+        samples = self._add_special_token_ids(samples)
         padded_batch, attention_mask = self._pad_batch(samples)
 
         return padded_batch, attention_mask
@@ -658,37 +523,23 @@ class PatientDataCollatorForLanguageModelling(DataCollatorMixin):
         samples: list[dict[str, np.ndarray]],
     ) -> dict[str, dict[str, np.ndarray]|np.ndarray]:
         """
-        Collate patient embedding samples and create labels for LM training
-        Used by the huggingface trainer
+        Collate patient sequences and create labels for LM training
+        Used by HuggingFace's trainer
         """
         # Preprocess the input samples
         samples, non_features = self._separate_non_processed_features(samples)
         padded_batch, attention_mask = self._process_batch(samples)
 
-        # Prepare unmasked data and labels for the supervised task
-        if self.use_supervised_task:
-            unmasked_input_dict = {k: v.copy() for k, v in padded_batch.items()}
-            if self.use_pretrained_embeddings: del unmasked_input_dict[self.mlm_label_key]
-            supervised_task_labels = np.array(non_features[self.supervised_task_key])
-        else:
-            unmasked_input_dict = None
-            supervised_task_labels = None
-
         # Prepare inputs and labels for the MLM task
         masked_input_dict = padded_batch
-        if self.mlm:
-            masked_values, mlm_labels = self._masked_modelling(masked_input_dict)
-            masked_input_dict[self.mlm_masked_key] = masked_values
-        else:  # causal LM (not sure if I keep this, but we never know)
-            mlm_labels = self._causal_modelling(masked_input_dict)
+        masked_values, labels = self._masked_modelling(masked_input_dict)
+        masked_input_dict[self.mlm_masked_key] = masked_values
 
         # Assemble the final input batch
         batch = {
-            "masked_input_dict": self._check_types(masked_input_dict),       # dict[str, np.ndarray|torch.tensor]
-            "unmasked_input_dict": self._check_types(unmasked_input_dict),   # dict[str, np.ndarray|torch.tensor]
-            "attention_mask": torch.tensor(attention_mask),                  # torch.tensor
-            "mlm_labels": torch.tensor(mlm_labels),                          # torch.tensor
-            "supervised_task_labels": torch.tensor(supervised_task_labels),  # torch.tensor
+            "input_dict": self._check_types(masked_input_dict),  # dict[str, np.ndarray|torch.tensor]
+            "attention_mask": torch.tensor(attention_mask),      # torch.tensor[float]
+            "labels": torch.tensor(labels).long(),               # torch.tensor[int]
         }
         batch.update(non_features)  # in case useful somewhere
 
@@ -699,7 +550,7 @@ class PatientDataCollatorForLanguageModelling(DataCollatorMixin):
         input_dict: dict[str, np.ndarray],
     ) -> dict[str, np.ndarray|torch.Tensor]:
         """ Make sure the type of the batch elements is the correct one.
-            The reason for all this is that strings can only be put to np.ndarray,
+            The reason for this is that strings can only be put to np.ndarray,
             while other elements are better inside tensors
         """
         for key, value in input_dict.items():
@@ -716,7 +567,6 @@ class PatientDataCollatorForLanguageModelling(DataCollatorMixin):
     ):
         """
         Pads a list of variable-length sequences with a padding value.
-
         This function is a NumPy equivalent of torch.nn.utils.rnn.pad_sequence.
 
         Args:
@@ -762,7 +612,7 @@ class PatientDataCollatorForLanguageModelling(DataCollatorMixin):
 
         # Sample masked locations in the batch, using mlm_probability
         probability_matrix = torch.full(mlm_labels.shape, self.mlm_probability)
-        no_mask_ids = [self.bos_id, self.eos_id, self.unk_id, self.pad_id]
+        no_mask_ids = [self.bos_token_id, self.eos_token_id, self.unk_token_id, self.pad_token_id]
         no_mask_pad = torch.tensor(np.isin(mlm_labels, no_mask_ids))
         probability_matrix.masked_fill_(no_mask_pad, value=0.0)
         masked_indices = torch.bernoulli(probability_matrix).bool()
@@ -773,7 +623,7 @@ class PatientDataCollatorForLanguageModelling(DataCollatorMixin):
 
         # 80% of the time, replace masked input tokens with mask token
         indices_replaced = torch.bernoulli(torch.full(mlm_labels.shape, 0.8)).bool() & masked_indices
-        mlm_inputs[indices_replaced] = self.mask_id
+        mlm_inputs[indices_replaced] = self.mask_token_id
 
         # 10% of the time, replace masked input tokens with a random entry of the batch
         indices_random = torch.bernoulli(torch.full(mlm_labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
@@ -784,22 +634,35 @@ class PatientDataCollatorForLanguageModelling(DataCollatorMixin):
 
         return mlm_inputs, mlm_labels
 
-    def _causal_modelling(
-        self,
-        masked_input_dict: dict[str, np.ndarray],
-    ) -> torch.Tensor:
-        """
-        Prepare labels for causal language modeling by shifting tokens to the right
-        Modified from transformers.data.data_collator.py
-        """
-        raise NotImplementedError
-        # TODO: CHECK WHAT TO CHANGE TO MAKE IT WORK WITH TEXT AND NOT JUST IDS
-        # # Create labels from inputs (no need of manual shift: done in trainer)
-        # inputs = masked_input_dict[self.mlm_masked_key]
-        # labels = inputs.clone()
 
-        # # Ensure original padding tokens are also ignored in the labels
-        # if self.pad_id is not None:
-        #     labels[inputs == self.pad_id] = -100
+@dataclass
+class PatientDataCollatorForClassification(PatientDataCollatorForMaskedLanguageModelling):
+    """
+    Inherits padding/truncation logic from the MLM collator, 
+    but disables masking and extracts a specific target label.
+    """
+    label_key: str|None = None
 
-        # return labels
+    def torch_call(self, samples: list[dict[str, np.ndarray]]) -> dict:
+        """
+        Collate patient sequences and create labels for supervised fine-tuning
+        Used by HuggingFace's trainer
+        """
+        # Separate features and labels
+        if self.label_key is None:
+            raise ValueError("Label key missing in patient data collator for classification")
+        labels = [s.pop(self.label_key) for s in samples]
+
+        # Preprocess the input samples
+        samples, non_features = self._separate_non_processed_features(samples)
+        padded_batch, attention_mask = self._process_batch(samples)
+
+        # Assemble batch
+        batch = {
+            "input_dict": self._check_types(padded_batch),
+            "attention_mask": torch.tensor(attention_mask),
+            "labels": torch.tensor(labels).long(),  # classification loss expects long tensors
+        }
+        batch.update(non_features)  # in case useful somewhere
+
+        return batch

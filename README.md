@@ -32,7 +32,7 @@ Follow these steps in order to replicate the full pipeline.
 This script processes the raw data into a format suitable for model training.
 
 ```bash
-python -m scripts.create_patient_datasets
+python scripts/create_patient_datasets.py
 ```
 
 The script will:
@@ -53,7 +53,7 @@ The script will:
 This script runs a single training job for the `PatientTokenEmbeddingModel` based on a given configuration file. While this can be run standalone, it is typically called by the `optuna_tuning.py` script.
 
 ```bash
-python -m scripts.pretrain_token_model \
+python scripts/pretrain_token_model.py \
     --pretrain_config_path configs/patient_token_embedder.yaml \
     --prediction_horizon 30
 ```

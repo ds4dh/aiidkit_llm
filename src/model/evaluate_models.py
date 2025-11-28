@@ -1,11 +1,7 @@
+import wandb
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
-from datasets import Dataset
 from transformers.trainer_utils import EvalPrediction
-from sentence_transformers import SentenceTransformer
-from src.model.patient_sequence_embedder import PatientDataCollatorForSequenceEmbedding
-from src.model.model_utils import WandbPlottingCallback
 
 import optuna
 from optuna.samplers import TPESampler
@@ -18,7 +14,6 @@ import gc
 import io
 from contextlib import redirect_stdout
 
-import wandb
 import plotly.graph_objects as go
 from plotly.colors import qualitative
 from scipy.special import softmax
@@ -42,6 +37,49 @@ class UMAP_HDBSCAN_Clusterer:
     def __init__(self, n_optuna_trials: int=25) -> None:
         self.n_optuna_trials = n_optuna_trials
 
+    def perform_analysis(
+        self,
+        embeddings: np.ndarray,
+        max_samples: int=2500,
+    ) -> tuple[dict[str, float], go.Figure | None]:
+        """
+        High-level wrapper to subsample, fit, predict, score, and plot.
+        Returns:
+            metrics: dict containing 'silhouette_score'
+            fig: Plotly figure (or None on error/noise)
+        """
+        # Subsample if dataset is too large
+        if len(embeddings) > max_samples:
+            indices = np.random.choice(len(embeddings), max_samples, replace=False)
+            curr_embeddings = embeddings[indices]
+        else:
+            curr_embeddings = embeddings
+
+        try:
+            # Fit and predict
+            reduced_data, labels_cluster = self.fit_predict(
+                curr_embeddings, 
+            )
+
+            # Compute float metrics (only silhouette for now)
+            metrics = {}
+            unique_labels = np.unique(labels_cluster)
+            n_clusters = len(unique_labels) - (1 if -1 in unique_labels else 0)
+            if n_clusters > 1:
+                sil_score = silhouette_score(reduced_data, labels_cluster)
+                metrics["silhouette_score"] = float(sil_score)
+            else:
+                metrics["silhouette_score"] = -1.0
+
+            # Generate cluster plot
+            fig = self.plot(embeddings_2d=reduced_data, labels=labels_cluster)
+
+            return metrics, fig
+
+        except Exception as e:
+            print(f"Error during clustering analysis: {e}")
+            return {"silhouette_score": -1.0}, None
+
     def fit(
         self,
         pooled_embeddings: np.ndarray,
@@ -53,11 +91,11 @@ class UMAP_HDBSCAN_Clusterer:
         num_samples = len(pooled_embeddings)
         best_params = {
             "n_components": 15,
-            "min_cluster_size": int(num_samples / 100),
-            "min_samples": int(num_samples / 100),
+            "min_cluster_size": max(2, int(num_samples / 100)),
+            "min_samples": max(2, int(num_samples / 100)),
         }
 
-        # Parameters identified using 
+        # Parameters identified using
         if self.n_optuna_trials is not None and self.n_optuna_trials > 0:
             study = optuna.create_study(direction="maximize", sampler=TPESampler())
             objective_fn = lambda trial: self.cluster_objective(trial, pooled_embeddings)
@@ -214,7 +252,7 @@ class UMAP_HDBSCAN_Clusterer:
         """
         Fit the clusterer (i.e., identify best hyper-parameters) and predict clusters
         """
-        best_params = self.fit(pooled_embeddings, optuna_trials=kwargs.get("optuna_trials", 25))
+        best_params = self.fit(pooled_embeddings)
         reduced_embeddings, cluster_labels = self.predict(pooled_embeddings, **best_params)
 
         return reduced_embeddings, cluster_labels
@@ -263,358 +301,147 @@ class UMAP_HDBSCAN_Clusterer:
         return fig
 
 
-class CustomEmbeddingEvaluator:
-    """
-    Class used by HuggingFace's trainer to compute embedding metrics
-    """
+class CustomEmbeddingEvaluatorForMaskedLanguageModelling:
     def __init__(
         self,
-        eval_dataset: Dataset,
-        embedding_mode: str,
-        do_clustering_analysis: bool=True,
-        optuna_trials_for_clustering: int|None=None,
-        eval_label_key: str|None=None,
-        eval_batch_size: int|None=None,  # used for sequence embedding evaluation
-        eval_data_collator: PatientDataCollatorForSequenceEmbedding|None=None,
-        wandb_plotting_callback: WandbPlottingCallback|None=None,
-        *args, **kwargs,
+        vocabs: dict[str, int],
+        do_clustering: bool=True,
+        max_clustered_samples: int=2500,
+        n_optuna_trials: int=25,
     ):
-        if embedding_mode not in ["token", "sequence"]:
-            raise ValueError("Embedding mode must be either 'token' or 'sequence'")
-
-        self.embedding_mode = embedding_mode
-        self.do_clustering_analysis = do_clustering_analysis
-        if do_clustering_analysis:
-            self.clusterer = UMAP_HDBSCAN_Clusterer(optuna_trials_for_clustering)
-        self.wandb_plotting_callback = wandb_plotting_callback
-
-        # Prepare evaluation data
-        self.eval_dataset = eval_dataset
-        self.eval_batch_size = eval_batch_size
-        self.eval_data_collator = eval_data_collator
-        if eval_label_key is not None:
-            self.true_labels = np.array(self.eval_dataset[eval_label_key])
-        else:
-            self.true_labels = None
-
-    def __call__(self, *args, **kwargs) -> dict[str, float]:
         """
-        Evaluate embeddings with different cluster-related metrics
-        """
-        # Initialize metric and plot dictionaries (logged differently!)
-        metric_dict = {}
-        plot_dict = {}
-
-        # Extract embeddings from the model output
-        if self.embedding_mode == "token":
-            # The huggingface trainer passes a single EvalPrediction object
-            eval_preds: EvalPrediction = args[0]  # no other argument
-            eval_preds: dict[str, torch.Tensor] = self._format_eval_prediction(eval_preds)
-            pooled_embeddings = eval_preds["pooled_embeddings"]
-            mlm_accuracy = self._compute_mlm_accuracy_for_token_model(eval_preds)
-            metric_dict.update({"mlm_accuracy": mlm_accuracy})
-        else:
-            # The sentence-transformer trainer passes the model as the first argument
-            model: SentenceTransformer = args[0]
-            eval_path, epoch_float, global_step = args[1:]  # in case useful
-            pooled_embeddings = self._get_pooled_embeddings_for_sequence_model(model)
-
-        # Compute cluster-related metrics and plots
-        if self.do_clustering_analysis:
-            best_params = self.clusterer.fit(pooled_embeddings)
-            reduced_embeddings, cluster_labels = self.clusterer.predict(pooled_embeddings, **best_params)
-            silhouette_score_ = silhouette_score(reduced_embeddings, cluster_labels)
-            metric_dict.update({"silhouette_score": silhouette_score_})
-
-            # Create a 2-dimensional visualization
-            vis_params = best_params.copy()
-            vis_params["n_components"] = 2
-            reduced_embeddings_2d, _ = self.clusterer.predict(pooled_embeddings, compute_clusters=False, **vis_params)
-            cluster_plot = self.clusterer.plot(reduced_embeddings_2d, cluster_labels)
-            plot_dict.update({"cluster_plot": cluster_plot})
-
-        # Compute infection-label-related metrics and plots
-        if self.true_labels is not None:
-
-            # Compute adjusted mutual information score if clusters were computed
-            if self.do_clustering_analysis:
-                ami_score = adjusted_mutual_info_score(self.true_labels, cluster_labels)
-                truth_plot = self.clusterer.plot(reduced_embeddings_2d, self.true_labels, noise_label=0)
-                plot_dict.update({"truth_plot": truth_plot})
-                metric_dict.update({"ami_score": ami_score})
-
-            # Compute classification metrics using a regularized classifier
-            cm_plot_dict, classification_metric_dict = self._evaluate_supervised_classifier(eval_preds)
-            plot_dict.update(cm_plot_dict)
-            metric_dict.update(classification_metric_dict)
-
-        # Compute a survival metric (using higher is better convention)
-        survival_score = 0.0
-        if "mlm_accuracy" in metric_dict:
-            survival_score += metric_dict["mlm_accuracy"]
-        if "supervised_task_f1_macro" in classification_metric_dict:
-            survival_score += classification_metric_dict["supervised_task_f1_macro"]
-        metric_dict.update({"survival_score": survival_score})
-
-        # Send the plots to the wandb plotting callback
-        if plot_dict:
-            if self.wandb_plotting_callback is not None:
-                self.wandb_plotting_callback.plots_to_log.update(plot_dict)
-
-        return metric_dict
-
-    @staticmethod
-    def _format_eval_prediction(
-        eval_prediction: EvalPrediction,
-    ) -> dict[str, torch.Tensor]:
-        """ Extract information from EvalPrediction object with names
-        """
-        # Extract last hidden state from the model output
-        model_output, task_labels = eval_prediction
-        mlm_loss, mlm_logits, cutoff_days, \
-        supervised_task_loss, supervised_task_logits, \
-        hidden_states, pooled_embeddings = model_output
-
-        mlm_predictions = mlm_logits.argmax(axis=-1)
-        last_hidden_state = hidden_states[-1]
-
-        # Extract MLM task labels, to know where the padded tokens are
-        if isinstance(task_labels, tuple):
-            mlm_labels = task_labels[0]
-            supervised_task_labels = task_labels[1:]
-        else:
-            mlm_labels = task_labels
-            supervised_task_labels = ()
-
-        # Huggingface's convention is to have label == -100 for padding tokens 
-        no_pad_mask = (mlm_labels != -100)
-
-        return {
-            "last_hidden_state": last_hidden_state,
-            "no_pad_mask": no_pad_mask,
-            "mlm_logits": mlm_logits,
-            "mlm_predictions": mlm_predictions,
-            "mlm_labels": mlm_labels,
-            "mlm_loss": mlm_loss,
-            "cutoff_days": cutoff_days,
-            "supervised_task_loss": supervised_task_loss,
-            "supervised_task_logits": supervised_task_logits,
-            "supervised_task_labels": supervised_task_labels,
-            "pooled_embeddings": pooled_embeddings,
-        }
-
-    def _compute_mlm_accuracy_for_token_model(
-        self,
-        eval_predictions: dict[str, torch.Tensor],
-    ) -> float:
-        """
-        Compute raw accuracy on MLM task (labels already aligned with the model
-        output, thanks to the data collator)
-        """
-        # Flatten the predictions and labels to make them comparable
-        predictions_flat = eval_predictions["mlm_predictions"].flatten()
-        labels_flat = eval_predictions["mlm_labels"].flatten()
-        no_pad_mask_flat = eval_predictions["no_pad_mask"].flatten()
-
-        # Filter out ignored labels
-        predictions_valid = predictions_flat[no_pad_mask_flat]
-        labels_valid = labels_flat[no_pad_mask_flat]
-
-        return np.mean(predictions_valid == labels_valid)  # i.e., accuracy
-
-    def _get_pooled_embeddings_for_sequence_model(
-        self,
-        model: SentenceTransformer,
-    ) -> np.ndarray:
-        """
-        Get final sequence embeddings from a SentenceTransformer model
-        """
-        # Use the same data collator used during training
-        dataloader = DataLoader(
-            self.eval_dataset,
-            batch_size=self.eval_batch_size,
-            collate_fn=self.eval_data_collator,
-            shuffle=False,  # important if any label comparison later
-        )
-
-        # Perform inference with the sentence-transformer model
-        model.eval()
-        all_embeddings = []
-        with torch.no_grad():
-            input_layer_device = next(model.parameters()).device
-            for batch in dataloader:
-
-                # The collator might add non-model-input keys (e.g., labels)
-                model_input = {
-                    k: v.to(input_layer_device) for k, v in batch.items()
-                    if isinstance(v, torch.Tensor)
-                }
-
-                # Pass the processed batch to the model
-                outputs = model(model_input)
-                embeddings = outputs["sentence_embedding"].cpu().numpy()  # (batch_size, embed_dim)
-                all_embeddings.append(embeddings)
-
-        return np.concatenate(all_embeddings, axis=0)  # (num_eval_samples, embed_dim)
-
-    # def _evaluate_supervised_classifier(
-    #     self,
-    #     eval_predictions: dict[str, np.ndarray],
-    #     cutoff_days: str = None,
-    # ) -> tuple[go.Figure, dict[str, float]]:
-    #     """
-    #     Compute classification metrics from the model's supervised task logits
-    #     """
-    #     y_logits = eval_predictions["supervised_task_logits"]
-    #     y_true = eval_predictions["supervised_task_labels"][0]  # it is a tuple!
-    #     y_probs = softmax(y_logits, axis=1)
-    #     n_classes = y_logits.shape[1]
-
-    #     # Binary classification case
-    #     if n_classes == 2:
-    #         y_score = y_probs[:, 1]  # score = probability of positive class
-    #         y_pred = self._get_preds_from_best_threshold(y_true, y_score)
-    #         auroc_score = roc_auc_score(y_true, y_score)
-    #         auprc_score = average_precision_score(y_true, y_score)
-    #         sensitivity = recall_score(y_true, y_pred, pos_label=1, zero_division=0)
-    #         specificity = recall_score(y_true, y_pred, pos_label=0, zero_division=0)
-
-    #     # Multi-class classification
-    #     else:
-    #         y_pred = np.argmax(y_probs, axis=1)  # prediction = class with highest probability
-    #         auroc_score = roc_auc_score(y_true, y_probs, multi_class="ovr", average="macro")
-    #         auprc_score = None
-    #         sensitivity = None
-    #         specificity = None
-
-    #     # Compute confusion matrix plot (to be logged later)
-    #     cm_plot = wandb.plot.confusion_matrix(y_true=y_true, preds=y_pred)
-        
-    #     # Add threshold-related metrics
-    #     metrics = {
-    #         "supervised_task_accuracy": accuracy_score(y_true, y_pred),
-    #         "supervised_task_balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
-    #         "supervised_task_precision_macro": precision_score(y_true, y_pred, average="macro", zero_division=0),
-    #         "supervised_task_recall_macro": recall_score(y_true, y_pred, average="macro", zero_division=0),
-    #         "supervised_task_f1_macro": f1_score(y_true, y_pred, average="macro", zero_division=0),
-    #         "supervised_task_ece": self._expected_calibration_error(y_true, y_probs),
-    #         "supervised_task_roc_auc": auroc_score,
-    #         "supervised_task_pr_auc": auprc_score if auprc_score is not None else "N/A",
-    #         "supervised_task_sensitivity": sensitivity if sensitivity is not None else "N/A",
-    #         "supervised_task_specificity": specificity if specificity is not None else "N/A",
-    #     }
-
-    #     return cm_plot, metrics
-
-    def _compute_classification_metrics(
-        self,
-        y_true: np.ndarray,
-        y_logits: np.ndarray,
-    ) -> tuple[go.Figure, dict[str, float]]:
-        """
-        Core logic to compute classification metrics from labels and logits.
-        
         Args:
-            y_true: Ground truth labels.
-            y_logits: Raw logit outputs from the model.
-
-        Returns:
-            A tuple containing the confusion matrix plot and a dictionary of metrics.
+            do_clustering: whether to run UMAP/HDBSCAN on the pooled embeddings
+            n_optuna_trials: 0 to skip hyperparam search, > 0 to optimize clustering
+            max_clustered_samples: maximum number of samples to cluster
         """
-        # Ensure there are samples to evaluate
-        if y_true.size == 0:
-            return None, {}
+        self.vocabs = vocabs  # may be useful at some point!
+        self.do_clustering = do_clustering
+        self.max_clustered_samples = max_clustered_samples
+        self.n_optuna_trials = n_optuna_trials
+        if do_clustering:
+            self.clusterer_module = UMAP_HDBSCAN_Clusterer(n_optuna_trials=n_optuna_trials)
 
-        y_probs = softmax(y_logits, axis=1)
-        n_classes = y_logits.shape[1]
-
-        # Binary classification case
-        if n_classes == 2:
-            y_score = y_probs[:, 1]  # score = probability of positive class
-            y_pred = self._get_preds_from_best_threshold(y_true, y_score)
-            auroc_score = roc_auc_score(y_true, y_score)
-            auprc_score = average_precision_score(y_true, y_score)
-            sensitivity = recall_score(y_true, y_pred, pos_label=1, zero_division=0)
-            specificity = recall_score(y_true, y_pred, pos_label=0, zero_division=0)
-
-        # Multi-class classification
-        else:
-            y_pred = np.argmax(y_probs, axis=1)  # prediction = class with highest probability
-            auroc_score = roc_auc_score(y_true, y_probs, multi_class="ovr", average="macro")
-            auprc_score = None
-            sensitivity = None
-            specificity = None
-
-        # Compute confusion matrix plot (to be logged later)
-        cm_plot = wandb.plot.confusion_matrix(y_true=y_true, preds=y_pred)
-
-        # Add threshold-related metrics
-        metrics = {
-            "accuracy": accuracy_score(y_true, y_pred),
-            "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
-            "precision_macro": precision_score(y_true, y_pred, average="macro", zero_division=0),
-            "recall_macro": recall_score(y_true, y_pred, average="macro", zero_division=0),
-            "f1_macro": f1_score(y_true, y_pred, average="macro", zero_division=0),
-            "ece": self._expected_calibration_error(y_true, y_probs),
-            "roc_auc": auroc_score,
-            "pr_auc": auprc_score if auprc_score is not None else "N/A",
-            "sensitivity": sensitivity if sensitivity is not None else "N/A",
-            "specificity": specificity if specificity is not None else "N/A",
-        }
-
-        return cm_plot, metrics
-
-    def _evaluate_supervised_classifier(
-        self,
-        eval_predictions: dict[str, np.ndarray],
-    ) -> tuple[go.Figure, dict[str, float]]:
+    def __call__(self, eval_preds: EvalPrediction) -> dict[str, float]:
         """
-        Compute classification metrics for the overall supervised task.
+        The trainer will call this function at evaluation time, on CPU
+        eval_preds.predictions contains the tuple returned by preprocess_logits_for_metrics
         """
-        # Extract evaluation data
-        y_logits = eval_predictions["supervised_task_logits"]
-        y_true = eval_predictions["supervised_task_labels"][0]  # it is a tuple!
+        # Retrieve model outputs
+        (pred_ids, embeddings), labels = eval_preds.predictions, eval_preds.label_ids
+        metrics = {}
 
-        # Evaluate all predictions at once
-        cm_plot, metrics = self._compute_classification_metrics(y_true, y_logits)
-        metric_dict = {f"sup_{k}": v for k, v in metrics.items()}
-        plot_dict = {"cm_plot": cm_plot}
-
-        # Evaluate predictions stratifying per cutoff day
-        cutoff_days = eval_predictions.get("cutoff_days", None)
-        if cutoff_days is not None:
-            unique_cutoffs = np.unique(cutoff_days)        
-            for cutoff in unique_cutoffs:
-
-                # Filter labels and logits
-                indices = (cutoff_days == cutoff)
-                y_true_cutoff = y_true[indices]
-                y_logits_cutoff = y_logits[indices]
-
-                # Compute metrics for this subset of data
-                cm_plot_cutoff, metrics_cutoff = self._compute_classification_metrics(
-                    y_true_cutoff, y_logits_cutoff
-                )
-
-                # Add a prefix for the cutoff day to each metric key for logging
-                plot_dict[f"cm_plot_cutoff_{int(cutoff)}"] = cm_plot_cutoff
-                for key, value in metrics_cutoff.items():
-                    metric_dict[f"sup_{key}_cut_{int(cutoff)}"] = value
-
-        return plot_dict, metric_dict
-
-    def _evaluate_supervised_classifier_per_cutoff_day(
-        self,
-        eval_predictions: dict[str, np.ndarray],
-    ) -> tuple[dict[str, go.Figure], dict[str, float]]:
-        """
-        Compute classification metrics for each cutoff day separately.
-        """
-        y_logits = eval_predictions["supervised_task_logits"]
-        y_true = eval_predictions["supervised_task_labels"][0]
-        cutoff_days = eval_predictions["cutoff_days"][0]
-
+        # Compute MLM accuracy
+        preds_flat, labels_flat = pred_ids.flatten(), labels.flatten()
+        mask = labels_flat != -100  # filtering out ignored tokens
+        metrics["mlm_accuracy"] = accuracy_score(labels_flat[mask], preds_flat[mask])
         
+        # Compute clustering metrics using your custom module
+        if self.do_clustering and embeddings is not None:
+            cluster_metrics, cluster_fig = self.clusterer_module.perform_analysis(
+                embeddings, 
+                max_samples=self.max_clustered_samples
+            )
+
+            # Update metrics and plot clusters
+            metrics.update(cluster_metrics)
+            if cluster_fig is not None and wandb.run is not None:
+                wandb.log({"eval_plots/clusters": cluster_fig}, commit=False)
+
+        return metrics
+
+
+class CustomEmbeddingEvaluatorForClassification:
+    def __init__(
+        self,
+        do_clustering: bool = False,
+        n_optuna_trials: int = 0,
+        max_clustered_samples: int = 2500,
+        pos_label: int = 1,
+    ):
+        """
+        Args:
+            do_clustering: whether to run UMAP/HDBSCAN on the pooled embeddings
+            n_optuna_trials: 0 to skip hyperparam search, > 0 to optimize clustering
+            max_clustered_samples: maximum number of samples to cluster
+            pos_label: integer label of the 'positive' class (usually 1)
+        """
+        self.do_clustering = do_clustering
+        self.pos_label = pos_label
+        self.max_clustered_samples = max_clustered_samples
+        self.n_optuna_trials = n_optuna_trials
+        if do_clustering:
+            self.clusterer_module = UMAP_HDBSCAN_Clusterer(n_optuna_trials=n_optuna_trials)
+
+    def __call__(self, eval_preds: EvalPrediction) -> dict[str, float]:
+        """
+        Called by Trainer.evaluate()
+        eval_preds.predictions: Tuple[np.ndarray, np.ndarray] (logits, embeddings)
+        eval_preds.label_ids: np.ndarray
+        """
+        # Unpack data
+        if isinstance(eval_preds.predictions, tuple):
+            logits, embeddings = eval_preds.predictions
+        else:
+            logits = eval_preds.predictions
+            embeddings = None
+
+        # Prepare metric computation
+        metrics = {}
+        labels = eval_preds.label_ids
+        probs = softmax(logits, axis=-1)
+        if logits.shape[1] == 2:  # binary classification care about the positive class
+            probs_pos = probs[:, self.pos_label]
+        else:
+            probs_pos = probs.max(axis=1)
+
+        # Probabilistic metrics
+        metrics["ece"] = self._expected_calibration_error(labels, probs)
+        if logits.shape[1] == 2:
+            try:
+                metrics["roc_auc"] = roc_auc_score(labels, probs_pos)
+                metrics["pr_auc"] = average_precision_score(labels, probs_pos)
+            except ValueError:
+                # Happens if only one class is present in the batch
+                metrics["roc_auc"] = -1.0
+                metrics["pr_auc"] = -1.0
+
+        # Threshold-based metrics metrics
+        preds_optimal = self._get_preds_from_best_threshold(labels, probs_pos)
+        avg_method = "binary" if logits.shape[1] == 2 else "weighted"
+        if logits.shape[1] == 2:
+            metrics["acc"] = accuracy_score(labels, preds_optimal)
+            metrics["bal_acc"] = balanced_accuracy_score(labels, preds_optimal)
+            metrics["precision"] = precision_score(labels, preds_optimal, average=avg_method)
+            metrics["recall"] = recall_score(labels, preds_optimal, average=avg_method)
+            metrics["f1"] = f1_score(labels, preds_optimal)
+
+        # Classification plots
+        if wandb.run is not None:
+            try:
+                # Log confusion matrix (for any classification task)
+                cm = wandb.plot.confusion_matrix(probs=None, y_true=labels, preds=preds_optimal)
+                wandb.log({"eval_plots/conf_mat": cm}, commit=False)
+
+                # Log precision-recall curve (if binary classification)
+                if logits.shape[1] == 2:
+                    wandb.log({"eval_plots/pr_curve": wandb.plot.pr_curve(labels, probs)}, commit=False)
+                    wandb.log({"eval_plots/roc_curve": wandb.plot.roc_curve(labels, probs)}, commit=False)
+
+            except Exception as e:
+                print(f"WandB logging error: {e}")
+
+        # Clustering analysis
+        if self.do_clustering and embeddings is not None:
+            cluster_metrics, cluster_fig = self.clusterer_module.perform_analysis(
+                embeddings, 
+                max_samples=self.max_clustered_samples
+            )
+            metrics.update(cluster_metrics)
+            if cluster_fig is not None and wandb.run is not None:
+                wandb.log({"eval_plots/cls_clusters": cluster_fig}, commit=False)
+
+        return metrics
 
     @staticmethod
     def _get_preds_from_best_threshold(
@@ -626,47 +453,67 @@ class CustomEmbeddingEvaluator:
         of the positive class
         """
         precisions, recalls, thresholds = precision_recall_curve(y_true, y_score)
-        f1_scores = (2 * precisions * recalls) / (precisions + recalls + 1e-9)
-        f1_scores = f1_scores[:-1]
+        denominator = precisions + recalls
+        denominator[denominator == 0] = 1e-9 
+        f1_scores = (2 * precisions * recalls) / denominator
+        f1_scores = f1_scores[:-1]  # thresholds are 1 shorter than precision/recall
+        if len(f1_scores) == 0:
+            return np.zeros_like(y_true)
+            
         best_threshold = thresholds[np.argmax(f1_scores)]
-
         return (y_score >= best_threshold).astype(int)
 
     @staticmethod
     def _expected_calibration_error(y_true, y_probs, n_bins=10):
         """
-        Computes the Expected Calibration Error (ECE) for a model.
-
-        Args:
-            y_true (np.ndarray): True labels, shape (n_samples,).
-            y_probs (np.ndarray): Predicted probabilities, shape (n_samples, n_classes).
-            n_bins (int): Number of bins to use for calibration.
-
-        Returns:
-            float: The ECE score.
+        Computes the Expected Calibration Error (ECE).
         """
-        # For multi-class, we need the confidence (max prob) and the predictions
         n_classes = y_probs.shape[1]
         if n_classes > 2:
             confidences = np.max(y_probs, axis=1)
             predictions = np.argmax(y_probs, axis=1)
             is_correct = (predictions == y_true)
-
-        # For binary, we use the probability of the positive class
         else:
+            # For binary, use probability of class 1
             confidences = y_probs[:, 1]
             is_correct = (y_true == 1)
 
-        # Bin confidences and calculate accuracy and average confidence per bin
         bin_boundaries = np.linspace(0, 1, n_bins + 1)
         bin_indices = np.digitize(confidences, bin_boundaries[1:-1])
         ece = 0.0
+        
         for i in range(n_bins):
             in_bin = (bin_indices == i)
             n_in_bin = np.sum(in_bin)
             if n_in_bin > 0:
-                acc_in_bin = np.mean(is_correct[in_bin])  # bin accuracy
-                conf_in_bin = np.mean(confidences[in_bin])  # bin confidence
-                ece += np.abs(acc_in_bin - conf_in_bin) * n_in_bin  # update ECE
+                acc_in_bin = np.mean(is_correct[in_bin])
+                conf_in_bin = np.mean(confidences[in_bin])
+                ece += np.abs(acc_in_bin - conf_in_bin) * n_in_bin
 
         return ece / len(y_true)
+
+
+def preprocess_logits_for_metrics(logits, labels):
+    """
+    Splits the model output to save memory
+    """
+    # The model returns (logits, hidden_states)
+    if isinstance(logits, tuple):
+        real_logits = logits[0]  # [batch, seq, vocab]
+        hidden_states = logits[1] # layer tuple (usually includes only the last one)
+        last_hidden = hidden_states[-1] # [batch, seq, hidden]
+    else:
+        real_logits = logits
+        last_hidden = None
+
+    # Compute masked token prediction from the model logits
+    pred_ids = torch.argmax(real_logits, dim=-1)
+    
+    # Pool embeddings by averaging all non-pad token embeddings
+    if last_hidden is not None:
+        mask = (labels != -100).unsqueeze(-1).to(last_hidden.dtype)
+        sum_embeddings = (last_hidden * mask).sum(dim=1)
+        sum_mask = mask.sum(dim=1).clamp(min=1e-9)  # avoid division by zero
+        pooled_embeddings = sum_embeddings / sum_mask
+
+    return pred_ids, pooled_embeddings

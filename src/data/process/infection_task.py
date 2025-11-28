@@ -11,9 +11,12 @@ import src.constants as constants
 csts = constants.ConstantsNamespace()
 
 LABEL_KEYS = [
-    "infection_label_binary_any", "infection_label_binary_bacterial",
-    "infection_label_binary_viral", "infection_label_binary_fungal",
-    "infection_label_categorical", "infection_label_one_hot",
+    "infection_label_binary_any",
+    "infection_label_binary_bacterial",
+    "infection_label_binary_viral",
+    "infection_label_binary_fungal",
+    "infection_label_categorical",
+    "infection_label_one_hot",
 ]
 CONTEXT_KEYS = ["cutoff", "horizon", "sequence_id"]
 

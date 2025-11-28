@@ -10,7 +10,9 @@ description = "A project to train discriminative and generative LLMs to predict 
 readme = "README.md"
 authors = [
     { name = "Alban Bornet", email = "alban.bornet@gmail.com" },
-    { name = "Yamil Vindas", email = "anthony.yazdani@unige.ch" },
+    { name = "Yamil Vindas", email = "yamil.vindasyassine@unige.ch" },
+    { name = "Mohammadreza Alizadeh", email = "mohammadreza.alizadeh@unige.ch" },
+    { name = "Mélanie Huck", email = "melanie.huck@etu.unige.ch"},
 ]
 license = { text = "MIT" }
 requires-python = ">=3.11"
@@ -25,7 +27,15 @@ dependencies = [
     "trl[vllm]==0.25.1",
     "peft",
     "sentence-transformers",
+    "optuna",
     "pandas",
+    "matplotlib",
+    "plotly",
+    "cudf-cu12==25.10.*",
+    "cuml-cu12==25.10.*",
+    "umap-learn",
+    "hdbscan",
+    "lifelines",
     "wandb",
     "weave",
 ]

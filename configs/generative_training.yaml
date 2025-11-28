@@ -1,0 +1,61 @@
+# Arguments for TRL's SFTConfig
+finetuning:
+  logging_steps: 10
+  warmup_steps: 100
+  num_train_epochs: 10  # maximum number of epochs (loses to max_steps)
+  max_steps: 10000  # maximum number of steps (training + validation)
+  eval_strategy: steps
+  save_strategy: steps
+  eval_steps: 100
+  save_steps: 100
+  save_total_limit: 2
+  gradient_accumulation_steps: 8
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 4
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  bf16: true
+  report_to: wandb
+  remove_unused_columns: true
+  load_best_model_at_end: true
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  patience: 5
+  output_dir: results/qwen_finetuning
+  logging_dir: results/qwen_finetuning/logs
+  # Important generative LLM finetuning parameters
+  max_length: 16384
+  packing: false
+  completion_only_loss: true  # only train on the completed part (not on the prompt)
+  # assistant_only_loss: true  # but could be cool if Qwen supports it once!
+
+# Low-rank adaptation (LoRA) configuration
+peft:
+  task_type: CAUSAL_LM
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  bias: none
+  target_modules: all-linear
+
+# Generative Model Configuration
+model:
+  model_id: Qwen/Qwen3-4B-Instruct-2507  # Qwen/Qwen3-0.6B  # Qwen/Qwen3-4B-Thinking-2507
+  trust_remote_code: true
+  model_args:
+    dtype: bfloat16
+    attn_implementation: flash_attention_2
+    use_cache: false
+    # enable_thinking: false
+  # quantization:
+  #   load_in_4bit: true
+  #   bnb_4bit_quant_type: nf4
+  #   bnb_4bit_compute_dtype: bfloat16
+  #   bnb_4bit_use_double_quant: true
+
+data:
+  input_column: patient_card_markdown
+  system_prompt: |
+    You are an expert medical AI. Analyze the patient history.
+    Your task is to predict for the {condition_description} in the patient in the next {horizon} days.
+    Respond with exactly one digit: '1' for Yes, '0' for No.

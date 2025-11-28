@@ -6,8 +6,8 @@ from datasets import DatasetDict
 from transformers import Trainer, TrainingArguments
 from transformers.integrations import WandbCallback
 
-from src.model.patient_token_embedder import (
-    PatientTokenEmbeddingModel,
+from src.model.patient_embedder import (
+    PatientTokenEmbeddingModel,a
     PatientDataCollatorForLanguageModelling,
 )
 from src.model.model_utils import (

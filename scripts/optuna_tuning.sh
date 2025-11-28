@@ -21,7 +21,7 @@
 
 # --- Configuration ---
 
-PYTHON_SCRIPT="scripts.optuna_tuning"
+PYTHON_SCRIPT="scripts/optuna_tuning.py"
 PRETRAINED_EMBEDDINGS_OPTIONS=(
     ""
     # "--use_pretrained_embeddings_for_input_layer"
@@ -97,7 +97,7 @@ for pe_option in "${PRETRAINED_EMBEDDINGS_OPTIONS[@]}"; do
             cv_option="${pair#*;}"
 
             # Start building the command in an array for robustness
-            CMD=(python -m "$PYTHON_SCRIPT")
+            CMD=(python "$PYTHON_SCRIPT")
 
             # Add the --use_pretrained_embeddings_for_input_layer flag if the option is not empty
             if [[ -n "$pe_option" ]]; then

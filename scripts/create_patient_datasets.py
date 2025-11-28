@@ -62,7 +62,7 @@ def main():
     else:
         # Process all patients using multiprocesing to create csv records
         if not ONLY_POST_PROCESS_FLAG:
-            num_workers = os.cpu_count() - 1
+            num_workers = min(os.cpu_count() - 1, 16)
             chunksize = max(1, len(patients_IDs) // (4 * num_workers))
             pooled_fn = partial(create_patient_record, data_dict=data_dict)
             process_map(
@@ -85,7 +85,7 @@ def main():
         # Create infection task datasets
         create_infection_datasets(
             patient_sequence_dir=csts.HUGGINGFACE_DIR_PATH,
-            create_patient_cards=False,
+            create_patient_cards=True,
             create_patient_card_summaries=False,
         )
 
@@ -134,6 +134,7 @@ def create_patient_record(
     # Save the patient record to a CSV file
     if 1:  # not DEBUG_FLAG:
         save_path = os.path.join(csts.PREPROCESSED_DIR_PATH, f"patient_{patient_ID}.csv")
+        os.makedirs(csts.PREPROCESSED_DIR_PATH, exist_ok=True)
         patient_df.to_csv(save_path, index=False)
 
 

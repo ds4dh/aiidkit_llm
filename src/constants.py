@@ -1,6 +1,6 @@
-import os
 import numpy as np
 import pandas as pd
+from pathlib import Path
 from dataclasses import dataclass
 
 
@@ -8,20 +8,60 @@ from dataclasses import dataclass
 class ConstantsNamespace():
 
     # Data-related paths
-    EXCEL_DATA_PATH = os.path.join("data", "raw", "Datacut_FUP226_raw-01Jan2023_v1.xlsx")
-    PICKLE_DATA_PATH = os.path.join("data", "raw", "Datacut_FUP226_raw-01Jan2023_v1.pkl")
-    PREPROCESSED_DIR_PATH = os.path.join("data", "preprocessed")
-    HUGGINGFACE_DIR_PATH = os.path.join("data", "hf_data", "full_patient_sequences")
-    METADATA_DIR_PATH = os.path.join("data", "hf_metadata")
-    EXPLORE_DIR_PATH = os.path.join("data", "explore")
+    # RAW_DATA_DIR = Path("/home/shares/ds4dh/aiidkit_project/data")
+    RAW_DATA_DIR = Path("data/raw")
+    EXCEL_DATA_PATH = RAW_DATA_DIR / "Datacut_FUP226_raw-01Jan2023_v1.xlsx"
+    PICKLE_DATA_PATH = RAW_DATA_DIR / "Datacut_FUP226_raw-01Jan2023_v1.pkl"
+    PREPROCESSED_DIR_PATH = Path("data/preprocessed")
+    HUGGINGFACE_DIR_PATH = Path("data/hf_data/full_patient_sequences")
+    METADATA_DIR_PATH = Path("data/hf_metadata")
+    EXPLORE_DIR_PATH = Path("data/explore")
 
-    # Useful if we use our own "triplet" patient embedder
+    # Useful in discriminative or generative LLM training
     BASE_VOCAB = {
         "[PAD]": 0,
         "[MASK]": 1,
         "[BOS]": 2,
         "[EOS]": 3,
         "[UNK]": 4,
+    }
+    VOCAB_ID_TO_KEY_MAPPING = {
+        "entity_id": "entity",  # simple vocabulary map
+        "attribute_id": "attribute",  # simple vocabulary map
+        "value_id": "value_binned",  # for binned version of "value" key
+        "days_since_tpx": "time",  # number normalized between patients
+    }
+    LABEL_KEY_TO_CONDITION_MAPPING = {
+        "infection_label_categorical": {
+            "task_type": "classification",
+            "num_labels": 4,
+            "condition_description": "type of the first clinically significant infection, if any",
+        },
+        "infection_label_one_hot": {
+            "task_type": "classification",
+            "num_labels": 2,  # ??? not sure how to do this one
+            "condition_description": "occurrence of any clinically significant infection",
+        },
+        "infection_label_binary_any": {
+            "task_type": "classification",
+            "num_labels": 2,
+            "condition_description": "occurrence of any clinically significant infection",
+        },
+        "infection_label_binary_bacterial": {
+            "task_type": "classification",
+            "num_labels": 2,
+            "condition_description": "occurrence of any clinically significant bacterial infection",
+        },
+        "infection_label_binary_viral": {
+            "task_type": "classification",
+            "num_labels": 2,
+            "condition_description": "occurrence of any clinically significant viral infection",
+        },
+        "infection_label_binary_fungal": {
+            "task_type": "classification",
+            "num_labels": 2,
+            "condition_description": "occurrence of any clinically significant fungal infection",
+        },
     }
 
     # Infection task labels

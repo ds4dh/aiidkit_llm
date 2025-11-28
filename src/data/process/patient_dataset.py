@@ -222,7 +222,11 @@ def get_vocabs(dataset: DatasetDict) -> dict[str, dict[str, int]]:
     Compute vocabularies for entity, attribute, and binned value columns
     """
     # Collect all possible expressions for entities, attributes, and binned values
-    vocab_sets = {"entity": set(), "attribute": set(), "value_binned": set()}
+    vocab_sets = {
+        "entity": set(),     # "entity_id": set(),
+        "attribute": set(),  # "attribute_id": set(),
+        "value_binned": set(),      # "value_id": set(),
+    }
     for sample in concatenate_datasets([dataset["train"], dataset["validation"]]):
         for key, vocab_set in vocab_sets.items():
             vocab_set.update(sample[key])

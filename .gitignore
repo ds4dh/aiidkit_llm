@@ -183,5 +183,6 @@ data/processed/*
 !data/processed/.gitkeep
 data/preprocessed/*
 data/huggingface/*
+*.sif
 results
 wandb
