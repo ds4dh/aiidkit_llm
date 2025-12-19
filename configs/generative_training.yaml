@@ -1,28 +1,29 @@
 # Arguments for TRL's SFTConfig
-finetuning:
+trainer:
   logging_steps: 10
   warmup_steps: 100
   num_train_epochs: 10  # maximum number of epochs (loses to max_steps)
   max_steps: 10000  # maximum number of steps (training + validation)
   eval_strategy: steps
   save_strategy: steps
-  eval_steps: 100
-  save_steps: 100
-  save_total_limit: 2
-  gradient_accumulation_steps: 8
-  per_device_train_batch_size: 2
+  eval_steps: 50
+  save_steps: 50
+  save_total_limit: 1
+  gradient_accumulation_steps: 4
+  per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
-  learning_rate: 1.0e-4
+  eval_accumulation_steps: 1  # offloading logits to CPU immediately after every batch
+  learning_rate: 2.0e-4
+  max_grad_norm: 1.0
   weight_decay: 0.01
   bf16: true
   report_to: wandb
   remove_unused_columns: true
   load_best_model_at_end: true
-  metric_for_best_model: eval_loss
+  metric_for_best_model: eval_roc_auc
   greater_is_better: false
-  patience: 5
-  output_dir: results/qwen_finetuning
-  logging_dir: results/qwen_finetuning/logs
+  output_dir: results/generative
+  logging_dir: results/generative/logs
   # Important generative LLM finetuning parameters
   max_length: 16384
   packing: false
@@ -38,23 +39,27 @@ peft:
   bias: none
   target_modules: all-linear
 
-# Generative Model Configuration
+# Generative model configuration
 model:
-  model_id: Qwen/Qwen3-4B-Instruct-2507  # Qwen/Qwen3-0.6B  # Qwen/Qwen3-4B-Thinking-2507
+  # model_id: Qwen/Qwen3-0.6B
+  model_id: Qwen/Qwen3-4B-Instruct-2507
+  # model_id: Qwen/Qwen3-4B-Thinking-2507
   trust_remote_code: true
   model_args:
     dtype: bfloat16
     attn_implementation: flash_attention_2
     use_cache: false
-    # enable_thinking: false
+    # enable_thinking: false  # to consider when using not "Instruct" models?
   # quantization:
   #   load_in_4bit: true
   #   bnb_4bit_quant_type: nf4
   #   bnb_4bit_compute_dtype: bfloat16
   #   bnb_4bit_use_double_quant: true
 
+# Dataset pre-processing
 data:
   input_column: patient_card_markdown
+  response_template: "Response: "
   system_prompt: |
     You are an expert medical AI. Analyze the patient history.
     Your task is to predict for the {condition_description} in the patient in the next {horizon} days.

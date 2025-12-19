@@ -60,9 +60,9 @@ def create_infection_datasets(
                 num_proc=min(16, os.cpu_count() - 1),
             )
 
-        # Summarize all patient cards as a new column field
-        if create_patient_card_summaries:
-            dataset = generate_patient_card_summaries(dataset)
+            # Summarize all patient card texts as a new column field
+            if create_patient_card_summaries:
+                task_dataset = generate_patient_card_summaries(task_dataset)
 
         # Save task dataset in a new directory, next to the one with full patient sequences
         output_dir = os.path.join(

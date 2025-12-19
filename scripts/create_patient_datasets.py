@@ -51,7 +51,7 @@ def main():
 
     # Process some patients, using only one process, if DEBUG_FLAG is enabled
     if DEBUG_FLAG:
-        for patient_ID in tqdm(patients_IDs[0:1000], "Creating patient records"):
+        for patient_ID in tqdm(patients_IDs[590:690], "Creating patient records"):
             print(f"Processing patient {patient_ID}")
             create_patient_record(patient_ID, data_dict)
     
@@ -132,10 +132,17 @@ def create_patient_record(
     patient_df = patient_df.sort_values(by=["time", "entity", "attribute", "value"])
 
     # Save the patient record to a CSV file
-    if 1:  # not DEBUG_FLAG:
+    if not DEBUG_FLAG:
         save_path = os.path.join(csts.PREPROCESSED_DIR_PATH, f"patient_{patient_ID}.csv")
         os.makedirs(csts.PREPROCESSED_DIR_PATH, exist_ok=True)
         patient_df.to_csv(save_path, index=False)
+    else:
+        if str(patient_ID) == "80001499":
+            patient_df["patientid"] = patient_ID
+            pd.set_option('display.max_rows', 500)
+            import ipdb; ipdb.set_trace()
+        else:
+            print(patient_ID)
 
 
 def print_index_range(df, field, with_date=True):

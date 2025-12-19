@@ -8,13 +8,15 @@ from dataclasses import dataclass
 class ConstantsNamespace():
 
     # Data-related paths
-    # RAW_DATA_DIR = Path("/home/shares/ds4dh/aiidkit_project/data")
-    RAW_DATA_DIR = Path("data/raw")
+    RAW_DATA_DIR = Path("/home/shares/ds4dh/aiidkit_project/data")
+    # RAW_DATA_DIR = Path("data/raw")
     EXCEL_DATA_PATH = RAW_DATA_DIR / "Datacut_FUP226_raw-01Jan2023_v1.xlsx"
     PICKLE_DATA_PATH = RAW_DATA_DIR / "Datacut_FUP226_raw-01Jan2023_v1.pkl"
     PREPROCESSED_DIR_PATH = Path("data/preprocessed")
-    HUGGINGFACE_DIR_PATH = Path("data/hf_data/full_patient_sequences")
-    METADATA_DIR_PATH = Path("data/hf_metadata")
+    # HUGGINGFACE_DIR_PATH = Path("data/hf_data/full_patient_sequences")
+    # METADATA_DIR_PATH = Path("data/hf_metadata")
+    HUGGINGFACE_DIR_PATH = Path("../aiidkit_mhmmdrz/processed_data")
+    METADATA_DIR_PATH = Path("../aiidkit_mhmmdrz/processed_data/metadata")
     EXPLORE_DIR_PATH = Path("data/explore")
 
     # Useful in discriminative or generative LLM training
@@ -25,44 +27,6 @@ class ConstantsNamespace():
         "[EOS]": 3,
         "[UNK]": 4,
     }
-    VOCAB_ID_TO_KEY_MAPPING = {
-        "entity_id": "entity",  # simple vocabulary map
-        "attribute_id": "attribute",  # simple vocabulary map
-        "value_id": "value_binned",  # for binned version of "value" key
-        "days_since_tpx": "time",  # number normalized between patients
-    }
-    LABEL_KEY_TO_CONDITION_MAPPING = {
-        "infection_label_categorical": {
-            "task_type": "classification",
-            "num_labels": 4,
-            "condition_description": "type of the first clinically significant infection, if any",
-        },
-        "infection_label_one_hot": {
-            "task_type": "classification",
-            "num_labels": 2,  # ??? not sure how to do this one
-            "condition_description": "occurrence of any clinically significant infection",
-        },
-        "infection_label_binary_any": {
-            "task_type": "classification",
-            "num_labels": 2,
-            "condition_description": "occurrence of any clinically significant infection",
-        },
-        "infection_label_binary_bacterial": {
-            "task_type": "classification",
-            "num_labels": 2,
-            "condition_description": "occurrence of any clinically significant bacterial infection",
-        },
-        "infection_label_binary_viral": {
-            "task_type": "classification",
-            "num_labels": 2,
-            "condition_description": "occurrence of any clinically significant viral infection",
-        },
-        "infection_label_binary_fungal": {
-            "task_type": "classification",
-            "num_labels": 2,
-            "condition_description": "occurrence of any clinically significant fungal infection",
-        },
-    }
 
     # Infection task labels
     INFECTION_TYPES = ["bacterial", "viral", "fungal"]
@@ -72,15 +36,15 @@ class ConstantsNamespace():
     # CUTOFF_DAYS = [0, 30, 60, 90, 180, 365, 1000, 3000, "full"]  # in days after first transplant event
 
     # Sheet names
-    CONSENT_SHEET = "Consent"  # "#1_CONSENT" <- names change for the full data file
-    KIDNEY_BL_SHEET = "Kidney_BL"  # "#2_KIDNEY_BL"
-    KIDNEY_FUP_SHEET = "Kidney_FUP"  # "#3_KIDNEY_FUP"
-    PATIENT_BL_SHEET = "PAT_BL"  # "#4_PAT_BL"
-    PATIENT_PSQ_SHEET = "PAT_PSQ"  # "#5_PAT_PSQ"
+    CONSENT_SHEET = "Consent"           # "#1_CONSENT" <- names change for the full data file
+    KIDNEY_BL_SHEET = "Kidney_BL"       # "#2_KIDNEY_BL"
+    KIDNEY_FUP_SHEET = "Kidney_FUP"     # "#3_KIDNEY_FUP"
+    PATIENT_BL_SHEET = "PAT_BL"         # "#4_PAT_BL"
+    PATIENT_PSQ_SHEET = "PAT_PSQ"       # "#5_PAT_PSQ"
     PATIENT_INFECTION_SHEET = "PAT_ID"  # "#6_PAT_ID" <- renamed to avoid confusion with patient identifier (ID)
-    PATIENT_DRUG_SHEET = "PAT_Drug"  # "#7_PAT_DRUG"
-    PATIENT_STOP_SHEET = "PAT_Stop"  # "#8_PAT_STOP"
-    ORGAN_BASE_SHEET = "Organ_Base"  # "#9_ORGAN_BASE"
+    PATIENT_DRUG_SHEET = "PAT_Drug"     # "#7_PAT_DRUG"
+    PATIENT_STOP_SHEET = "PAT_Stop"     # "#8_PAT_STOP"
+    ORGAN_BASE_SHEET = "Organ_Base"     # "#9_ORGAN_BASE"
 
     # Some key variables to build the data (used for drug df only for now)
     START_TIME_IMPUTATION_STRATEGY = "aggressive"  # None, "normal", "aggressive", "remove"

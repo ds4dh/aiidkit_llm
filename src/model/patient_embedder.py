@@ -13,7 +13,7 @@ from transformers import (
 )
 from transformers.data.data_collator import DataCollatorMixin
 from sentence_transformers import SentenceTransformer
-from src.model.model_utils import TimeEmbedding, PositionalEncoding
+from src.model.model_utils import TimeEmbedding
 
 
 class PatientEmbeddingModelFactory:
@@ -125,7 +125,7 @@ class PatientEmbeddingModelFactory:
                 outputs.hidden_states = (outputs.hidden_states[-1],)
             return outputs
 
-        # Apply Monkey Patch
+        # Apply monkey patch
         model.original_forward = model.forward
         model.forward = types.MethodType(custom_forward, model)
 
@@ -140,114 +140,44 @@ class PatientEmbeddingModelFactory:
 class PatientEmbeddingLayer(nn.Module):
     def __init__(
         self,
+        vocab_size: int,
         embedding_dim: int,
-        vocabs: dict[str, dict[str, int]],
-        vocab_mapping: dict[str, str]={
-            "entity": "entity_id",
-            "attribute": "attribute_id",
-            "value_binned": "value_id",
-        },
+        eav_keys: list[str]=["entity_id", "attribute_id", "value_id"],
         time_key: str="days_since_tpx",
-        use_positional_encoding: bool=True,
         use_pretrained_embeddings: bool=True,
         pretrained_model_name: str="NeuML/pubmedbert-base-embeddings",
     ):
         """
         Layer to generate input embedddings given patient data sequences
         Args:
+            vocab_size (int): size of the vocabulary for token embeddings
             embedding_dim (int): dimension of the generated embeddings
-            vocabs (dict[str, dict[str, int]]): dictionary mapping feature names
-                to their respective vocabulary dictionaries, from string to int id
-            vocab_mapping (dict[str, str]): dictionary mapping the keys in `vocabs`
-                to the corresponding keys in the input `kwargs` during the forward pass
             time_key (str): key in forward `kwargs` that corresponds to the time feature
-            use_positional_encoding (bool): Whether to apply positional encoding to
-                the combined embeddings
             use_pretrained_embeddings (bool): whether to initialize embedding layers
                 with embeddings from a pretrained SentenceTransformer model.
             pretrained_model_name (str): model used for `use_pretrained_embeddings`
-            freeze_pretrained (bool): freeze model for `use_pretrained_embeddings`
         """
         super().__init__()
-
-        # Create embedding layers for each feature vocabulary
-        if vocabs.keys() != vocab_mapping.keys():
-            raise KeyError(f"Required vocab keys: {list(vocab_mapping.keys())}")
-        self.vocabs = vocabs
-        self.vocab_mapping = vocab_mapping
         self.embedding_dim = embedding_dim
-
-        # Initialize pretrained embedding model, if required
+        self.eav_keys = eav_keys
+        self.time_key = time_key
         self.use_pretrained_embeddings = use_pretrained_embeddings
         self.pretrained_model_name = pretrained_model_name
-        self._init_embedding_strategy()
 
-        # Special embedding layer for time feature
-        self.time_key = time_key
+        # Time embedding layer (always used)
         self.time_embedding = TimeEmbedding(embedding_dim)
 
-        # Positional encoding to encode relative position between events
-        self.use_positional_encoding = use_positional_encoding
-        if use_positional_encoding:
-            self.positional_encoding = PositionalEncoding(embedding_dim)
+        # Train from scratch (using medical code vocabulary and embedding layer)
+        if not use_pretrained_embeddings:
+            self.token_embedding = nn.Embedding(vocab_size, embedding_dim)
+
+        # Use a pretrained sentence transformer to embed textual event descriptions
         else:
-            self.positional_encoding = None
-
-    def _init_embedding_strategy(self) -> nn.ModuleDict:
-        """
-        Initialize ModuleDict for token embeddings and create embedding layers
-        from pretrained embeddings or from scratch for each feature vocabulary
-        """
-        # Create embedding layers from scratch for each feature vocabulary
-        if not self.use_pretrained_embeddings:
-            token_embedding_dict = nn.ModuleDict()
-            
-            for vocab_key, vocab in self.vocabs.items():
-                input_key = self.vocab_mapping[vocab_key]
-                token_embedding_dict[input_key] = nn.Embedding(
-                    num_embeddings=len(vocab), 
-                    embedding_dim=self.embedding_dim
-                )
-
-            self.required_eav_keys = list(self.vocab_mapping.values())
-            self.token_embedding_dict = token_embedding_dict
-            self.event_sentence_embedding_model_list = None
-
-        # Create embedding layers from pretrained embeddings for each feature vocabulary
-        else:
-            sentence_model = SentenceTransformer(self.pretrained_model_name, device="cpu")
-            sentence_model.eval()
-            for param in sentence_model.parameters():
+            self.sentence_model = SentenceTransformer(pretrained_model_name, device="cpu")
+            self.sentence_model.eval()
+            for param in self.sentence_model.parameters():
                 param.requires_grad = False
-            
-            # Check if the model's embedding dimension matches the desired one
-            model_embedding_dim = sentence_model.get_sentence_embedding_dimension()
-            if model_embedding_dim != self.embedding_dim:
-                raise ValueError(
-                    f"The `embedding_dim` ({self.embedding_dim}) does not match the "
-                    f"pretrained model's dimension ({model_embedding_dim}). "
-                    "Please adjust `embedding_dim` or choose a different model."
-                )
-            
-            # Note: the sentence embedding model is registered as a list to avoid
-            # automatic submodule registration which would send it to GPU
-            self.required_eav_keys = list(self.vocab_mapping.keys())
-            self.event_sentence_embedding_model_list = [sentence_model]
-            self.event_embedding_cache = {}  # avoid re-computing already seen ones
-            self.token_embedding_dict = None
-
-    def _get_embeddings_from_scratch_from_eav_ids(
-        self,
-        kwargs: dict[str, torch.Tensor],
-    ) -> torch.Tensor:
-        """
-        Compute embeddings by summing individual feature embeddings
-        """
-        return sum(
-            self.token_embedding_dict[key](sequence)
-            for key, sequence in kwargs.items()
-            if key in self.required_eav_keys
-        )
+            self.event_embedding_cache = {}
 
     def _construct_eav_event_sentence(
         self,
@@ -331,29 +261,19 @@ class PatientEmbeddingLayer(nn.Module):
 
     def forward(self, **kwargs) -> torch.Tensor:
         """
-        Forward pass for the patient embedding layer
+        Forward pass for the patient embedding layer.
         """
-        # Check input arguments
-        required_keys = self.required_eav_keys + [self.time_key]
-        if not all(key in kwargs for key in required_keys):
-            raise KeyError(f"Missing one or more required inputs. Expected: {required_keys}")
-
-        # Get the event triplet embeddings
+        # Compute base embeddings
         if self.use_pretrained_embeddings:
-            eav_embeddings = self._get_pretrained_embeddings_with_sentence_model(kwargs)
+            x = self._get_pretrained_embeddings_with_sentence_model(kwargs)
         else:
-            eav_embeddings = self._get_embeddings_from_scratch_from_eav_ids(kwargs)
-        eav_embeddings = eav_embeddings.to(kwargs[self.time_key].device)
+            x = sum(self.token_embedding(kwargs[key]) for key in self.eav_keys)
 
-        # Apply time embeddings using the time input
-        time_embeddings = self.time_embedding(x=eav_embeddings, times=kwargs[self.time_key])
-        final_embeddings = eav_embeddings + time_embeddings
-
-        # Apply relative positional encoding, if required
-        if self.positional_encoding is not None:
-            final_embeddings = self.positional_encoding(final_embeddings)
-
-        return final_embeddings
+        # Add time embeddings to the base embeddings
+        x = x.to(kwargs[self.time_key].device)
+        x = x + self.time_embedding(x, kwargs[self.time_key])
+            
+        return x
 
 
 @dataclass
@@ -362,55 +282,91 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
     Data collator used for the PatientEmbedding-based language model
     Modified from transformers.data.data_collator.py
     """
-    pad_token_id: int=0
-    mask_token_id: int=1
-    bos_token_id: int=2
-    eos_token_id: int=3
-    unk_token_id: int=4
+    # Special tokens
+    pad_token_id: int | str = 0
+    mask_token_id: int | str = 1
+    bos_token_id: int | str = 2
+    eos_token_id: int | str = 3
+    unk_token_id: int | str = 4
+
+    # Configuration
     input_keys: list[str] = field(default_factory=lambda: ["entity_id", "attribute_id"])
-    mlm_masked_key: str="value_id"
-    mlm_label_key: str="value_id"
-    time_key: str="days_since_tpx"
-    use_pretrained_embeddings: bool=True
-    max_position_embeddings: int=512
-    mlm_probability: float=0.15
-    truncation_probability: float=0.5
-    return_tensors: str="pt"
+    time_key: str = "days_since_tpx"
+    mlm_masking_rules: dict[str, float] = field(default_factory=lambda: {"value_id": 0.15})
+    mlm_label_keys: list[str] = field(default_factory=lambda: ["value_id"])
+    use_pretrained_embeddings: bool = True
+    max_position_embeddings: int = 512
+    truncation_probability: float = 0.5
+    return_tensors: str = "pt"
 
     @classmethod
     def from_kwargs(cls, **kwargs):
-        """
-        Filter the kwargs to only include keys that exist in the dataclass
-        Valid keys will automatically include keys from the subclass if called on the subclass
-        """
-        # cls.__dataclass_fields__ contains fields from the class and its parents
-        return cls(**{
-            k: v for k, v in kwargs.items() 
-            if k in cls.__dataclass_fields__
-        })
+        return cls(**{k: v for k, v in kwargs.items() if k in cls.__dataclass_fields__})
 
     def __post_init__(self):
-        """
-        Prepare data collator for embedding text sentences directly, with the time
-        """
+        # Handle text (with pretrained embeddings) vs ID (without) mode
+        self.mask_source_to_label_source = {}
         if self.use_pretrained_embeddings:
-
-            # Replace input keys by their corresponding text
-            self.pad_token_id = "[PAD]"  # no ids, but texts
-            self.mask_token_id = "[MASK]"  # no ids, but texts
-            self.bos_token_id = "[BOS]"  # no ids, but texts
-            self.eos_token_id = "[EOS]"  # no ids, but texts
-            self.unk_token_id = "[UNK]"  # no ids, but texts
+            self.pad_token_id = "[PAD]"
+            self.mask_token_id = "[MASK]"
+            self.bos_token_id = "[BOS]"
+            self.eos_token_id = "[EOS]"
+            self.unk_token_id = "[UNK]"
+            
+            # Update input keys
             self.input_keys = ["entity", "attribute"]
-            self.mlm_masked_key = "value_binned"
+            self.mask_source_to_label_source["value_binned"] = "value_id"
+            if "value_id" in self.mlm_masking_rules:
+                self.mlm_masking_rules["value_binned"] = self.mlm_masking_rules.pop("value_id")
 
-            # But time key and MLM labels stay the same (int ids)  
-            self.mlm_label_key = "value_id"
-            self.time_key = "days_since_tpx"
+        
+        # Check that no label key is missing in the masking rules
+        else:
+            if not all(k in self.mlm_masking_rules for k in self.mlm_label_keys):
+                missing = [k for k in self.mlm_label_keys if k not in self.mlm_masking_rules]
+                raise KeyError(f"These mlm_label_keys are missing in mlm_masking_rules: {missing}")
 
-        added_keys = [self.mlm_masked_key, self.mlm_label_key, self.time_key]
-        self.features_to_process = list(set(self.input_keys + added_keys))
+        # Determine all features that need processing (padding/truncating)
+        all_masking_keys = list(self.mlm_masking_rules.keys())
+        self.features_to_process = list(set(self.input_keys + [self.time_key] + all_masking_keys))
 
+    @staticmethod
+    def _pad_sequences_numpy(
+        sequences: list[np.ndarray],
+        batch_first: bool=False,
+        padding_value: int|float|str=0,
+    ):
+        """
+        Pads a list of variable-length sequences with a padding value.
+        This function is a NumPy equivalent of torch.nn.utils.rnn.pad_sequence.
+
+        Args:
+            sequences (list of np.ndarray): sequences to pad
+            batch_first (bool, optional): batch dimension as the first dimension
+            padding_value (float, optional): value to use for padding
+
+        Returns:
+            np.ndarray: The padded sequences as a single NumPy array.
+        """
+        # Define the output shape
+        max_len = max([s.shape[0] for s in sequences])
+        trailing_dims = sequences[0].shape[1:]
+        if batch_first:  # (batch_size, max_len, *trailing_dims)
+            out_shape = (len(sequences), max_len) + trailing_dims
+        else:  # (max_len, batch_size, *trailing_dims)
+            out_shape = (max_len, len(sequences)) + trailing_dims
+
+        # Create the padded array, copying values from the original sequences
+        padded_sequences = np.full(out_shape, padding_value, dtype=sequences[0].dtype)
+        for i, s in enumerate(sequences):
+            length = s.shape[0]
+            if batch_first:
+                padded_sequences[i, :length, ...] = s
+            else:
+                padded_sequences[:length, i, ...] = s
+
+        return padded_sequences
+    
     def _separate_non_processed_features(
         self,
         samples: list[dict],
@@ -470,7 +426,6 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
             to_add = ([self.bos_token_id], [self.eos_token_id])
 
         return np.concatenate([to_add[0], sequence, to_add[-1]], axis=0)
-        # return torch.cat([to_add[0], sequence, to_add[-1]], dim=0)
         
     def _add_special_token_ids(
         self,
@@ -494,7 +449,10 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
         padded_batch: dict[str, np.ndarray] = {}
         for key in self.features_to_process:
             sequences = [s[key] for s in samples]
-            padding_value = 0.0 if key == self.time_key else self.pad_token_id
+            if key == self.time_key or key in self.mlm_label_keys:
+                padding_value = 0
+            else:
+                padding_value = self.pad_token_id
             padded_batch[key] = self._pad_sequences_numpy(
                 sequences, batch_first=True, padding_value=padding_value,
             )
@@ -518,30 +476,19 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
 
         return padded_batch, attention_mask
 
-    def torch_call(
-        self,
-        samples: list[dict[str, np.ndarray]],
-    ) -> dict[str, dict[str, np.ndarray]|np.ndarray]:
+    def torch_call(self, samples: list[dict[str, np.ndarray]]) -> dict:
         """
-        Collate patient sequences and create labels for LM training
-        Used by HuggingFace's trainer
+        Main entry point used by HuggingFace Trainer.
         """
-        # Preprocess the input samples
         samples, non_features = self._separate_non_processed_features(samples)
         padded_batch, attention_mask = self._process_batch(samples)
-
-        # Prepare inputs and labels for the MLM task
-        masked_input_dict = padded_batch
-        masked_values, labels = self._masked_modelling(masked_input_dict)
-        masked_input_dict[self.mlm_masked_key] = masked_values
-
-        # Assemble the final input batch
+        masked_input_dict, labels = self._masked_modelling(padded_batch)
         batch = {
-            "input_dict": self._check_types(masked_input_dict),  # dict[str, np.ndarray|torch.tensor]
-            "attention_mask": torch.tensor(attention_mask),      # torch.tensor[float]
-            "labels": torch.tensor(labels).long(),               # torch.tensor[int]
+            "input_dict": self._check_types(masked_input_dict),
+            "attention_mask": torch.tensor(attention_mask),
+            "labels": torch.tensor(labels).long(),
         }
-        batch.update(non_features)  # in case useful somewhere
+        batch.update(non_features)
 
         return batch
 
@@ -559,80 +506,66 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
 
         return input_dict
 
-    @staticmethod
-    def _pad_sequences_numpy(
-        sequences: list[np.ndarray],
-        batch_first: bool=False,
-        padding_value: int|float|str=0,
-    ):
-        """
-        Pads a list of variable-length sequences with a padding value.
-        This function is a NumPy equivalent of torch.nn.utils.rnn.pad_sequence.
-
-        Args:
-            sequences (list of np.ndarray): sequences to pad
-            batch_first (bool, optional): batch dimension as the first dimension
-            padding_value (float, optional): value to use for padding
-
-        Returns:
-            np.ndarray: The padded sequences as a single NumPy array.
-        """
-        # Define the output shape
-        max_len = max([s.shape[0] for s in sequences])
-        trailing_dims = sequences[0].shape[1:]
-        if batch_first:  # (batch_size, max_len, *trailing_dims)
-            out_shape = (len(sequences), max_len) + trailing_dims
-        else:  # (max_len, batch_size, *trailing_dims)
-            out_shape = (max_len, len(sequences)) + trailing_dims
-
-        # Create the padded array, copying values from the original sequences
-        padded_sequences = np.full(out_shape, padding_value, dtype=sequences[0].dtype)
-        for i, s in enumerate(sequences):
-            length = s.shape[0]
-            if batch_first:
-                padded_sequences[i, :length, ...] = s
-            else:
-                padded_sequences[:length, i, ...] = s
-
-        return padded_sequences
-
     def _masked_modelling(
         self,
         masked_input_dict: dict[str, np.ndarray],
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[dict[str, np.ndarray], np.ndarray]:
         """
-        Prepare masked tokens inputs and labels for masked language modeling
-        Modified from transformers.data.data_collator.py
+        Generalized MLM with Mutually Exclusive Masking per token.
+        At any given position, MAX one feature is masked.
         """
-        # Take input values to mask and output ids to retrieve. Using copy()
-        # ensures labels and inputs do not refer to the same object when the
-        # masked key and the label key are the same
-        mlm_inputs = masked_input_dict.get(self.mlm_masked_key).copy()
-        mlm_labels = masked_input_dict.pop(self.mlm_label_key)
+        # Initialization
+        any_key = next(iter(self.mlm_masking_rules.keys()))
+        batch_shape = masked_input_dict[any_key].shape
+        final_labels = np.full(batch_shape, -100, dtype=int)  # will be filled
+        global_mask_map = torch.zeros(batch_shape, dtype=torch.bool)  # who is masked
+        features_to_process = list(self.mlm_masking_rules.keys())
+        random.shuffle(features_to_process)  # shuffle which feature gets priority
 
-        # Sample masked locations in the batch, using mlm_probability
-        probability_matrix = torch.full(mlm_labels.shape, self.mlm_probability)
-        no_mask_ids = [self.bos_token_id, self.eos_token_id, self.unk_token_id, self.pad_token_id]
-        no_mask_pad = torch.tensor(np.isin(mlm_labels, no_mask_ids))
-        probability_matrix.masked_fill_(no_mask_pad, value=0.0)
-        masked_indices = torch.bernoulli(probability_matrix).bool()
+        # Process each feature one by one
+        for feature_key in features_to_process:
+            if feature_key not in masked_input_dict:
+                continue
+                
+            # Generate candidates for this feature key
+            input_tokens = masked_input_dict[feature_key].copy()
+            probability = self.mlm_masking_rules[feature_key]
+            prob_matrix = torch.full(input_tokens.shape, probability)
+            
+            # Initial mask candidates for this feature (skipping PAD, CLS, SEP, etc.)
+            no_mask_ids = [self.bos_token_id, self.eos_token_id, self.unk_token_id, self.pad_token_id]
+            special_tokens_mask = torch.tensor(np.isin(input_tokens, no_mask_ids))
+            prob_matrix.masked_fill_(special_tokens_mask, value=0.0)
+            candidate_mask = torch.bernoulli(prob_matrix).bool()
 
-        # Build the label array
-        mlm_labels[~masked_indices] = -100  # special code to only compute loss on masked tokens
-        mlm_labels = mlm_labels.astype(int)  # special tokens are -100, then all the rest is int
+            # Enforce mutual exclusivity
+            final_mask = candidate_mask & (~global_mask_map)
+            global_mask_map = global_mask_map | final_mask
+            if not final_mask.any():
+                continue
 
-        # 80% of the time, replace masked input tokens with mask token
-        indices_replaced = torch.bernoulli(torch.full(mlm_labels.shape, 0.8)).bool() & masked_indices
-        mlm_inputs[indices_replaced] = self.mask_token_id
+            # Update labels if part of label keys (using standard MLM labeling)
+            label_source = self.mask_source_to_label_source.get(feature_key, feature_key)
+            if label_source in self.mlm_label_keys:
+                target_values = masked_input_dict[label_source]
+                final_labels[final_mask] = target_values[final_mask]
 
-        # 10% of the time, replace masked input tokens with a random entry of the batch
-        indices_random = torch.bernoulli(torch.full(mlm_labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
-        flat_mlm_inputs = mlm_inputs.flatten()
-        valid_choices = flat_mlm_inputs[~np.isin(flat_mlm_inputs, no_mask_ids)]
-        random_tokens = valid_choices[np.random.randint(0, valid_choices.size, mlm_labels.shape)]
-        mlm_inputs[indices_random] = random_tokens[indices_random]
+            # Replace 80% of selected masked token locations using [MASK]
+            indices_replaced = torch.bernoulli(torch.full(final_labels.shape, 0.8)).bool() & final_mask
+            input_tokens[indices_replaced] = self.mask_token_id
 
-        return mlm_inputs, mlm_labels
+            # Replace 10% of selected masked token locations with a random token from the batch (10% last untouched)
+            indices_random = torch.bernoulli(torch.full(final_labels.shape, 0.5)).bool() & final_mask & ~indices_replaced
+            flat_tokens = input_tokens.flatten()
+            valid_choices = flat_tokens[~np.isin(flat_tokens, no_mask_ids)]
+            if valid_choices.size > 0:
+                random_tokens = valid_choices[np.random.randint(0, valid_choices.size, input_tokens.shape)]
+                input_tokens[indices_random] = random_tokens[indices_random]
+
+            # Update the batch dictionary
+            masked_input_dict[feature_key] = input_tokens
+
+        return masked_input_dict, final_labels
 
 
 @dataclass

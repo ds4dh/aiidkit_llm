@@ -18,7 +18,7 @@ import plotly.graph_objects as go
 from plotly.colors import qualitative
 from scipy.special import softmax
 from sklearn.metrics import (
-    silhouette_score, adjusted_mutual_info_score, ConfusionMatrixDisplay,
+    silhouette_score, adjusted_mutual_info_score,
     roc_auc_score, average_precision_score, precision_recall_curve,
     accuracy_score, balanced_accuracy_score,
     precision_score, recall_score, f1_score,
@@ -301,13 +301,13 @@ class UMAP_HDBSCAN_Clusterer:
         return fig
 
 
-class CustomEmbeddingEvaluatorForMaskedLanguageModelling:
+class DiscriminativeEmbeddingEvaluatorForMaskedLanguageModelling:
     def __init__(
         self,
-        vocabs: dict[str, int],
         do_clustering: bool=True,
         max_clustered_samples: int=2500,
         n_optuna_trials: int=25,
+        **kwargs,
     ):
         """
         Args:
@@ -315,7 +315,6 @@ class CustomEmbeddingEvaluatorForMaskedLanguageModelling:
             n_optuna_trials: 0 to skip hyperparam search, > 0 to optimize clustering
             max_clustered_samples: maximum number of samples to cluster
         """
-        self.vocabs = vocabs  # may be useful at some point!
         self.do_clustering = do_clustering
         self.max_clustered_samples = max_clustered_samples
         self.n_optuna_trials = n_optuna_trials
@@ -351,7 +350,11 @@ class CustomEmbeddingEvaluatorForMaskedLanguageModelling:
         return metrics
 
 
-class CustomEmbeddingEvaluatorForClassification:
+class BaseEmbeddingEvaluatorForClassification:
+    """
+    Base class containing shared logic for metrics, clustering, and logging.
+    Subclasses must implement `prepare_predictions`.
+    """
     def __init__(
         self,
         do_clustering: bool = False,
@@ -359,79 +362,59 @@ class CustomEmbeddingEvaluatorForClassification:
         max_clustered_samples: int = 2500,
         pos_label: int = 1,
     ):
-        """
-        Args:
-            do_clustering: whether to run UMAP/HDBSCAN on the pooled embeddings
-            n_optuna_trials: 0 to skip hyperparam search, > 0 to optimize clustering
-            max_clustered_samples: maximum number of samples to cluster
-            pos_label: integer label of the 'positive' class (usually 1)
-        """
         self.do_clustering = do_clustering
-        self.pos_label = pos_label
         self.max_clustered_samples = max_clustered_samples
-        self.n_optuna_trials = n_optuna_trials
+        self.pos_label = pos_label
         if do_clustering:
             self.clusterer_module = UMAP_HDBSCAN_Clusterer(n_optuna_trials=n_optuna_trials)
 
+    def prepare_predictions(self, eval_preds: EvalPrediction) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+        """
+        Abstract method to unpack predictions.
+        Must return: (logits, labels, embeddings)
+        """
+        raise NotImplementedError("Subclasses must implement prepare_predictions")
+
     def __call__(self, eval_preds: EvalPrediction) -> dict[str, float]:
         """
-        Called by Trainer.evaluate()
-        eval_preds.predictions: Tuple[np.ndarray, np.ndarray] (logits, embeddings)
-        eval_preds.label_ids: np.ndarray
+        Main entry point called by the Trainer
         """
-        # Unpack data
-        if isinstance(eval_preds.predictions, tuple):
-            logits, embeddings = eval_preds.predictions
-        else:
-            logits = eval_preds.predictions
-            embeddings = None
+        # Standardize Input using the subclass implementation
+        logits, labels, embeddings = self.prepare_predictions(eval_preds)
 
-        # Prepare metric computation
-        metrics = {}
-        labels = eval_preds.label_ids
+        # Compute Probabilities
         probs = softmax(logits, axis=-1)
-        if logits.shape[1] == 2:  # binary classification care about the positive class
+        if logits.shape[1] == 2:
             probs_pos = probs[:, self.pos_label]
         else:
+            # Fallback for multiclass: take max prob
             probs_pos = probs.max(axis=1)
 
-        # Probabilistic metrics
+        # Probability-based metrics
+        metrics = {}
         metrics["ece"] = self._expected_calibration_error(labels, probs)
-        if logits.shape[1] == 2:
-            try:
-                metrics["roc_auc"] = roc_auc_score(labels, probs_pos)
-                metrics["pr_auc"] = average_precision_score(labels, probs_pos)
-            except ValueError:
-                # Happens if only one class is present in the batch
-                metrics["roc_auc"] = -1.0
-                metrics["pr_auc"] = -1.0
+        try:
+            metrics["roc_auc"] = roc_auc_score(labels, probs_pos)
+            metrics["pr_auc"] = average_precision_score(labels, probs_pos)
+        except ValueError:
+            # Fail if we have only one class in the batch
+            metrics["roc_auc"] = -1.0
+            metrics["pr_auc"] = -1.0
 
-        # Threshold-based metrics metrics
+        # Threshold-based metrics
         preds_optimal = self._get_preds_from_best_threshold(labels, probs_pos)
-        avg_method = "binary" if logits.shape[1] == 2 else "weighted"
-        if logits.shape[1] == 2:
-            metrics["acc"] = accuracy_score(labels, preds_optimal)
-            metrics["bal_acc"] = balanced_accuracy_score(labels, preds_optimal)
-            metrics["precision"] = precision_score(labels, preds_optimal, average=avg_method)
-            metrics["recall"] = recall_score(labels, preds_optimal, average=avg_method)
-            metrics["f1"] = f1_score(labels, preds_optimal)
+        avg_method = "binary" if logits.shape[1] == 2 else "macro"
+        metrics["acc"] = accuracy_score(labels, preds_optimal)
+        metrics["bal_acc"] = balanced_accuracy_score(labels, preds_optimal)
+        metrics["precision"] = precision_score(labels, preds_optimal, average=avg_method, zero_division=0)
+        metrics["recall"] = recall_score(labels, preds_optimal, average=avg_method, zero_division=0)
+        metrics["f1"] = f1_score(labels, preds_optimal, average=avg_method, zero_division=0)
 
-        # Classification plots
+        # WandB Logging
         if wandb.run is not None:
-            try:
-                # Log confusion matrix (for any classification task)
-                cm = wandb.plot.confusion_matrix(probs=None, y_true=labels, preds=preds_optimal)
-                wandb.log({"eval_plots/conf_mat": cm}, commit=False)
+            self._log_plots(labels, probs, preds_optimal, prefix="eval_plots")
 
-                # Log precision-recall curve (if binary classification)
-                if logits.shape[1] == 2:
-                    wandb.log({"eval_plots/pr_curve": wandb.plot.pr_curve(labels, probs)}, commit=False)
-                    wandb.log({"eval_plots/roc_curve": wandb.plot.roc_curve(labels, probs)}, commit=False)
-
-            except Exception as e:
-                print(f"WandB logging error: {e}")
-
-        # Clustering analysis
+        # Clustering Analysis
         if self.do_clustering and embeddings is not None:
             cluster_metrics, cluster_fig = self.clusterer_module.perform_analysis(
                 embeddings, 
@@ -439,49 +422,57 @@ class CustomEmbeddingEvaluatorForClassification:
             )
             metrics.update(cluster_metrics)
             if cluster_fig is not None and wandb.run is not None:
-                wandb.log({"eval_plots/cls_clusters": cluster_fig}, commit=False)
+                wandb.log({"eval_plots/clusters": cluster_fig}, commit=False)
 
         return metrics
 
+    def _log_plots(self, labels, probs, preds, prefix="eval_plots"):
+        try:
+            # Confusion Matrix
+            cm = wandb.plot.confusion_matrix(probs=None, y_true=labels, preds=preds)
+            wandb.log({f"{prefix}/conf_mat": cm}, commit=False)
+
+            # Binary specific curves
+            if probs.shape[1] == 2:
+                wandb.log({f"{prefix}/pr_curve": wandb.plot.pr_curve(labels, probs)}, commit=False)
+                wandb.log({f"{prefix}/roc_curve": wandb.plot.roc_curve(labels, probs)}, commit=False)
+        except Exception as e:
+            print(f"WandB logging error: {e}")
+
     @staticmethod
-    def _get_preds_from_best_threshold(
-        y_true: np.ndarray,
-        y_score: np.ndarray,
-    ) -> np.ndarray:
+    def _get_preds_from_best_threshold(y_true, y_score):
         """
-        Find the optimal threshold for a binary classifier based on the f1-score
-        of the positive class
+        Infer predictions using F1-score to determine the optimal threshold
         """
+        if len(np.unique(y_true)) < 2:
+            return np.round(y_score)
+
         precisions, recalls, thresholds = precision_recall_curve(y_true, y_score)
         denominator = precisions + recalls
         denominator[denominator == 0] = 1e-9 
         f1_scores = (2 * precisions * recalls) / denominator
-        f1_scores = f1_scores[:-1]  # thresholds are 1 shorter than precision/recall
+        f1_scores = f1_scores[:-1]
+
         if len(f1_scores) == 0:
             return np.zeros_like(y_true)
-            
+
         best_threshold = thresholds[np.argmax(f1_scores)]
+
         return (y_score >= best_threshold).astype(int)
 
     @staticmethod
     def _expected_calibration_error(y_true, y_probs, n_bins=10):
-        """
-        Computes the Expected Calibration Error (ECE).
-        """
         n_classes = y_probs.shape[1]
         if n_classes > 2:
             confidences = np.max(y_probs, axis=1)
-            predictions = np.argmax(y_probs, axis=1)
-            is_correct = (predictions == y_true)
+            is_correct = (np.argmax(y_probs, axis=1) == y_true)
         else:
-            # For binary, use probability of class 1
             confidences = y_probs[:, 1]
             is_correct = (y_true == 1)
-
+        
         bin_boundaries = np.linspace(0, 1, n_bins + 1)
         bin_indices = np.digitize(confidences, bin_boundaries[1:-1])
         ece = 0.0
-        
         for i in range(n_bins):
             in_bin = (bin_indices == i)
             n_in_bin = np.sum(in_bin)
@@ -489,13 +480,59 @@ class CustomEmbeddingEvaluatorForClassification:
                 acc_in_bin = np.mean(is_correct[in_bin])
                 conf_in_bin = np.mean(confidences[in_bin])
                 ece += np.abs(acc_in_bin - conf_in_bin) * n_in_bin
-
         return ece / len(y_true)
 
 
-def preprocess_logits_for_metrics(logits, labels):
+class DiscriminativeEmbeddingEvaluatorForClassification(BaseEmbeddingEvaluatorForClassification):
     """
-    Splits the model output to save memory
+    Evaluator for standard BERT-like sequence classification models.
+    Expects predictions to be formatted by `preprocess_logits_for_metrics_discriminative`.
+    """
+    def prepare_predictions(self, eval_preds: EvalPrediction):
+        # Unpack predictions
+        if isinstance(eval_preds.predictions, tuple):
+            logits, embeddings = eval_preds.predictions
+        else:
+            logits = eval_preds.predictions
+            embeddings = None
+
+        labels = eval_preds.label_ids
+        return logits, labels, embeddings
+
+
+class GenerativeEmbeddingEvaluatorForClassification(BaseEmbeddingEvaluatorForClassification):
+    """
+    Evaluator for Generative LLMs (CausalLM) performing classification.
+    Expects predictions to be formatted by `preprocess_logits_for_metrics_generative`.
+    """
+    def __init__(self, tokenizer, positive_token="1", negative_token="0", **kwargs):
+        # Enforce clustering to False (at least for now)
+        kwargs["do_clustering"] = False
+        super().__init__(**kwargs)
+        self.tokenizer = tokenizer
+        self.pos_token_id = tokenizer.encode(positive_token, add_special_tokens=False)[-1]
+        self.neg_token_id = tokenizer.encode(negative_token, add_special_tokens=False)[-1]
+
+    def prepare_predictions(self, eval_preds: EvalPrediction):
+        # Unpack predictions (from preprocess function output)
+        logits, embeddings = eval_preds.predictions, None  # no clustering (for now)
+
+        # Reconstruct labels (first valid token in the sequence, using argmax)
+        label_ids = eval_preds.label_ids
+        answer_indices = (label_ids != -100).argmax(axis=1)
+
+        # Extract the actual token IDs at those positions
+        actual_token_ids = label_ids[np.arange(len(label_ids)), answer_indices]
+
+        # Convert to binary 0/1 (1 if it matches pos_token_id, else 0)
+        labels = (actual_token_ids == self.pos_token_id).astype(int)
+
+        return logits, labels, embeddings
+
+
+def preprocess_logits_for_mlm_metrics(logits, labels):
+    """
+    Compute model predictions and pool last hidden states as sequence embeddings
     """
     # The model returns (logits, hidden_states)
     if isinstance(logits, tuple):
@@ -517,3 +554,37 @@ def preprocess_logits_for_metrics(logits, labels):
         pooled_embeddings = sum_embeddings / sum_mask
 
     return pred_ids, pooled_embeddings
+
+
+def make_preprocess_logits_for_metrics_generative(
+    tokenizer,
+    pos_token: str="1",
+    neg_token: str="0",
+):
+    """
+    Creates a pre-processing function to extract only the logits
+    for the '0' and '1' tokens and the last hidden state for embeddings.
+    """
+    pos_id = tokenizer.encode(pos_token, add_special_tokens=False)[-1]
+    neg_id = tokenizer.encode(neg_token, add_special_tokens=False)[-1]
+
+    def preprocess_logits_for_metrics_generative(logits, labels):
+        if isinstance(logits, tuple):
+            logits = logits[0]
+
+        # Find index of the first valid label (the answer token)
+        # labels format: [-100 (prompt), ..., answer, eos, -100 (padding)]
+        # argmax on a boolean tensor returns the index of the first True
+        answer_indices = (labels != -100).long().argmax(dim=-1)
+
+        # The logit used to predict token at answer_indices is located at answer_indices - 1
+        # Clamped to 0 to avoid -1 indexing errors, though -1 should not happen in valid data
+        logit_indices = (answer_indices - 1).clamp(min=0)
+        
+        # Extract logits at the answer position
+        batch_range = torch.arange(logits.shape[0], device=logits.device)
+        final_logits = logits[batch_range, logit_indices][:, [neg_id, pos_id]]
+
+        return final_logits
+
+    return preprocess_logits_for_metrics_generative

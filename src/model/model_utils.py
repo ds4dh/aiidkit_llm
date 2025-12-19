@@ -83,80 +83,6 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
-class FocalLoss(nn.Module):
-    """
-    Focal Loss for Dense Object Detection (He et al.)
-    Compatible with Hugging Face SequenceClassification models (outputs shape: [N, C]).
-    """
-    def __init__(
-        self,
-        gamma: float=2.0,
-        alpha: float|list|torch.Tensor=None,
-        reduction: str="mean",
-    ):
-        """
-        Args:
-            gamma (float): Focusing parameter. Higher values (e.g., 2.0) down-weight easy examples.
-            alpha (float | list | Tensor): 
-                - If float (e.g., 0.25): Applies to the positive class (class 1) in binary case.
-                  Class 0 gets (1 - alpha).
-                - If list/Tensor (e.g., [1.0, 10.0]): specific weights for [class_0, class_1, ...].
-            reduction (str): 'mean', 'sum', or 'none'.
-        """
-        super().__init__()
-        self.gamma = gamma
-        self.reduction = reduction
-
-        if isinstance(alpha, float):
-            # If float provided, assume binary and construct weights: [1-alpha, alpha]
-            self.alpha = torch.tensor([1 - alpha, alpha])
-        elif isinstance(alpha, list):
-            self.alpha = torch.tensor(alpha)
-        else:
-            self.alpha = alpha  # assuming it is already a tensor or None
-
-    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            inputs: Logits of shape (batch_size, num_classes)
-            targets: Labels of shape (batch_size,)
-        """
-        # Compute standard cross entropy loss (element-wise)
-        ce_loss = F.cross_entropy(inputs, targets, reduction="none")
-
-        #  Calculate focal loss
-        pt = torch.exp(-ce_loss)
-        focal_term = (1 - pt) ** self.gamma
-        loss = focal_term * ce_loss
-
-        # Apply alpha (class balancing)
-        if self.alpha is not None:
-            if self.alpha.device != loss.device:
-                self.alpha = self.alpha.to(loss.device)
-            alpha_t = self.alpha.gather(0, targets)
-            loss = alpha_t * loss
-
-        # Apply loss reduction
-        if self.reduction == "mean":
-            return loss.mean()
-        elif self.reduction == "sum":
-            return loss.sum()
-        
-        return loss
-
-
-def make_focal_loss_func(gamma=2.0, alpha=None, reduction="mean"):
-    focal = FocalLoss(gamma=gamma, alpha=alpha, reduction=reduction)
-
-    def compute_loss(outputs, labels, num_items_in_batch=None):
-        # outputs is a dict-like ModelOutput
-        logits = outputs["logits"] if isinstance(outputs, dict) else outputs[0]
-        # labels is already popped from inputs by Trainer
-        return focal(logits, labels)
-
-    return compute_loss
-
-
 class EarlyStoppingCallbackWithWarmup(EarlyStoppingCallback):
     """
     An EarlyStoppingCallback that disables early stopping for some warm-up steps
@@ -187,115 +113,184 @@ class EarlyStoppingCallbackWithWarmup(EarlyStoppingCallback):
         super().on_evaluate(args, state, control, metrics, **kwargs)
 
 
-# class SupervisedTaskWeightSchedulerCallback(TrainerCallback):
-#     """
-#     A callback to handle annealing a weight during training.
-#     """
-#     def __init__(self, start_steps, end_steps, start_value, end_value, strategy="linear"):
-#         self.start_steps = start_steps
-#         self.end_steps = end_steps
-#         self.start_value = start_value
-#         self.end_value = end_value
-#         self.strategy = strategy
-#         self.current_weight = start_value
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for Dense Object Detection (He et al.)
+    """
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        alpha: float | list | torch.Tensor = None,
+        reduction: str = "mean",
+    ):
+        super().__init__()
+        self.gamma = gamma
+        self.reduction = reduction
 
-#     def on_step_begin(
-#         self,
-#         args: TrainingArguments,
-#         state: TrainerState,
-#         control: TrainerControl,
-#         **kwargs,
-#     ):
-#         """
-#         Called at the beginning of a training step.
-#         """
-#         model = kwargs.get("model")
-#         if model is None:
-#             return
+        # Prepare alpha
+        if isinstance(alpha, float):
+            self.register_buffer("alpha", torch.tensor([1 - alpha, alpha]))
+        elif isinstance(alpha, list):
+            self.register_buffer("alpha", torch.tensor(alpha))
+        else:
+            self.register_buffer("alpha", alpha) # Assumed Tensor or None
 
-#         current_step = state.global_step
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # standard cross entropy (no reduction yet)
+        ce_loss = F.cross_entropy(inputs, targets, reduction="none")
 
-#         # Before annealing starts (during warmup)
-#         if current_step < self.start_steps:
-#             self.current_weight = self.start_value
+        pt = torch.exp(-ce_loss)
+        focal_term = (1 - pt) ** self.gamma
+        loss = focal_term * ce_loss
 
-#         # After annealing is complete
-#         elif current_step >= self.end_steps:
-#             self.current_weight = self.end_value
+        if self.alpha is not None:
+            # Alpha is registered buffer, so it matches device automatically
+            alpha_t = self.alpha.gather(0, targets)
+            loss = alpha_t * loss
 
-#         # During the annealing phase
-#         else:
-#             annealing_duration = self.end_steps - self.start_steps
-#             progress = (current_step - self.start_steps) / annealing_duration
-
-#             if self.strategy == "linear":
-#                 self.current_weight = self.start_value + progress * (self.end_value - self.start_value)
-            
-#             elif self.strategy == "cosine":
-#                 # Check if we are increasing or decreasing the weight
-#                 if self.start_value < self.end_value:
-#                     # This creates the "sine up" phase shape. The factor goes from 0 to 1.
-#                     # It's based on the formula: 0.5 * (1 - cos(pi * progress))
-#                     cosine_factor = 0.5 * (1.0 - math.cos(math.pi * progress))
-#                 else:
-#                     # This is the standard "cosine down" decay. The factor goes from 1 to 0.
-#                     # It's based on the formula: 0.5 * (1 + cos(pi * progress))
-#                     # We subtract from 1 to make the factor go from 0 to 1 for consistent interpolation.
-#                     cosine_factor_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-#                     cosine_factor = 1.0 - cosine_factor_decay
-
-#                 # Apply the factor using standard linear interpolation
-#                 self.current_weight = self.start_value + cosine_factor * (self.end_value - self.start_value)
-
-#             else:
-#                 # Default to linear if strategy is unknown
-#                 self.current_weight = self.start_value + progress * (self.end_value - self.start_value)
-
-#         # Update the model's attribute directly
-#         if hasattr(model, "supervised_task_weight"):
-#             model.supervised_task_weight = self.current_weight
-
-#     def on_log(
-#         self,
-#         args: TrainingArguments,
-#         state: TrainerState,
-#         control: TrainerControl,
-#         logs: dict,
-#         **kwargs,
-#     ):
-#         """
-#         Adds the current supervised task weight to the logs
-#         """
-#         if state.is_local_process_zero:
-#             logs["supervised_task_weight"] = self.current_weight
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        return loss
 
 
-# class WandbPlottingCallback(TrainerCallback):
-#     """
-#     Callback acting as a "mailbox" for plots generated during evaluation, logging
-#     plots to wandb at the correct step
-#     """
-#     def __init__(self):
-#         super().__init__()
-#         self.plots_to_log = {}  # temporary storage to log at the right time
+class WeightedCELoss(nn.Module):
+    """
+    Standard Cross Entropy but with explicit class weights for imbalance.
+    Args:
+        class_weights (list | Tensor): Weights for each class (e.g., [1.0, 10.0])
+    """
+    def __init__(self, class_weights: list | torch.Tensor = None, reduction: str = "mean"):
+        super().__init__()
+        if class_weights is not None:
+            if isinstance(class_weights, list):
+                class_weights = torch.tensor(class_weights)
+            # Register as buffer to handle device placement automatically
+            self.register_buffer("weight", class_weights)
+        else:
+            self.weight = None
+        
+        self.reduction = reduction
 
-#     def on_log(
-#         self, 
-#         args: TrainingArguments,
-#         state: TrainerState,
-#         control: TrainerControl,
-#         logs: dict[str, float],
-#         **kwargs,
-#     ):
-#         # We only log plots during evaluation, i.e., when an evaluation key is in
-#         # the `logs` dict, "eval_loss" being a reliable key for this purpose
-#         if "eval_loss" in logs and self.plots_to_log:
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        return F.cross_entropy(inputs, targets, weight=self.weight, reduction=self.reduction)
 
-#             # Check if there are any plots in our temporary storage
-#             if self.plots_to_log:
 
-#                 # Log the plots with the correct global step
-#                 wandb.log(self.plots_to_log, step=state.global_step)
+class DiceLoss(nn.Module):
+    """
+    Dice Loss for checking overlap. Excellent for strong imbalance.
+    Calculates 1 - DiceCoefficient.
+    """
+    def __init__(self, smooth: float = 1e-6, square_denominator: bool = False, reduction: str = "mean"):
+        super().__init__()
+        self.smooth = smooth
+        self.square_denominator = square_denominator
+        self.reduction = reduction
 
-#                 # Clear the storage to prevent re-logging
-#                 self.plots_to_log = {}
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        inputs: Logits [B, C]
+        targets: Labels [B]
+        """
+        # Get probabilities
+        probs = F.softmax(inputs, dim=1)
+        
+        # One-hot encode targets
+        num_classes = inputs.shape[1]
+        targets_one_hot = F.one_hot(targets, num_classes=num_classes)
+        
+        # Intersection: sum(probs * targets)
+        intersection = (probs * targets_one_hot).sum(dim=1)
+        
+        if self.square_denominator:
+            # Soft dice approach (squares in denominator)
+            cardinality = (probs ** 2).sum(dim=1) + (targets_one_hot ** 2).sum(dim=1)
+        else:
+            # Standard dice
+            cardinality = probs.sum(dim=1) + targets_one_hot.sum(dim=1)
+
+        dice_score = (2. * intersection + self.smooth) / (cardinality + self.smooth)
+
+        # We want to minimize loss, so loss = 1 - dice
+        loss = 1.0 - dice_score
+
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+
+class Poly1Loss(nn.Module):
+    """
+    Poly-1 Loss: A polynomial expansion of Cross Entropy.
+    L = CE + epsilon * (1 - pt)
+    Provides a heavier tail than Focal Loss, often more stable.
+    """
+    def __init__(self, epsilon: float = 1.0, class_weights: list | torch.Tensor = None, reduction: str = "mean"):
+        super().__init__()
+        self.epsilon = epsilon
+        self.reduction = reduction
+        
+        if class_weights is not None:
+            if isinstance(class_weights, list):
+                class_weights = torch.tensor(class_weights)
+            self.register_buffer("weight", class_weights)
+        else:
+            self.weight = None
+
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Cross-entropy term
+        ce_loss = F.cross_entropy(inputs, targets, weight=self.weight, reduction="none")
+        
+        # Poly-1 term: epsilon * (1 - pt), pt being probability of the correct class
+        probs = F.softmax(inputs, dim=1)
+        pt = probs.gather(1, targets.view(-1, 1)).squeeze()
+        
+        poly_term = self.epsilon * (1 - pt)
+        
+        loss = ce_loss + poly_term
+        
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+
+def make_loss_func(loss_name: str, loss_args: dict = None):
+    """
+    Factory to create a compute_loss function for HF Trainer.
+    
+    Args:
+        loss_name: 'focal', 'weighted_ce', 'dice', 'poly1'
+        loss_args: Dictionary of arguments for the specific loss class.
+    """
+    if loss_args is None:
+        loss_args = {}
+
+    # Instantiate the correct Loss Module
+    if loss_name.lower() == "focal":
+        loss_fct = FocalLoss(**loss_args)
+    elif loss_name.lower() in ["weighted_ce", "weighted"]:
+        loss_fct = WeightedCELoss(**loss_args)
+    elif loss_name.lower() == "dice":
+        loss_fct = DiceLoss(**loss_args)
+    elif loss_name.lower() in ["poly1", "poly"]:
+        loss_fct = Poly1Loss(**loss_args)
+    else:
+        raise ValueError(f"Loss name '{loss_name}' not recognized.")
+
+    # Define the inner function compatible with Hugging Face Trainer
+    def compute_loss(outputs, labels, num_items_in_batch=None):
+        # Handle HF ModelOutput object or tuple
+        if isinstance(outputs, dict):
+            logits = outputs["logits"]
+        else:
+            # Fallback for tuple outputs
+            logits = outputs[0]
+        
+        return loss_fct(logits, labels)
+
+    return compute_loss
