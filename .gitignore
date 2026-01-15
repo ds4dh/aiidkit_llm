@@ -184,5 +184,6 @@ data/processed/*
 data/preprocessed/*
 data/huggingface/*
 *.sif
+archives
 results
 wandb

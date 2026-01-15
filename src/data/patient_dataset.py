@@ -12,25 +12,32 @@ csts = constants.ConstantsNamespace()
 
 def load_hf_data_and_metadata(
     data_dir: str,
-    cutoff_days_train: int | list[int] | None = None,
-    cutoff_days_valid: int | list[int] | None = None,
+    fup_train: int | list[int] | None = None,
+    fup_valid: int | list[int] | None = None,
     overwrite_cache: bool = False,
+    metadata_cache_key: str | None = None,
     **kwargs,
 ) -> tuple[DatasetDict, dict[str, pd.IntervalIndex], dict[str, int]]:
     """
     Loads, concatenates, and processes patient datasets with caching support.
+    Ensures Vocabulary and Binning consistency if metadata_cache_key is provided.
     """
-    # Resolve which subfolders to load for each split
     root_path = Path(data_dir)
-    train_folders = _resolve_folders(root_path, cutoff_days_train)
-    valid_folders = _resolve_folders(root_path, cutoff_days_valid)
+    train_folders = _resolve_folders(root_path, fup_train)
+    valid_folders = _resolve_folders(root_path, fup_valid)
 
-    # Compute the cache name (e.g., "processed_train-90-180_val-90") and paths
+    # Generate cache name with the reference key to prevent collisions
+    # where the same data is processed with different vocabularies/bins
     cache_name = _generate_cache_name(train_folders, valid_folders)
+    if metadata_cache_key:
+        cache_name = f"{cache_name}_ref-{metadata_cache_key}"
+
     cache_path = root_path / "processed_cache" / cache_name
     bins_path = cache_path / "bin_intervals.pkl"
     vocab_path = cache_path / "vocab.pkl"
     
+    # import ipdb; ipdb.set_trace()
+
     # Try loading from cache
     if cache_path.exists() and not overwrite_cache:
         print(f"Loading cached dataset from: {cache_path}")
@@ -43,18 +50,36 @@ def load_hf_data_and_metadata(
             print(f"Cache load failed ({e}), reprocessing raw data")
             shutil.rmtree(cache_path, ignore_errors=True)
 
+    # Load reference data if finetuning
+    ref_vocab, ref_bins = None, None
+    if metadata_cache_key:
+        print(f"Aligning to reference metadata from: {metadata_cache_key}")
+        ref_path = root_path / "processed_cache" / metadata_cache_key        
+        if not ref_path.exists():
+            raise FileNotFoundError(f"Cache not found at {ref_path}. Run pre-training first.")
+        with open(ref_path / "vocab.pkl", "rb") as f: ref_vocab = pickle.load(f)
+        with open(ref_path / "bin_intervals.pkl", "rb") as f: ref_bins = pickle.load(f)
+
     # Load and concatenate raw data
-    print(f"Loading raw data")
-    raw_train = [load_from_disk(p)["train"] for p in train_folders]
-    raw_valid = [load_from_disk(p)["validation"] for p in valid_folders]
+    print(f"Loading raw data from disk...")
+    raw_train = [load_from_disk(str(p))["train"] for p in train_folders]
+    raw_valid = [load_from_disk(str(p))["validation"] for p in valid_folders]
     dataset = DatasetDict({
         "train": concatenate_datasets(raw_train),
         "validation": concatenate_datasets(raw_valid),
     })
 
-    # Bin dataset, compute vocab, and map tokens to unified IDs
-    dataset, bin_intervals = bin_values_by_attribute(dataset)
-    vocab = get_vocab(dataset, root_path=root_path, **kwargs)
+    # Bin dataset and compute bins + vocabulary, using reference if provided
+    dataset, bin_intervals = bin_values_by_attribute(dataset, existing_bins=ref_bins)
+    if ref_vocab:
+        print("Using reference vocabulary.")
+        vocab = ref_vocab
+    else:
+        # base_vocab = {v['token']: v['id'] for v in base_vocab_cfg.values()}
+        base_vocab = {"[PAD]": 0, "[MASK]": 1, "[BOS]": 2, "[EOS]": 3, "[UNK]": 4}
+        vocab = get_vocab(dataset, base_vocab=base_vocab, root_path=root_path, **kwargs)
+
+    # Map to unified IDs
     unk_id = vocab["[UNK]"]
     def map_to_ids(example):
         return {
@@ -75,7 +100,7 @@ def load_hf_data_and_metadata(
     available_cols = [c for c in cols_to_keep if c in dataset["train"].column_names]
     dataset.set_format(type="numpy", columns=available_cols)
 
-    # Save data and metadata to cache
+    # Save to cache
     print(f"Saving processed dataset and metadata to: {cache_path}")
     dataset.save_to_disk(str(cache_path))
     with open(bins_path, "wb") as f: pickle.dump(bin_intervals, f)
@@ -93,13 +118,14 @@ def _resolve_folders(
     'None' is treated as a literal suffix -> 'fup_None'.
     """
     # Normalize input to a list (wrap int or None to a list if not a list)
-    days_list = selection if isinstance(selection, list) else [selection]
+    fup_list = selection if isinstance(selection, list) else [selection]
 
     # Scan for available fup folders (to ensure we match existing ones)
     all_fups = sorted([p for p in root_path.iterdir() if p.is_dir() and p.name.startswith("fup_")])
     selected_paths = []
-    for day in days_list:
-        target_name = f"fup_{day}"
+    for fups in fup_list:
+        suffix = f"{fups:04d}" if fups is not None else "None"
+        target_name = f"fup_{suffix}"
         match = next((p for p in all_fups if p.name == target_name), None)
         if match:
             selected_paths.append(match)
@@ -124,8 +150,9 @@ def _generate_cache_name(train_paths: list[Path], valid_paths: list[Path]) -> st
 
 
 def get_vocab(
-    dataset: DatasetDict, 
-    root_path: Path | None = None, 
+    dataset: DatasetDict,
+    root_path: Path | None = None,
+    base_vocab: dict = {"[PAD]": 0, "[MASK]": 1, "[BOS]": 2, "[EOS]": 3, "[UNK]": 4},
     **kwargs
 ) -> dict[str, int]:
     """
@@ -134,12 +161,12 @@ def get_vocab(
     """
     # Load vocabulary using cache key (e.g., to ensure same vocab as pre-training)
     if "metadata_cache_key" in kwargs and root_path is not None:
-        meta_cut = kwargs["metadata_cache_key"]
-        print(f"Loading reference vocabulary using cutoff: {meta_cut}")
+        meta_fup = kwargs["metadata_cache_key"]
+        print(f"Loading reference vocabulary using follow-up: {meta_fup}")
         
         # Resolve the path to the master vocabulary
-        ref_t_folders = _resolve_folders(root_path, meta_cut)
-        ref_v_folders = _resolve_folders(root_path, meta_cut)
+        ref_t_folders = _resolve_folders(root_path, meta_fup)
+        ref_v_folders = _resolve_folders(root_path, meta_fup)
         ref_cache_name = _generate_cache_name(ref_t_folders, ref_v_folders)
         ref_vocab_path = root_path / "processed_cache" / ref_cache_name / "vocab.pkl"
         
@@ -157,8 +184,8 @@ def get_vocab(
         unique_tokens.update(sample["attribute"])
         unique_tokens.update(sample["value_binned"])
 
-    vocab = dict(csts.BASE_VOCAB)
-    start_idx = len(csts.BASE_VOCAB)
+    vocab = dict(base_vocab)
+    start_idx = len(vocab)
     for idx, term in enumerate(sorted(list(unique_tokens))):
         vocab[term] = idx + start_idx
 
@@ -167,79 +194,92 @@ def get_vocab(
 
 def bin_values_by_attribute(
     dataset: DatasetDict,
-    bin_labels: list[str]={
-        0: "Lowest", 1: "Lower", 2: "Low", 3: "Middle",
-        4: "High", 5: "Higher", 6: "Highest",
-    },
+    existing_bins: dict[str, pd.IntervalIndex] | None = None,
+    bin_labels: list[str] = None,
 ) -> tuple[DatasetDict, dict[str, np.ndarray]]:
     """
-    Post-processing a huggingface dataset dictionary to bin values by quantiles
-    computed over each attribute
+    Bins numerical values. If existing_bins is provided, uses those intervals 
+    instead of computing new ones (CRITICAL for fine-tuning consistency).
     """
+    if bin_labels is None:
+        bin_labels = ["Lowest", "Lower", "Low", "Middle", "High", "Higher", "Highest"]
+        
     # Group training and validation longitudinal sample values by attribute
     train_val_data = concatenate_datasets([dataset["train"], dataset["validation"]])
     values_by_attr = defaultdict(list)
     attribute_types = defaultdict(lambda: "numerical")
-    feature_types = {}
+    
+    # Only scan data if we need to compute bins (existing_bins is None)
+    # or if we need to know which attributes are categorical vs numerical for processing
     for sample in train_val_data:
-
-        # Fill-in groups by attribute type (either category or value)
         for entity, attribute, value in zip(sample["entity"], sample["attribute"], sample["value"]):
-            feature_types[attribute] = entity
             try:
-                values_by_attr[attribute].append(float(value))
-            except ValueError:  # i.e., if str value is not a number
-                values_by_attr[attribute].append(value)
+                if existing_bins is None: 
+                    values_by_attr[attribute].append(float(value))
+            except ValueError:
                 attribute_types[attribute] = "categorical"
 
-    # Compute bin intervals for continuous data
+    # Compute or Assign Bin Intervals
     bin_intervals: dict[str, pd.IntervalIndex] = {}
-    for attribute, values in values_by_attr.items():
-        if attribute_types[attribute] == "numerical" and len(set(values)) > 10:
-            try:
-                binned = pd.qcut(x=values,  q=len(bin_labels))
-            except ValueError:  # required for very skewed data, like with many 0.0
-                binned = pd.cut(x=values, bins=len(bin_labels))
-            bin_intervals[attribute] = binned.categories
-        else:  # correcting the type of numerical values with low numerosity
-            attribute_types[attribute] = "categorical"
+    
+    if existing_bins is not None:
+        # Fine-tuning path: Use the intervals from pre-training
+        bin_intervals = existing_bins
+        # We assume attributes in existing_bins are numerical
+        for attr in existing_bins:
+            attribute_types[attr] = "numerical"
+    else:
+        # Pre-training path: Compute new intervals
+        for attribute, values in values_by_attr.items():
+            if attribute_types[attribute] == "numerical" and len(set(values)) > 10:
+                try:
+                    binned = pd.qcut(x=values, q=len(bin_labels))
+                except ValueError:
+                    binned = pd.cut(x=values, bins=len(bin_labels))
+                bin_intervals[attribute] = binned.categories
+            else:
+                attribute_types[attribute] = "categorical"
 
-    # Define numerical value binning, given bin intervals
+    # Define numerical value binning function
     def bin_sample_values(values: list, attributes: list) -> dict[str, list]:
         values_binned = []
-        sorted_labels = [bin_labels[i] for i in sorted(bin_labels.keys())]
+        # Ensure bin_labels map to indices correctly
+        labels_map = {i: label for i, label in enumerate(bin_labels)}
+        
         for val, attr in zip(values, attributes):
             processed_val = str(val)
 
-            # Numerical attribute (known from training + validation sets)
+            # Numerical attribute with known bins
             if attr in bin_intervals:
-                try:  # normal path: value is within known intervals
+                try:
                     f_val = float(val)
-                    bin_idx = bin_intervals[attr].get_loc(f_val)
-                    processed_val = sorted_labels[bin_idx]
-                except KeyError:  # outlier path: value outside training range
-                    is_high = f_val > bin_intervals[attr].right.max()
-                    processed_val = sorted_labels[-1] if is_high else sorted_labels[0]
-                except ValueError:  # error path: keep raw string
-                    pass
+                    # Check intervals
+                    idx = bin_intervals[attr].get_loc(f_val)
+                    processed_val = labels_map[idx]
+                except KeyError:
+                    # Outlier handling (outside training range)
+                    if f_val > bin_intervals[attr].right.max():
+                        processed_val = labels_map[len(bin_labels)-1] # Highest
+                    else:
+                        processed_val = labels_map[0] # Lowest
+                except ValueError:
+                    pass  # keep original string if conversion fails
 
-            # Categorical or unknown attribute (e.g., new in test set)
+            # Categorical or unknown attribute
             else:
-                try:  # clean up integer-floats (e.g., "1.0" -> "1")
+                try:
                     processed_val = str(int(float(val)))
-                except ValueError:  # keep original string if not a number
+                except ValueError:
                     pass
-
+            
             values_binned.append(processed_val)
 
         return {"value_binned": values_binned}
 
-    # Apply the binning to all dataset samples (including test set)
-    bin_fn = lambda s: bin_sample_values(s["value"], s["attribute"])
+    # Apply the binning
     binned_dataset = dataset.map(
-        function=bin_fn,
-        desc="Binning values",
-        load_from_cache_file=False,
+        function=lambda s: bin_sample_values(s["value"], s["attribute"]),
+        desc="Binning values", load_from_cache_file=False,
     )
 
     return binned_dataset, bin_intervals

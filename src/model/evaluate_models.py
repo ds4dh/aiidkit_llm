@@ -17,6 +17,7 @@ from contextlib import redirect_stdout
 import plotly.graph_objects as go
 from plotly.colors import qualitative
 from scipy.special import softmax
+from sklearn.calibration import calibration_curve
 from sklearn.metrics import (
     silhouette_score, adjusted_mutual_info_score,
     roc_auc_score, average_precision_score, precision_recall_curve,
@@ -335,7 +336,7 @@ class DiscriminativeEmbeddingEvaluatorForMaskedLanguageModelling:
         mask = labels_flat != -100  # filtering out ignored tokens
         metrics["mlm_accuracy"] = accuracy_score(labels_flat[mask], preds_flat[mask])
         
-        # Compute clustering metrics using your custom module
+        # Compute clustering metrics using custom clustering module
         if self.do_clustering and embeddings is not None:
             cluster_metrics, cluster_fig = self.clusterer_module.perform_analysis(
                 embeddings, 
@@ -379,16 +380,10 @@ class BaseEmbeddingEvaluatorForClassification:
         """
         Main entry point called by the Trainer
         """
-        # Standardize Input using the subclass implementation
+        # Retrieve model outputs and compute probabilities
         logits, labels, embeddings = self.prepare_predictions(eval_preds)
-
-        # Compute Probabilities
         probs = softmax(logits, axis=-1)
-        if logits.shape[1] == 2:
-            probs_pos = probs[:, self.pos_label]
-        else:
-            # Fallback for multiclass: take max prob
-            probs_pos = probs.max(axis=1)
+        probs_pos = probs[:, self.pos_label] if logits.shape[1] == 2 else probs.max(axis=1)
 
         # Probability-based metrics
         metrics = {}
@@ -402,64 +397,60 @@ class BaseEmbeddingEvaluatorForClassification:
             metrics["pr_auc"] = -1.0
 
         # Threshold-based metrics
-        preds_optimal = self._get_preds_from_best_threshold(labels, probs_pos)
+        t = "best_f1"  # for optimal-f1 threshold, use "best_f1", else use float between 0.0 and 1.0
+        threshold, preds = self._get_preds_from_threshold(labels, probs_pos, t)
         avg_method = "binary" if logits.shape[1] == 2 else "macro"
-        metrics["acc"] = accuracy_score(labels, preds_optimal)
-        metrics["bal_acc"] = balanced_accuracy_score(labels, preds_optimal)
-        metrics["precision"] = precision_score(labels, preds_optimal, average=avg_method, zero_division=0)
-        metrics["recall"] = recall_score(labels, preds_optimal, average=avg_method, zero_division=0)
-        metrics["f1"] = f1_score(labels, preds_optimal, average=avg_method, zero_division=0)
-
-        # WandB Logging
+        if isinstance(t, float): t = int(t * 100)
+        metrics[f"acc_t{t}"] = accuracy_score(labels, preds)
+        metrics[f"bal_acc_t{t}"] = balanced_accuracy_score(labels, preds)
+        metrics[f"precision_t{t}"] = precision_score(labels, preds, average=avg_method, zero_division=0)
+        metrics[f"recall_t{t}"] = recall_score(labels, preds, average=avg_method, zero_division=0)
+        metrics[f"f1_t{t}"] = f1_score(labels, preds, average=avg_method, zero_division=0)
+        metrics[f"net_benefit_t{t}"] = self._calculate_net_benefit(labels, probs_pos, threshold=threshold)
+        
+        # WandB logging
         if wandb.run is not None:
-            self._log_plots(labels, probs, preds_optimal, prefix="eval_plots")
+            self._log_plots(labels, probs, preds, probs_pos, prefix="eval_plots")
 
-        # Clustering Analysis
-        if self.do_clustering and embeddings is not None:
-            cluster_metrics, cluster_fig = self.clusterer_module.perform_analysis(
-                embeddings, 
-                max_samples=self.max_clustered_samples
-            )
-            metrics.update(cluster_metrics)
-            if cluster_fig is not None and wandb.run is not None:
-                wandb.log({"eval_plots/clusters": cluster_fig}, commit=False)
+        # # Clustering analysis  # for now, skipping
+        # if self.do_clustering and embeddings is not None:
+        #     cluster_metrics, cluster_fig = self.clusterer_module.perform_analysis(
+        #         embeddings, 
+        #         max_samples=self.max_clustered_samples
+        #     )
+        #     metrics.update(cluster_metrics)
+        #     if cluster_fig is not None and wandb.run is not None:
+        #         wandb.log({"eval_plots/clusters": cluster_fig}, commit=False)
 
         return metrics
 
-    def _log_plots(self, labels, probs, preds, prefix="eval_plots"):
-        try:
-            # Confusion Matrix
-            cm = wandb.plot.confusion_matrix(probs=None, y_true=labels, preds=preds)
-            wandb.log({f"{prefix}/conf_mat": cm}, commit=False)
-
-            # Binary specific curves
-            if probs.shape[1] == 2:
-                wandb.log({f"{prefix}/pr_curve": wandb.plot.pr_curve(labels, probs)}, commit=False)
-                wandb.log({f"{prefix}/roc_curve": wandb.plot.roc_curve(labels, probs)}, commit=False)
-        except Exception as e:
-            print(f"WandB logging error: {e}")
-
     @staticmethod
-    def _get_preds_from_best_threshold(y_true, y_score):
+    def _get_preds_from_threshold(
+        y_true: np.ndarray,
+        y_score: np.ndarray,
+        threshold: float | str = "best_f1",
+    ) -> tuple[float, np.ndarray]:
         """
-        Infer predictions using F1-score to determine the optimal threshold
+        Infer predictions with a given threshold or computing the f1-optimal threshold
         """
         if len(np.unique(y_true)) < 2:
-            return np.round(y_score)
+            return threshold if isinstance(threshold, float) else 0.5, np.round(y_score)
 
-        precisions, recalls, thresholds = precision_recall_curve(y_true, y_score)
-        denominator = precisions + recalls
-        denominator[denominator == 0] = 1e-9 
-        f1_scores = (2 * precisions * recalls) / denominator
-        f1_scores = f1_scores[:-1]
+        if threshold == "best_f1":
+            precisions, recalls, thresholds = precision_recall_curve(y_true, y_score)
+            denominator = precisions + recalls
+            denominator[denominator == 0] = 1e-9 
+            f1_scores = (2 * precisions * recalls) / denominator
+            f1_scores = f1_scores[:-1]
 
-        if len(f1_scores) == 0:
-            return np.zeros_like(y_true)
+            if len(f1_scores) == 0:
+                return np.zeros_like(y_true)
 
-        best_threshold = thresholds[np.argmax(f1_scores)]
-
-        return (y_score >= best_threshold).astype(int)
-
+            threshold = thresholds[np.argmax(f1_scores)]
+        
+        preds = (y_score >= threshold).astype(int)
+        return threshold, preds
+    
     @staticmethod
     def _expected_calibration_error(y_true, y_probs, n_bins=10):
         n_classes = y_probs.shape[1]
@@ -481,6 +472,124 @@ class BaseEmbeddingEvaluatorForClassification:
                 conf_in_bin = np.mean(confidences[in_bin])
                 ece += np.abs(acc_in_bin - conf_in_bin) * n_in_bin
         return ece / len(y_true)
+    
+    @staticmethod
+    def _calculate_net_benefit(y_true, y_prob, threshold):
+        """
+        Calculates net benefit at a specific clinical decision threshold.
+        Formula: (TP/N) - (FP/N) * (t / (1-t)) 
+        """
+        if threshold >= 1.0 - 1e-9:  # avoid division by zero
+            return 0.0
+
+        preds = (y_prob >= threshold).astype(int)
+        tp = np.sum((preds == 1) & (y_true == 1))
+        fp = np.sum((preds == 1) & (y_true == 0))
+        n = len(y_true)
+        
+        # Weight represents the ratio of harm (false positive) to benefit (true positive)
+        weight = threshold / (1 - threshold)
+        nb = (tp / n) - (fp / n) * weight
+        
+        return nb
+    
+    def _log_plots(self, labels, probs, preds, probs_pos, prefix="eval_plots"):
+        try:
+            # Confusion Matrix
+            cm = wandb.plot.confusion_matrix(probs=None, y_true=labels, preds=preds)
+            wandb.log({f"{prefix}/conf_mat": cm}, commit=False)
+
+            # Only for binary classification
+            if probs.shape[1] == 2:
+                cal_fig = self._plot_calibration(labels, probs_pos)
+                dca_fig = self._plot_decision_curve(labels, probs_pos)
+                risk_fig = self._plot_risk_distribution(labels, probs_pos)
+                wandb.log({f"{prefix}/calibration_plot": cal_fig}, commit=False)
+                wandb.log({f"{prefix}/decision_curve": dca_fig}, commit=False) 
+                wandb.log({f"{prefix}/risk_distribution": risk_fig}, commit=False)
+                wandb.log({f"{prefix}/roc_curve": wandb.plot.roc_curve(labels, probs)}, commit=False)
+
+        except Exception as e:
+            print(f"WandB logging error: {e}")
+
+    def _plot_calibration(self, y_true, y_prob, n_bins=10):
+        """Plots observed vs expected probability."""
+        prob_true, prob_pred = calibration_curve(y_true, y_prob, n_bins=n_bins)
+        
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(  # diagonal ("ideal") line
+            x=[0, 1], y=[0, 1], mode='lines', name='Ideal',
+            line=dict(dash='dash', color='gray'),
+        ))
+        fig.add_trace(go.Scatter(  # model calibration
+            x=prob_pred, y=prob_true, mode='lines+markers', name='Model',
+        ))
+        fig.update_layout(
+            title="Calibration plot (reliability diagram)",
+            xaxis_title="Mean predicted probability",
+            yaxis_title="Fraction of positives",
+            width=600, height=600,
+            xaxis=dict(range=[0, 1]), yaxis=dict(range=[0, 1])
+        )
+        return fig
+
+    def _plot_decision_curve(self, y_true, y_prob):
+        """Decision curve analysis plotting model net benefit vs threshold."""
+        # Calculate model net benefit for each threshold using the helper
+        thresholds = np.linspace(0.01, 0.99, 100)
+        net_benefits = [self._calculate_net_benefit(y_true, y_prob, t) for t in thresholds]
+        
+        # Calculate "treat all" strategy (reference as only positive predictions)
+        n = len(y_true)
+        prevalence = np.sum(y_true) / n
+        net_benefit_all = prevalence - (1 - prevalence) * (thresholds / (1 - thresholds))
+        
+        # The "treat none" strategy is always 0
+        net_benefit_none = np.zeros_like(thresholds)
+
+        # Generate decision curve plot
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=thresholds, y=net_benefits,
+            mode='lines', name='Model',
+        ))
+        fig.add_trace(go.Scatter(
+            x=thresholds, y=net_benefit_all,
+            mode='lines', name='Treat All', line=dict(dash='dot', color='gray'),
+        ))
+        fig.add_trace(go.Scatter(
+            x=thresholds, y=net_benefit_none,
+            mode='lines', name='Treat None', line=dict(color='black'),
+        ))
+        fig.update_layout(
+            title="Decision curve analysis",
+            xaxis_title="Threshold probability",
+            yaxis_title="Net benefit",
+            width=600, height=600,
+            yaxis=dict(range=[-0.1, prevalence + 0.1]),
+        )
+        return fig
+
+    def _plot_risk_distribution(self, y_true, y_prob):
+        """Violin/box plot of predicted probabilities for events vs non-events."""
+        fig = go.Figure()
+        fig.add_trace(go.Violin(
+            x=y_true[y_true==0], y=y_prob[y_true==0],
+            name="Class 0 (no event)", side='positive', line_color='blue',
+        ))
+        fig.add_trace(go.Violin(
+            x=y_true[y_true==1], y=y_prob[y_true==1],
+            name="Class 1 (event)", side='negative', line_color='red',
+        ))
+        fig.update_layout(
+            title="Risk distribution by outcome",
+            yaxis_title="Predicted probability",
+            xaxis_title="Outcome",
+            width=600, height=600,
+            xaxis=dict(range=[-0.5, 1.5]),
+            yaxis=dict(range=[0.0, 1.0]),
+        )
+        return fig
 
 
 class DiscriminativeEmbeddingEvaluatorForClassification(BaseEmbeddingEvaluatorForClassification):

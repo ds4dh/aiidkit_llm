@@ -1,3 +1,31 @@
+# Run configuration and task (data collator) definition
+hf_data_dir: /home/users/b/borneta/aiidkit_mhmmdrz/processed_data
+result_dir: results  # base directory name for all results
+data_collator:
+  feature_keys:
+    - days_since_tpx
+    - entity_id
+    - attribute_id
+    - value_id
+  time_key: days_since_tpx
+  mlm_masking_rules:    # these numbers will set the result subdirectory name
+    entity_id: 0.10     # mlm task masks 'entity_id' with this probability
+    attribute_id: 0.20  # mlm task masks 'attribute_id' with this probability
+    value_id: 0.40      # mlm task masks 'value_id' with this probability
+  mlm_label_keys:
+    - entity_id         # mlm task must predict 'entity_id' labels
+    - attribute_id      # mlm task must predict 'attribute_id' labels
+    - value_id          # mlm task must predict 'value_id' labels
+
+# Configuration for finetuning tasks to run
+prediction_tasks:
+  infection_bacteria: {fups: [0, 30, 60, 90, 180, 365], horizons: [30, 60, 90]}
+  # infection_virus:    {fups: [0, 30, 60, 90, 180, 365], horizons: [30, 60, 90]}
+  # infection_fungi:    {fups: [0, 30, 60, 90, 180, 365], horizons: [30, 60, 90]}
+  # infection:          {fups: [0, 30, 60, 90, 180, 365], horizons: [30, 60, 90]}
+  graft_loss:         {fups: [0, 180, 365, 730, 1095],  horizons: [365, 730, 1095]}
+  death:              {fups: [0, 180, 365, 730, 1095],  horizons: [365, 730, 1095]}
+
 # Arguments for HF's trainer for the pre-training phase
 pretrainer:
   logging_steps: 10
@@ -12,16 +40,15 @@ pretrainer:
   gradient_accumulation_steps: 1
   per_device_train_batch_size: 32
   per_device_eval_batch_size: 32
-  learning_rate: 1.0e-4  # careful! "1e-4" will be read as a string
+  learning_rate: 1.0e-4  # careful! "1e-4" will be read as a string, use 1.0e-4
   weight_decay: 0.1
   bf16: true
   report_to: wandb
   remove_unused_columns: false  # crucial for custom collators
   load_best_model_at_end: true  # required for early stopping
-  metric_for_best_model: eval_mlm_accuracy # format: "eval_" + metric name
+  metric_for_best_model: eval_mlm_accuracy  # format: "eval_" + metric name
   greater_is_better: true
-  output_dir: results/pretraining
-  logging_dir: results/pretraining/logs
+  early_stopping_patience: 10  # evaluations without improvement before stopping
 
 # Arguments for HF's trainer for the fine-tuning phase
 finetuner:
@@ -37,7 +64,7 @@ finetuner:
   gradient_accumulation_steps: 1
   per_device_train_batch_size: 32
   per_device_eval_batch_size: 32
-  learning_rate: 1.0e-5
+  learning_rate: 5.0e-5
   weight_decay: 0.01
   bf16: true
   report_to: wandb
@@ -45,24 +72,23 @@ finetuner:
   load_best_model_at_end: true
   metric_for_best_model: eval_roc_auc  # eval_pr_auc
   greater_is_better: true
-  output_dir: results/finetuning
-  logging_dir: results/finetuning/logs
+  early_stopping_patience: 20  # evaluations without improvement before stopping
 
 # Embedding model
 model:
   model_id: answerdotai/ModernBERT-base
   load_backbone_weights: false
   config_args:
-    # vocab_size: 5036  # will be set at bulid time (depending on the data vocabulary)
+    # vocab_size: 1024  # will be set at bulid time (depending on the data vocabulary)
     max_position_embeddings: 512  # original value in ModernBERT-base: 8192
     output_hidden_states: true  # required for plotting embeddings
     classifier_pooling: mean  # to classify sequences during the fine-tuning phase
     pad_token_id: 0
-    bos_token_id: 2
+    bos_token_id: 2  # 1 being kept for mask_token_id
     cls_token_id: 2
     eos_token_id: 3
     sep_token_id: 3
-    # Comment what's below to get the default ModernBERT configuration
+    # Below should be commented to get the default ModernBERT configuration
     # num_hidden_layers: 4      #   4 //    8 //   12
     # num_attention_heads: 4    #   4 //    8 //   12
     # hidden_size: 128          # 128 //  256 //  512
@@ -72,23 +98,4 @@ model:
     attn_implementation: sdpa  # flash_attention_2 will create a shape mismatch in ModernBERT, with input_embeds as input
   embedding_layer_config:
     time_key: days_since_tpx
-    pretrained_model_name: NeuML/pubmedbert-base-embeddings
-
-# Data collator configuration
-data_collator:
-  pad_token_id: 0
-  mask_token_id: 1
-  bos_token_id: 2
-  eos_token_id: 3
-  unk_token_id: 4
-  return_tensors: pt
-  input_keys:
-    - entity_id
-    - attribute_id
-  time_key: days_since_tpx
-  mlm_masking_rules:
-    value_id: 0.5       # mask 'value_id' with 50% probability
-    entity_id: 0.5      # mask 'entity_id' with 50% probability
-  mlm_label_keys:
-    - value_id          # generate labels for 'value_id'
-    - entity_id         # generate labels for 'entity_id'
+    sentence_embedding_model: NeuML/pubmedbert-base-embeddings

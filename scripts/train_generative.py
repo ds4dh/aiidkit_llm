@@ -37,6 +37,7 @@ CLASSIFICATION_LABEL_KEYS = [
     # "infection_label_one_hot",
 ]
 
+TODO: UPDATE THIS SCRIPT LIKE THE NEW WAY OF TRAIN_CLASSIFICATION.PY
 
 def main():
     """

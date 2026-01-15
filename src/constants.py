@@ -7,17 +7,15 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class ConstantsNamespace():
 
-    # Data-related paths
+    # Raw data paths
     RAW_DATA_DIR = Path("/home/shares/ds4dh/aiidkit_project/data")
-    # RAW_DATA_DIR = Path("data/raw")
     EXCEL_DATA_PATH = RAW_DATA_DIR / "Datacut_FUP226_raw-01Jan2023_v1.xlsx"
     PICKLE_DATA_PATH = RAW_DATA_DIR / "Datacut_FUP226_raw-01Jan2023_v1.pkl"
-    PREPROCESSED_DIR_PATH = Path("data/preprocessed")
-    # HUGGINGFACE_DIR_PATH = Path("data/hf_data/full_patient_sequences")
-    # METADATA_DIR_PATH = Path("data/hf_metadata")
-    HUGGINGFACE_DIR_PATH = Path("../aiidkit_mhmmdrz/processed_data")
-    METADATA_DIR_PATH = Path("../aiidkit_mhmmdrz/processed_data/metadata")
-    EXPLORE_DIR_PATH = Path("data/explore")
+    
+    # Processed data paths
+    HOME_DIR = Path.home()  # user home directory
+    HUGGINGFACE_DIR_PATH = HOME_DIR / "aiidkit_mhmmdrz" / "processed_data"
+    METADATA_DIR_PATH = HOME_DIR / "aiidkit_mhmmdrz" / "processed_data" / "metadata"
 
     # Useful in discriminative or generative LLM training
     BASE_VOCAB = {
@@ -28,38 +26,10 @@ class ConstantsNamespace():
         "[UNK]": 4,
     }
 
-    # Infection task labels
-    INFECTION_TYPES = ["bacterial", "viral", "fungal"]
-    LABEL_CLASSES = ["healthy"] + INFECTION_TYPES
-    PREDICTION_HORIZONS = [30, 60, 90, 180, 365]  # in days
-    CUTOFF_DAYS = [0, 30, 60, 90, 180, 365]  # in days after first transplant event
-    # CUTOFF_DAYS = [0, 30, 60, 90, 180, 365, 1000, 3000, "full"]  # in days after first transplant event
-
-    # Sheet names
-    CONSENT_SHEET = "Consent"           # "#1_CONSENT" <- names change for the full data file
-    KIDNEY_BL_SHEET = "Kidney_BL"       # "#2_KIDNEY_BL"
-    KIDNEY_FUP_SHEET = "Kidney_FUP"     # "#3_KIDNEY_FUP"
-    PATIENT_BL_SHEET = "PAT_BL"         # "#4_PAT_BL"
-    PATIENT_PSQ_SHEET = "PAT_PSQ"       # "#5_PAT_PSQ"
-    PATIENT_INFECTION_SHEET = "PAT_ID"  # "#6_PAT_ID" <- renamed to avoid confusion with patient identifier (ID)
-    PATIENT_DRUG_SHEET = "PAT_Drug"     # "#7_PAT_DRUG"
-    PATIENT_STOP_SHEET = "PAT_Stop"     # "#8_PAT_STOP"
-    ORGAN_BASE_SHEET = "Organ_Base"     # "#9_ORGAN_BASE"
-
-    # Some key variables to build the data (used for drug df only for now)
-    START_TIME_IMPUTATION_STRATEGY = "aggressive"  # None, "normal", "aggressive", "remove"
-    STOP_TIME_IMPUTATION_STRATEGY = "remove"  # None, "normal", "aggressive", "remove" 
-    OTHER_DRUG_TYPE_MAPPING_STRATEGY = "coarse"  # None, "normal", "coarse"
-
-    # To use for removing missing or invalid values
-    VALID_DATE_RANGE = (pd.Timestamp("1900-01-01"), pd.Timestamp("2030-01-01"))
-    NAN_LIKE_DATES = (pd.NaT, pd.Timestamp("9999-01-01"), pd.Timestamp("2000-01-01"))
-    NAN_LIKE_NUMBERS = (np.nan, pd.NA, -555.0, -666.0, -777.0, -888.0, -999.0)
-    NAN_LIKE_CATEGORIES = (
-        "NaN", "nan", "Nan", pd.NA, np.nan, "NA in FUP", -999.0,  # "Unknown"
-        "Global consent refused", "Refused", "Not done", "Not applicable",
-    )
-
+    ##############################################################################
+    # DISCLAIMER: ALL VARIABLES BELOW THIS POINT ARE NOT USED WITH THE NEW DATASET
+    ##############################################################################
+    
     # Mapping for reference transplant center
     REFERENCE_CENTER_NORMALIZATION_MAP = {
         "USZ": "University Hospital Zurich",

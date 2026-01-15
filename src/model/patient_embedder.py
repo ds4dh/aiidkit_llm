@@ -43,7 +43,7 @@ class PatientEmbeddingModelFactory:
         # Load model configuration from huggingface's directory
         config = AutoConfig.from_pretrained(model_id, **config_args, **model_args)
 
-        # Initialize the Backbone (Pre-trained or Random)
+        # Initialize the backbone (pre-trained or random)
         model_cls = cls._get_model_class(task)
         if load_backbone_weights:
             print(f"Initializing {model_id} backbone with pre-trained weights.")
@@ -65,10 +65,11 @@ class PatientEmbeddingModelFactory:
     @classmethod
     def from_pretrained(
         cls,
-        pretrained_dir: str,
         task: str,
+        pretrained_dir: str,
         embedding_layer_config: dict,
         model_args: dict = {},
+        reset_weights: bool = False,
         **kwargs,
     ):
         """
@@ -90,7 +91,12 @@ class PatientEmbeddingModelFactory:
         # Patch model structure before loading weights
         model = cls._patch_model(model, custom_embed, embedding_layer_config)
 
-        # Load all weights (backbone and custom embedding layer)
+        # Return a randomly initialized model if requested
+        if reset_weights:
+            print("Resetting model weights to random initialization.")
+            return model
+
+        # Load pretrained weights (backbone and custom embedding layer)
         safe_path = os.path.join(pretrained_dir, "model.safetensors")
         if os.path.exists(safe_path):
             print(f"Loading patient model weights from {safe_path}...")
@@ -130,8 +136,8 @@ class PatientEmbeddingModelFactory:
         model.forward = types.MethodType(custom_forward, model)
 
         # Expose config attributes
-        model.use_pretrained_embeddings = custom_embed.use_pretrained_embeddings
-        model.pretrained_model_name = custom_embed.pretrained_model_name
+        model.use_direct_text_input = custom_embed.use_direct_text_input
+        model.sentence_embedding_model = custom_embed.sentence_embedding_model
         model.config.max_position_embeddings = config_dict.get("max_position_embeddings", 512)
 
         return model
@@ -144,8 +150,8 @@ class PatientEmbeddingLayer(nn.Module):
         embedding_dim: int,
         eav_keys: list[str]=["entity_id", "attribute_id", "value_id"],
         time_key: str="days_since_tpx",
-        use_pretrained_embeddings: bool=True,
-        pretrained_model_name: str="NeuML/pubmedbert-base-embeddings",
+        use_direct_text_input: bool=False,
+        sentence_embedding_model: str|None=None,
     ):
         """
         Layer to generate input embedddings given patient data sequences
@@ -153,27 +159,27 @@ class PatientEmbeddingLayer(nn.Module):
             vocab_size (int): size of the vocabulary for token embeddings
             embedding_dim (int): dimension of the generated embeddings
             time_key (str): key in forward `kwargs` that corresponds to the time feature
-            use_pretrained_embeddings (bool): whether to initialize embedding layers
+            use_direct_text_input (bool): whether to initialize embedding layers
                 with embeddings from a pretrained SentenceTransformer model.
-            pretrained_model_name (str): model used for `use_pretrained_embeddings`
+            sentence_embedding_model (str): model used for `use_direct_text_input`
         """
         super().__init__()
         self.embedding_dim = embedding_dim
         self.eav_keys = eav_keys
         self.time_key = time_key
-        self.use_pretrained_embeddings = use_pretrained_embeddings
-        self.pretrained_model_name = pretrained_model_name
+        self.use_direct_text_input = use_direct_text_input
+        self.sentence_embedding_model = sentence_embedding_model
 
         # Time embedding layer (always used)
         self.time_embedding = TimeEmbedding(embedding_dim)
 
         # Train from scratch (using medical code vocabulary and embedding layer)
-        if not use_pretrained_embeddings:
+        if not use_direct_text_input:
             self.token_embedding = nn.Embedding(vocab_size, embedding_dim)
 
         # Use a pretrained sentence transformer to embed textual event descriptions
         else:
-            self.sentence_model = SentenceTransformer(pretrained_model_name, device="cpu")
+            self.sentence_model = SentenceTransformer(sentence_embedding_model, device="cpu")
             self.sentence_model.eval()
             for param in self.sentence_model.parameters():
                 param.requires_grad = False
@@ -194,7 +200,7 @@ class PatientEmbeddingLayer(nn.Module):
 
         return f"Event for the patient's {entity}: the value of {attribute} was {value}"
 
-    def _get_pretrained_embeddings_with_sentence_model(
+    def _get_sentence_embedding_model(
         self,
         kwargs: dict[str, np.ndarray],
     ) -> torch.Tensor:
@@ -264,8 +270,8 @@ class PatientEmbeddingLayer(nn.Module):
         Forward pass for the patient embedding layer.
         """
         # Compute base embeddings
-        if self.use_pretrained_embeddings:
-            x = self._get_pretrained_embeddings_with_sentence_model(kwargs)
+        if self.use_direct_text_input:
+            x = self._get_sentence_embedding_model(kwargs)
         else:
             x = sum(self.token_embedding(kwargs[key]) for key in self.eav_keys)
 
@@ -280,7 +286,6 @@ class PatientEmbeddingLayer(nn.Module):
 class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
     """
     Data collator used for the PatientEmbedding-based language model
-    Modified from transformers.data.data_collator.py
     """
     # Special tokens
     pad_token_id: int | str = 0
@@ -288,48 +293,23 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
     bos_token_id: int | str = 2
     eos_token_id: int | str = 3
     unk_token_id: int | str = 4
-
+    
     # Configuration
-    input_keys: list[str] = field(default_factory=lambda: ["entity_id", "attribute_id"])
+    feature_keys: list[str] = field(default_factory=lambda: [
+        "days_since_tpx",
+        "entity_id",
+        "attribute_id",
+        "value_id",
+    ])
     time_key: str = "days_since_tpx"
     mlm_masking_rules: dict[str, float] = field(default_factory=lambda: {"value_id": 0.15})
     mlm_label_keys: list[str] = field(default_factory=lambda: ["value_id"])
-    use_pretrained_embeddings: bool = True
+    
+    # Flags
+    do_augmentation: bool = False  # updated for different dataset splits
     max_position_embeddings: int = 512
-    truncation_probability: float = 0.5
     return_tensors: str = "pt"
-
-    @classmethod
-    def from_kwargs(cls, **kwargs):
-        return cls(**{k: v for k, v in kwargs.items() if k in cls.__dataclass_fields__})
-
-    def __post_init__(self):
-        # Handle text (with pretrained embeddings) vs ID (without) mode
-        self.mask_source_to_label_source = {}
-        if self.use_pretrained_embeddings:
-            self.pad_token_id = "[PAD]"
-            self.mask_token_id = "[MASK]"
-            self.bos_token_id = "[BOS]"
-            self.eos_token_id = "[EOS]"
-            self.unk_token_id = "[UNK]"
-            
-            # Update input keys
-            self.input_keys = ["entity", "attribute"]
-            self.mask_source_to_label_source["value_binned"] = "value_id"
-            if "value_id" in self.mlm_masking_rules:
-                self.mlm_masking_rules["value_binned"] = self.mlm_masking_rules.pop("value_id")
-
-        
-        # Check that no label key is missing in the masking rules
-        else:
-            if not all(k in self.mlm_masking_rules for k in self.mlm_label_keys):
-                missing = [k for k in self.mlm_label_keys if k not in self.mlm_masking_rules]
-                raise KeyError(f"These mlm_label_keys are missing in mlm_masking_rules: {missing}")
-
-        # Determine all features that need processing (padding/truncating)
-        all_masking_keys = list(self.mlm_masking_rules.keys())
-        self.features_to_process = list(set(self.input_keys + [self.time_key] + all_masking_keys))
-
+    
     @staticmethod
     def _pad_sequences_numpy(
         sequences: list[np.ndarray],
@@ -376,7 +356,7 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
         """
         # Identify which keys are the non-features
         sample_keys = samples[0].keys()
-        non_processed_keys = [k for k in sample_keys if k not in self.features_to_process]
+        non_processed_keys = [k for k in sample_keys if k not in self.feature_keys]
         if not non_processed_keys or not samples: return samples, {}  # useful?
 
         # Extract the labels by popping them out of each sample
@@ -385,6 +365,67 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
         }
 
         return samples, external_labels
+
+    def _augment_shuffle_concurrent_events(
+        self, 
+        samples: list[dict[str, np.ndarray]]
+    ) -> list[dict[str, np.ndarray]]:
+        """
+        Data augmentation: shuffle events that share the same timestamp
+        """
+        if not self.do_augmentation: return samples
+        
+        for i, sample in enumerate(samples):
+            
+            # Find unique timestamps and their occurrence counts
+            times = sample[self.time_key]
+            unique_times, counts = np.unique(times, return_counts=True)
+            if len(unique_times) == len(times): continue
+
+            # Iterate over timestamps that appear more than once
+            indices = np.arange(len(times))
+            for t in unique_times[counts > 1]:
+                
+                # Extract indices for this time, shuffle them in-place, and re-assign
+                mask = times == t
+                subset = indices[mask]
+                np.random.shuffle(subset)
+                indices[mask] = subset
+
+            # Reorder all feature arrays in the sample using the shuffled indices
+            samples[i] = {k: v[indices] for k, v in sample.items()}
+
+        return samples
+
+    def _augment_jitter_time(self, samples: list[dict], noise_level: float=0.2) -> list[dict]:
+        """
+        Data augmentation: add small Gaussian noise to time entries
+        """
+        if not self.do_augmentation: return samples
+
+        for sample in samples:
+            time = np.array(sample[self.time_key], dtype=np.float32)
+            noise = np.random.normal(0, noise_level, size=time.shape)          
+            sample[self.time_key] = time + noise.astype(np.float32)
+            
+        return samples
+
+    def _augment_random_crop(
+        self, 
+        samples: list[dict[str, np.ndarray]]
+    ) -> list[dict[str, np.ndarray]]:
+        """
+        Data augmentation: randomly crop the sequence to a shorter length.
+        """
+        if not self.do_augmentation: return samples
+        
+        for i, sample in enumerate(samples):
+            seq_len = next(iter(sample.values())).shape[0]
+            if seq_len > 1 and random.random() < 0.5:  # only 50% of the time
+                truncated_len = random.randint(1, seq_len - 1)
+                samples[i] = {key: val[:truncated_len] for key, val in sample.items()}
+
+        return samples
 
     def _truncate_sequences(
         self,
@@ -396,14 +437,6 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
         effective_max_len = self.max_position_embeddings - 2  # for bos and eos tokens
         for i, sample in enumerate(samples):
             seq_len = next(iter(sample.values())).shape[0]
-
-            # Augment the data by taking partial sequences only
-            if self.truncation_probability is not None and self.truncation_probability > 0:
-                if random.random() < self.truncation_probability:
-                    truncated_len = random.randint(1, seq_len - 1)
-                    samples[i] = {key: val[:truncated_len] for key, val in sample.items()}
-
-            # Ensure the sequence does not go past the maximum model length
             if seq_len > effective_max_len:
                 start_idx = random.randint(0, seq_len - effective_max_len)
                 end_idx = start_idx + effective_max_len
@@ -447,7 +480,7 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
         """
         # Pad sequences into rectangular array
         padded_batch: dict[str, np.ndarray] = {}
-        for key in self.features_to_process:
+        for key in self.feature_keys:
             sequences = [s[key] for s in samples]
             if key == self.time_key or key in self.mlm_label_keys:
                 padding_value = 0
@@ -458,7 +491,7 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
             )
 
         # Compute attention mask, given the padding performed on the sequences
-        attention_mask = padded_batch[self.features_to_process[0]] != self.pad_token_id
+        attention_mask = padded_batch[self.feature_keys[0]] != self.pad_token_id
         attention_mask = attention_mask.astype(int)
 
         return padded_batch, attention_mask
@@ -470,6 +503,11 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
         """
         Pipeline to truncate, encapsulate, pad samples, and compute attention masks
         """
+        if self.do_augmentation:
+            samples = self._augment_shuffle_concurrent_events(samples)
+            samples = self._augment_jitter_time(samples)
+            # samples = self._augment_random_crop(samples)
+            
         samples = self._truncate_sequences(samples)
         samples = self._add_special_token_ids(samples)
         padded_batch, attention_mask = self._pad_batch(samples)
@@ -480,11 +518,13 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
         """
         Main entry point used by HuggingFace Trainer.
         """
+        self.do_augmentation = (samples[0]["split"] == "train")
         samples, non_features = self._separate_non_processed_features(samples)
         padded_batch, attention_mask = self._process_batch(samples)
         masked_input_dict, labels = self._masked_modelling(padded_batch)
         batch = {
-            "input_dict": self._check_types(masked_input_dict),
+            # "input_dict": self._check_types(masked_input_dict),
+            "input_dict": {k: torch.tensor(v) for k, v in masked_input_dict.items()},
             "attention_mask": torch.tensor(attention_mask),
             "labels": torch.tensor(labels).long(),
         }
@@ -492,27 +532,26 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
 
         return batch
 
-    def _check_types(
-        self,
-        input_dict: dict[str, np.ndarray],
-    ) -> dict[str, np.ndarray|torch.Tensor]:
-        """ Make sure the type of the batch elements is the correct one.
-            The reason for this is that strings can only be put to np.ndarray,
-            while other elements are better inside tensors
-        """
-        for key, value in input_dict.items():
-            if key == self.time_key or not self.use_pretrained_embeddings:
-                input_dict[key] = torch.tensor(value)
-
-        return input_dict
+    # def _check_types(
+    #     self,
+    #     input_dict: dict[str, np.ndarray],
+    # ) -> dict[str, np.ndarray|torch.Tensor]:
+    #     """ Make sure the type of the batch elements is the correct one.
+    #         The reason for this is that strings can only be put to np.ndarray,
+    #         while other elements are better inside tensors
+    #     """
+    #     for key, value in input_dict.items():
+    #         if key == self.time_key or not self.use_direct_text_input:
+    #             input_dict[key] = torch.tensor(value)
+    #     return input_dict
 
     def _masked_modelling(
         self,
         masked_input_dict: dict[str, np.ndarray],
     ) -> tuple[dict[str, np.ndarray], np.ndarray]:
         """
-        Generalized MLM with Mutually Exclusive Masking per token.
-        At any given position, MAX one feature is masked.
+        Generalized MLM with mutually exclusive masking per token.
+        At any given position, maximum one feature is masked.
         """
         # Initialization
         any_key = next(iter(self.mlm_masking_rules.keys()))
@@ -521,6 +560,7 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
         global_mask_map = torch.zeros(batch_shape, dtype=torch.bool)  # who is masked
         features_to_process = list(self.mlm_masking_rules.keys())
         random.shuffle(features_to_process)  # shuffle which feature gets priority
+        # ground_truth_dict = {k: v.copy() for k, v in masked_input_dict.items()}
 
         # Process each feature one by one
         for feature_key in features_to_process:
@@ -543,13 +583,12 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
             global_mask_map = global_mask_map | final_mask
             if not final_mask.any():
                 continue
-
+            
             # Update labels if part of label keys (using standard MLM labeling)
-            label_source = self.mask_source_to_label_source.get(feature_key, feature_key)
-            if label_source in self.mlm_label_keys:
-                target_values = masked_input_dict[label_source]
+            if feature_key in self.mlm_label_keys:
+                target_values = masked_input_dict[feature_key]
                 final_labels[final_mask] = target_values[final_mask]
-
+                
             # Replace 80% of selected masked token locations using [MASK]
             indices_replaced = torch.bernoulli(torch.full(final_labels.shape, 0.8)).bool() & final_mask
             input_tokens[indices_replaced] = self.mask_token_id
@@ -587,12 +626,14 @@ class PatientDataCollatorForClassification(PatientDataCollatorForMaskedLanguageM
         labels = [s.pop(self.label_key) for s in samples]
 
         # Preprocess the input samples
+        self.do_augmentation = (samples[0]["split"] == "train")
         samples, non_features = self._separate_non_processed_features(samples)
         padded_batch, attention_mask = self._process_batch(samples)
 
         # Assemble batch
         batch = {
-            "input_dict": self._check_types(padded_batch),
+            # "input_dict": self._check_types(padded_batch),
+            "input_dict": {k: torch.tensor(v) for k, v in padded_batch.items()},
             "attention_mask": torch.tensor(attention_mask),
             "labels": torch.tensor(labels).long(),  # classification loss expects long tensors
         }
