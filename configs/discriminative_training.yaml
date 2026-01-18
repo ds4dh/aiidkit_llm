@@ -17,6 +17,18 @@ data_collator:
     - attribute_id      # mlm task must predict 'attribute_id' labels
     - value_id          # mlm task must predict 'value_id' labels
 
+# 0.00 0.00 0.15
+# 0.00 0.00 0.45
+# 0.00 0.00 0.75
+# 0.00 0.05 0.15
+# 0.00 0.15 0.45
+# 0.00 0.25 0.75
+# 0.05 0.15 0.25
+# 0.15 0.25 0.45
+# 0.05 0.05 0.05
+# 0.15 0.15 0.15
+# 0.25 0.25 0.25
+
 # Configuration for finetuning tasks to run
 prediction_tasks:
   infection_bacteria: {fups: [0, 30, 60, 90, 180, 365], horizons: [30, 60, 90]}
@@ -55,7 +67,7 @@ finetuner:
   logging_steps: 10
   warmup_steps: 1000
   num_train_epochs: 10  # maximum number of epochs (loses to max_steps)
-  max_steps: 10000  # maximum number of steps (training + validation)
+  max_steps: 100000  # maximum number of steps (training + validation)
   eval_strategy: steps
   save_strategy: steps
   eval_steps: 100
@@ -64,13 +76,13 @@ finetuner:
   gradient_accumulation_steps: 1
   per_device_train_batch_size: 32
   per_device_eval_batch_size: 32
-  learning_rate: 5.0e-5
+  learning_rate: 3.0e-5
   weight_decay: 0.01
   bf16: true
   report_to: wandb
   remove_unused_columns: false  # crucial for custom collators
   load_best_model_at_end: true
-  metric_for_best_model: eval_roc_auc  # eval_pr_auc
+  metric_for_best_model: eval_all_roc_auc  # eval_all_pr_auc
   greater_is_better: true
   early_stopping_patience: 20  # evaluations without improvement before stopping
 

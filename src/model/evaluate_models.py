@@ -397,7 +397,7 @@ class BaseEmbeddingEvaluatorForClassification:
             metrics["pr_auc"] = -1.0
 
         # Threshold-based metrics
-        t = "best_f1"  # for optimal-f1 threshold, use "best_f1", else use float between 0.0 and 1.0
+        t = 0.1  # for optimal-f1 threshold, use "best_f1", else use float between 0.0 and 1.0
         threshold, preds = self._get_preds_from_threshold(labels, probs_pos, t)
         avg_method = "binary" if logits.shape[1] == 2 else "macro"
         if isinstance(t, float): t = int(t * 100)

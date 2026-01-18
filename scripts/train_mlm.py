@@ -26,10 +26,8 @@ def main():
     # and associated entity-attribute-value vocabulary (required for encoding)
     dataset, _, vocab = load_hf_data_and_metadata(
         data_dir=Path(CLI_CFG["hf_data_dir"]),
-        fup_train=None,        # look for folder 'fup_None'
-        fup_valid=None,        # look for folder 'fup_None'
-        overwrite_cache=True,  # delete existing caches for this key
-        metadata_cache_key=None,
+        fup_train=None,  # look for folder 'fup_None'
+        fup_valid=None,  # look for folder 'fup_None'
     )
     dataset = {k: v.map(lambda x: {"split": k}) for k, v in dataset.items()}
 
@@ -61,9 +59,9 @@ def main():
     use_wandb = CLI_CFG.get("pretrainer", {}).get("report_to") == "wandb"
     if use_wandb:
         workspace = Path(__file__).stem
-        wandb.init(project=workspace, name=run_id, config=CLI_CFG, reinit=True)
+        wandb.init(project=workspace, name=run_id, config=CLI_CFG)
 
-    # Trainer (standard HF)
+    # Trainer (standard HuggingFace)
     trainer = Trainer(
         model=model,
         args=pt_args,

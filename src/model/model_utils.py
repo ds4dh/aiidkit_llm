@@ -122,6 +122,7 @@ class FocalLoss(nn.Module):
         gamma: float = 2.0,
         alpha: float | list | torch.Tensor = None,
         reduction: str = "mean",
+        *args, **kwargs,
     ):
         super().__init__()
         self.gamma = gamma
@@ -161,7 +162,12 @@ class WeightedCELoss(nn.Module):
     Args:
         class_weights (list | Tensor): Weights for each class (e.g., [1.0, 10.0])
     """
-    def __init__(self, class_weights: list | torch.Tensor = None, reduction: str = "mean"):
+    def __init__(
+        self,
+        class_weights: list | torch.Tensor = None,
+        reduction: str = "mean",
+        *args, **kwargs,
+    ):
         super().__init__()
         if class_weights is not None:
             if isinstance(class_weights, list):
@@ -182,7 +188,13 @@ class DiceLoss(nn.Module):
     Dice Loss for checking overlap. Excellent for strong imbalance.
     Calculates 1 - DiceCoefficient.
     """
-    def __init__(self, smooth: float = 1e-6, square_denominator: bool = False, reduction: str = "mean"):
+    def __init__(
+        self,
+        smooth: float = 1e-6,
+        square_denominator: bool = False,
+        reduction: str = "mean",
+        *args, **kwargs,
+    ):
         super().__init__()
         self.smooth = smooth
         self.square_denominator = square_denominator
@@ -222,42 +234,60 @@ class DiceLoss(nn.Module):
         return loss
 
 
-class Poly1Loss(nn.Module):
+class Poly1FocalLoss(nn.Module):
     """
-    Poly-1 Loss: A polynomial expansion of Cross Entropy.
-    L = CE + epsilon * (1 - pt)
-    Provides a heavier tail than Focal Loss, often more stable.
+    Combines standard Focal Loss with a polynomial term to prevent gradient 
+    vanishing when the model is confident (fixes the "flatline" issue).
+    Formula: Loss = FL(pt) + epsilon * (1 - pt)
     """
-    def __init__(self, epsilon: float = 1.0, class_weights: list | torch.Tensor = None, reduction: str = "mean"):
+    def __init__(
+        self,
+        num_classes: int = 2,
+        epsilon: float = 1.0,
+        gamma: float = 2.0,
+        alpha: float | list | torch.Tensor = None,
+        reduction: str = "mean",
+        *args, **kwargs,
+    ):
         super().__init__()
+        self.num_classes = num_classes
         self.epsilon = epsilon
+        self.gamma = gamma
         self.reduction = reduction
-        
-        if class_weights is not None:
-            if isinstance(class_weights, list):
-                class_weights = torch.tensor(class_weights)
-            self.register_buffer("weight", class_weights)
+
+        # Prepare alpha (class weights)
+        if isinstance(alpha, float):
+            self.register_buffer("alpha", torch.tensor([1 - alpha, alpha]))
+        elif isinstance(alpha, list):
+            self.register_buffer("alpha", torch.tensor(alpha))
         else:
-            self.weight = None
+            self.register_buffer("alpha", alpha)
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        # Cross-entropy term
-        ce_loss = F.cross_entropy(inputs, targets, weight=self.weight, reduction="none")
-        
-        # Poly-1 term: epsilon * (1 - pt), pt being probability of the correct class
-        probs = F.softmax(inputs, dim=1)
-        pt = probs.gather(1, targets.view(-1, 1)).squeeze()
-        
-        poly_term = self.epsilon * (1 - pt)
-        
-        loss = ce_loss + poly_term
-        
+        # Compute Probabilities (pt)
+        ce_loss = F.cross_entropy(inputs, targets, reduction="none")
+        pt = torch.exp(-ce_loss)
+
+        # Compute loss
+        focal_term = (1 - pt) ** self.gamma
+        fl_loss = focal_term * ce_loss
+        poly1_loss = self.epsilon * (1 - pt)
+        loss = fl_loss + poly1_loss
+
+        # Apply Alpha (class Balancing)
+        if self.alpha is not None:
+            if self.alpha.device != targets.device:
+                self.alpha = self.alpha.to(targets.device)
+            alpha_t = self.alpha.gather(0, targets)
+            loss = alpha_t * loss
+
+        # Reduction
         if self.reduction == "mean":
             return loss.mean()
         elif self.reduction == "sum":
             return loss.sum()
         return loss
-
+    
 
 def make_loss_func(loss_name: str, loss_args: dict = None):
     """
@@ -273,12 +303,12 @@ def make_loss_func(loss_name: str, loss_args: dict = None):
     # Instantiate the correct Loss Module
     if loss_name.lower() == "focal":
         loss_fct = FocalLoss(**loss_args)
-    elif loss_name.lower() in ["weighted_ce", "weighted"]:
+    elif loss_name.lower() == "weighted_ce":
         loss_fct = WeightedCELoss(**loss_args)
     elif loss_name.lower() == "dice":
         loss_fct = DiceLoss(**loss_args)
     elif loss_name.lower() in ["poly1", "poly"]:
-        loss_fct = Poly1Loss(**loss_args)
+        loss_fct = Poly1FocalLoss(**loss_args)
     else:
         raise ValueError(f"Loss name '{loss_name}' not recognized.")
 

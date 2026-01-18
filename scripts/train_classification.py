@@ -29,52 +29,75 @@ def main():
     """
     Fine-tune models for the prediction tasks in the yaml file from the CLI config
     """
-    # Iterate over the specific tasks we want to run
     for task_key, task_specs in CLI_CFG["prediction_tasks"].items():
-        combinations = itertools.product(
-            [False],  # is_train_data_filtered (only False for now)
-            task_specs["horizons"],
-            task_specs["fups"],
-        )
         
-        # Fine-tune model for all combinations
-        for is_train_data_filtered, horizon, fup in combinations:
-            print(
-                f"Starting fine-tuning: Task={task_key} | "
-                f"Horizon={horizon} | FUP={fup} | "
-                f"Filtered={is_train_data_filtered}"
-            )
-            finetune_disciminative_model(
-                task_key=task_key,
-                horizon=horizon,
-                fup_valid=fup,
-                fup_train=fup if is_train_data_filtered else task_specs["fups"],
-            )
+        # Iterate over filtering options and horizons
+        settings = itertools.product(
+            [False],  # is_train_data_filtered -> [True, False] to run both
+            task_specs["horizons"],
+        )
+        for is_train_data_filtered, horizon in settings:
+            
+            # Define run configurations: list of tuples (train_fups_list, valid_fups_list)
+            valid_fups = task_specs["fups"]
+            if is_train_data_filtered:  # one run per follow-up period
+                run_configs = [([f], [f]) for f in valid_fups]
+            else:  # single run with all follow-up periods
+                data_dir = Path(CLI_CFG["hf_data_dir"])
+                train_fups = scan_all_fups(data_dir)  # all available
+                run_configs = [(train_fups, valid_fups)]
+
+            # Execute the runs
+            for train_fups, valid_fups in run_configs:
+                print(
+                    f"Starting fine-tuning: Task={task_key} | Horizon={horizon} | "
+                    f"Filtered={is_train_data_filtered} | "
+                    f"Train FUPs={train_fups} | Valid FUPs={valid_fups}"
+                )
+                finetune_disciminative_model(
+                    task_key=task_key,
+                    horizon=horizon,
+                    fup_train=train_fups,
+                    fup_valid=valid_fups,
+                    is_train_data_filtered=is_train_data_filtered,
+                )
 
 
 def finetune_disciminative_model(
     task_key: str,
     horizon: int,
-    fup_valid: list[int]|int,
-    fup_train: list[int]|int|None=None,
+    fup_valid: list[int],
+    fup_train: list[int],
+    is_train_data_filtered: bool,
 ):
     """
     Fine-tune one model on a specific infection prediction task
     """
-    # Load data for classification task
+    # Load data for classification task, using vocabulary from pretraining phase
+    label_key = f"label_{task_key}_{horizon:04d}d"
+    do_undersampling = (not is_train_data_filtered)
     dataset, _, vocab = load_hf_data_and_metadata(
         data_dir=Path(CLI_CFG["hf_data_dir"]),
         fup_train=fup_train,
         fup_valid=fup_valid,
-        overwrite_cache=False,
-        metadata_cache_key="processed_train-None_val-None",  # aligns with pretraining
+        label_key=label_key,  # used for undersampling
+        do_undersampling=do_undersampling,
     )
-    dataset = {k: v.map(lambda x: {"split": k}) for k, v in dataset.items()}
     
-    # Filter unknown (censored) labels (-100)
-    label_key = f"label_{task_key}_{horizon:04d}d"
-    for split in dataset.keys():
-        dataset[split] = dataset[split].filter(lambda x: x[label_key] != -100)
+    # Prepare training dataset
+    has_label = lambda x: x[label_key] != -100
+    train_dataset = dataset["train"].map(lambda x: {"split": "train"})
+    train_dataset = train_dataset.filter(has_label)
+    
+    # Prepare validation dataset dictionary
+    val_labeled = dataset["validation"].filter(has_label)
+    eval_datasets = {"all": val_labeled.map(lambda x: {"split": "val_all"})}
+    for fup in fup_valid:
+        subset = val_labeled.filter(lambda x: x["fup"] == fup)        
+        if len(subset) > 0:
+            eval_datasets[f"fup_{fup:04d}"] = subset.map(lambda x: {"split": f"val_{fup}"})
+        else:
+            print(f"Warning: No labeled samples found for follow-up {fup}.")
 
     # Auto-detect model sub-directory and best pre-trained model checkpoint
     mlm_masking_rules = CLI_CFG["data_collator"]["mlm_masking_rules"]
@@ -106,8 +129,10 @@ def finetune_disciminative_model(
 
     # Training arguments, with the correct output directory
     ft_cfg = CLI_CFG["finetuner"].copy()
-    fmt_fn = lambda x: "-".join(f"{i:04d}" for i in ([x] if isinstance(x, int) else x or []))
-    task_subdir = f"hrz({fmt_fn(horizon)})_fut({fmt_fn(fup_train)})_fuv({fmt_fn(fup_valid)})"
+    fmt_fn = lambda x: "-".join(f"{i:04d}" for i in sorted(([x] if isinstance(x, int) else x or [])))    
+    fut_str = "all" if not is_train_data_filtered else fmt_fn(fup_train)  # training: "fut(0090)" vs "fut(all)"
+    fuv_str = fmt_fn(fup_valid)  # validation: "fuv(0090)" vs "fuv(0000-0030...)"
+    task_subdir = f"hrz({horizon:04d})_fut({fut_str})_fuv({fuv_str})"
     run_subdir = str(Path(task_key) / task_subdir)
     ft_cfg["output_dir"] = str(Path(CLI_CFG["result_dir"]) / run_id / "finetuning" / run_subdir)
     ft_args = TrainingArguments(**ft_cfg)
@@ -117,20 +142,20 @@ def finetune_disciminative_model(
     if use_wandb:
         workspace = Path(__file__).stem
         run_name = f"{run_id}_{run_subdir}"
-        wandb.init(project=workspace, name=run_name, config=CLI_CFG, reinit=True)
+        wandb.init(project=workspace, name=run_name, config=CLI_CFG)
 
     # Setup loss function
-    loss_args = compute_loss_args(dataset, label_key)
-    focal_loss_func = make_loss_func("focal")  # weighted_ce, focal, dice, poly1
+    loss_args = compute_loss_args(train_dataset, label_key)
+    loss_func = make_loss_func('focal', loss_args)  # weighted_ce, focal, dice, poly1
 
-    # Trainer (standard HF)
+    # Trainer (standard HuggingFace)
     trainer = Trainer(
         model=model,
-        train_dataset=dataset["train"], 
-        eval_dataset=dataset["validation"],
+        train_dataset=train_dataset, 
+        eval_dataset=eval_datasets,  # dictionary with different follow-up periods
         args=ft_args,
         data_collator=ft_collator,
-        compute_loss_func=focal_loss_func,
+        compute_loss_func=loss_func,
         compute_metrics=evaluator,
         callbacks=callbacks,
     )
@@ -149,18 +174,32 @@ def compute_loss_args(dataset: DatasetDict, label_key: str) -> dict[str, Any]:
     """ 
     Compute class weights for loss function based on training data distribution
     """
-    train_labels = dataset["train"][label_key]
-    valid_labels = dataset["validation"][label_key]
-    train_tot, valid_tot = len(train_labels), len(valid_labels)
-    train_pos, valid_pos = sum(train_labels), sum(valid_labels)
-    train_neg, valid_neg = train_tot - train_pos, valid_tot - valid_pos
-    
-    print(f"Training samples: {train_tot} ({train_pos} +, {train_neg} -)")
-    print(f"Validation samples: {valid_tot} ({valid_pos} +, {valid_neg} -)")
-    
+    train_labels = dataset[label_key]
+    train_pos, train_tot = sum(train_labels), len(train_labels)
+    train_neg = train_tot - train_pos
+    print(f"Training samples: {train_tot} ({train_pos} +, {train_neg} -)")    
+    pos_weight = train_neg / (train_pos if train_pos > 0 else 1)    
     return {
-        "class_weights": [1.0, train_neg / (train_pos or 1)],
+        "alpha": None,  # [1.0, pos_weight],  # controls volume (imbalance)
+        "gamma": 2.0,  # controls focus on hard samples (standard = 2.0)
+        "epsilon": 1.0,  # controls gradient flow (anti-flatline; standard = 1.0)
     }
+
+
+def scan_all_fups(data_dir: Path) -> list[int]:
+    """
+    Find all available follow-up folders (fup_XXXX) in the data directory
+    """
+    fups = []
+    for path in data_dir.iterdir():
+        if path.is_dir() and path.name.startswith("fup_"):
+            try:
+                # Extract integer from "fup_0090" -> 90
+                val = int(path.name.split("_")[-1])
+                fups.append(val)
+            except ValueError:
+                continue # skip fup_None or malformed folders
+    return sorted(fups)
 
 
 if __name__ == "__main__":
