@@ -12,94 +12,109 @@ from collections import Counter
 # ============================================================================
 
 COLUMN_MAPPING_INVERSED = {
+    # Publications
     'publication_authors': 'Authors',
+    'publication_year': 'Publication year',
+    'publication_title': 'Publication title',
+    'publication_pmid': 'Publication PMID',
     'publication_doi': 'Publication DOI',
     'publication_journal': 'Publication journal',
-    'publication_pmid': 'Publication PMID',
-    'publication_title': 'Publication title',
-    'publication_year': 'Publication year',
+    
+    # Data
+    'data_source': 'Source of data (e.g., EHR, registry, clinical trial, bespoke cohort)',
+    'data_type': 'Data type (e.g., structured, unstructured text, imaging, time-series, genomics)',
     'data_available': 'Is data publicly available? (Yes, no, on request)',
-    'data_collection_dates': 'Data collection dates',
-    'data_consent_obtaiend': 'Consent',
-    'data_ethics_approval': 'Ethical approval',
-    'data_exclusion_criteria': 'Exclusion criteria',
+    'data_sites_region': 'Study sites (region)',
+    'data_sites_number': 'Study sites (number of centers)',
     'data_inclusion_criteria': 'Inclusion criteria',
-    'data_missing_handling': 'Handling of missing data (e.g., complete-case analysis)',
-    'data_n_missing': 'Number of participants with any missing value',
+    'data_exclusion_criteria': 'Exclusion criteria',
+    'data_ethics_approval': 'Ethical approval',
+    'data_consent_obtaiend': 'Consent',
+    'data_study_settings': 'Study settings (e.g., inpatient, outpatient, ICU)',
+    'data_recruitment_method': 'Recruitment method',
+    'data_recruitment_dates': 'Recruitment dates',
+    'data_collection_dates': 'Data collection dates',
+    'data_participant_characteristics': 'Key participant characteristics',
     'data_n_participants': 'Number of participants (total in study)',
     'data_n_events': 'Number of outcomes/events (total events in study)',
     'data_epv': 'Number of outcomes/events wrt the number of candidate predictors (EPV)',
-    'data_participant_characteristics': 'Key participant characteristics',
-    'data_recruitment_dates': 'Recruitment dates',
-    'data_recruitment_method': 'Recruitment method',
-    'data_sites_number': 'Study sites (number of centers)',
-    'data_sites_region': 'Study sites (region)',
-    'data_source': 'Source of data (e.g., EHR, registry, clinical trial, bespoke cohort)',
-    'data_splitting_ratios': 'Data splitting ratios',
+    'data_n_missing': 'Number of participants with any missing value',
+    'data_missing_handling': 'Handling of missing data (e.g., complete-case analysis)',
     'data_splitting_strategy': 'Data splitting strategy',
-    'data_study_settings': 'Study settings (e.g., inpatient, outpatient, ICU)',
-    'data_type': 'Data type (e.g., structured, unstructured text, imaging, time-series, genomics)',
+    'data_splitting_ratios': 'Data splitting ratios',
+    
+    # Outcome
+    'outcome_predicted': 'Outcome(s) predicted',
+    'outcome_definition': 'Definition of each possible outcome',
+    'outcome_assessment': 'How was outcome assessed (e.g., clinical diagnosis, microbiology, ICD codes)',
+    'outcome_prevalence': 'Prevalence of each outcome',
+    'outcome_def_same': 'Was the outcome definition the same for all participants? (yes, no)',
+    'outcome_type': 'Type of outcome (e.g., single, combined, survival, binary, multi-class)',
+    'outcome_blinded': 'Was the outcome assessed without knowledge of the candidate predictors? (yes, no)',
+    'outcome_timing': 'Timing of outcome measurement/occurence (e.g., follow-up duration, time to event)',
+    
+    # Predictors
+    'predictors_number': 'Number of (candidate) predictors assessed',
+    'predictors_type': 'Type of predictors',
+    'predictors_timing': 'Timing of predictor measurement',
+    'predictors_similar': 'Were predictors and measurements similar for all participants? (yes, no)',
     'predictors_blinded': 'Were predictors assessed blinded for outcome? (yes, no)',
-    'predictors_candidate_selection': 'Method for selection of candidate predictors',
     'predictors_continuous_handling': 'Handling of continuous predictors in the modelling',
+    'predictors_candidate_selection': 'Method for selection of candidate predictors',
+    'predictors_selection': 'Method for selection of predictors during multivariable modelling',
     'predictors_imbalance_handling': 'Handling of class imbalance (e.g., oversampling)',
     'predictors_in_outcome': 'Were candidate predictors part of the outcome? (yes, no)',
     'predictors_n_final': 'Number of predictors/features used in the final model',
-    'predictors_number': 'Number of (candidate) predictors assessed',
-    'predictors_selection': 'Method for selection of predictors during multivariable modelling',
-    'predictors_similar': 'Were predictors and measurements similar for all participants? (yes, no)',
-    'predictors_timing': 'Timing of predictor measurement',
-    'predictors_type': 'Type of predictors',
-    'outcome_assessment': 'How was outcome assessed (e.g., clinical diagnosis, microbiology, ICD codes)',
-    'outcome_blinded': 'Was the outcome assessed without knowledge of the candidate predictors? (yes, no)',
-    'outcome_def_same': 'Was the outcome definition the same for all participants? (yes, no)',
-    'outcome_definition': 'Definition of each possible outcome',
-    'outcome_predicted': 'Outcome(s) predicted',
-    'outcome_prevalence': 'Prevalence of each outcome',
-    'outcome_timing': 'Timing of outcome measurement/occurence (e.g., follow-up duration, time to event)',
-    'outcome_type': 'Type of outcome (e.g., single, combined, survival, binary, multi-class)',
-    'model_best_main': 'Main or best model',
-    'models_used': 'Model name (best or main first)',
+    
+    # Model
+    'models_used': 'Model name',
     'model_type': 'Model type',
-    'model_architecture_provided': 'Final model architecture/equation provided',
-    'model_baseline_used': 'Was a baseline model/method used',
-    'model_code_available': 'Is model code available? (yes, no, on request)',
-    'model_external_validation': 'External evaluation strategy',
-    'model_hyperparameter_tuning': 'Hyperparameter tuning method',
-    'model_internal_validation': 'Internal validation strategy',
-    'model_interpretability': 'Feature importance/interpretability method',
-    'model_n_parameters': 'Number of parameters in the final model',
     'model_software': 'Software/programming language/libraries used',
+    'model_hyperparameter_tuning': 'Hyperparameter tuning method',
+    'model_code_available': 'Is model code available? (yes, no, on request)',
+    'model_internal_validation': 'Internal validation strategy',
+    'model_external_validation': 'External evaluation strategy',
+    'model_best_main': 'Main or best model',
+    'model_architecture_provided': 'Final model architecture/equation provided',
+    'model_n_parameters': 'Number of parameters in the final model',
+    'model_baseline_used': 'Was a baseline model/method used',
+    'model_interpretability': 'Feature importance/interpretability method',
     'model_top_features': 'If above is not NI, top-N most important features',
-    'metrics_accuracy': 'Accuracy',
-    'metrics_auprc': 'AUPRC (PR) graph / value',
-    'metrics_auroc': 'AUROC graph / value',
-    'metrics_balanced_accuracy': 'Balanced accuracy',
+    
+    # Metrics
     'metrics_c_statistic': 'C-Statistic',
     'metrics_calibration': 'Calibration metrics',
     'metrics_clinical_utility': 'Clinical utility metrics',
-    'metrics_f1_score': 'F1-Score',
+    'metrics_auroc': 'AUROC graph / value',
+    'metrics_auprc': 'AUPRC (PR) graph / value',
     'metrics_log_rank': 'Log-rank test',
-    'metrics_npv': 'Negative predicted value - NPV',
-    'metrics_other': 'Other',
-    'metrics_precision': 'Precision (PPV)',
-    'metrics_recall': 'Recall (sensitivity)',
     'metrics_risk_curves': 'Risk group curves',
+    'metrics_accuracy': 'Accuracy',
+    'metrics_balanced_accuracy': 'Balanced accuracy',
     'metrics_specificity': 'Specificity',
-    'study_clinical_implications': 'Clinical implications and utility',
-    'study_evidence_strength': 'Strength of evidence for drivers',
-    'study_future_research': 'Future research directions',
-    'study_implementation_barriers': 'Potential barriers to implementation',
+    'metrics_recall': 'Recall (sensitivity)',
+    'metrics_precision': 'Precision (PPV)',
+    'metrics_npv': 'Negative predicted value - NPV',
+    'metrics_f1_score': 'F1-Score',
+    'metrics_other': 'Other',
+    
+    # Study results
     'study_key_findings': 'Key findings of the study',
-    'study_limitations': 'Study limitations',
+    'study_evidence_strength': 'Strength of evidence for drivers',
     'study_strengths': 'Study strengths',
-    'transplant_biomarkers': 'Any specific biomarkers or transplant-related predictors used',
-    'transplant_immunosuppression': 'Immunosuppression regimen details',
-    'transplant_infections_predicted': 'Specific infections predicted',
-    'transplant_opportunistic_infections': 'Consideration of opportunistic infections (yes/no)',
-    'transplant_post_time': 'Time post-transplant covered by prediction',
-    'transplant_risk_stratification': 'Patient stratification by risk (if applicable)',
+    'study_limitations': 'Study limitations',
+    'study_future_research': 'Future research directions',
+    'study_clinical_implications': 'Clinical implications and utility',
+    'study_implementation_barriers': 'Potential barriers to implementation',
+    
+    # Transplant-specific
     'transplant_type': 'Type of transplant',
+    'transplant_post_time': 'Time post-transplant covered by prediction',
+    'transplant_infections_predicted': 'Specific infections predicted',
+    'transplant_immunosuppression': 'Immunosuppression regimen details',
+    'transplant_biomarkers': 'Any specific biomarkers or transplant-related predictors used',
+    'transplant_opportunistic_infections': 'Consideration of opportunistic infections (yes/no)',
+    'transplant_risk_stratification': 'Patient stratification by risk (if applicable)',
 }
 
 # Create a normalization lookup dict ("publicationyear" -> "publication_year")
@@ -167,10 +182,10 @@ class ScopingReviewData:
         clean_df = pd.DataFrame(valid_rows)
         
         # Transpose (rows become Papers, columns become Features)
-        features_raw = clean_df.iloc[:, 1].values.astype(str)
-        data_values = clean_df.iloc[:, 2:].values
+        features_raw = clean_df.iloc[:, 0].values.astype(str)
+        data_values = clean_df.iloc[:, 1:].values
         if data_values.shape[1] > len(paper_ids):
-            data_values = data_values[:, :len(paper_ids)]            
+            data_values = data_values[:, :len(paper_ids)]         
         df_transposed = pd.DataFrame(data_values.T, columns=features_raw)
         df_transposed['PAPER_ID'] = paper_ids
         
@@ -184,7 +199,8 @@ class ScopingReviewData:
             else:
                 new_columns[col] = col.strip()
 
-        df_transposed.rename(columns=new_columns, inplace=True)        
+        df_transposed.rename(columns=new_columns, inplace=True)
+        
         return df_transposed
 
 

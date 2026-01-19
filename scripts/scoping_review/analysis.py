@@ -25,7 +25,8 @@ def main():
     """
     Main function to perform scoping review analysis and generate plots.
     """
-    INPUT_FILENAME = "data/CHARMS Simplified Checklist - True run - Simplified.xlsx"
+    # INPUT_FILENAME = "data/CHARMS Simplified Checklist - True run - Simplified.xlsx"
+    INPUT_FILENAME = "data/CHARMS Simplified Checklist - True run - Corrected - MA - Full.xlsx"
     OUTPUT_DIR = Path("scoping_review_results")
     
     # Setup with subdirectories for organization
