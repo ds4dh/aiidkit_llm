@@ -5,7 +5,7 @@ from typing import Any
 from pathlib import Path
 from filelock import FileLock
 from collections import defaultdict
-from datasets import DatasetDict, load_from_disk, concatenate_datasets
+from datasets import Dataset, DatasetDict, load_from_disk, concatenate_datasets
 import src.constants as constants
 csts = constants.ConstantsNamespace()
 
@@ -14,8 +14,15 @@ def load_hf_data_and_metadata(
     data_dir: str,
     fup_train: int | list[int] | None = None,
     fup_valid: int | list[int] | None = None,
+    fup_test: int | list[int] | None = None,
+    target_undersampling_ratio: float | None = None,
     label_key: str | None = None,
-    do_undersampling: bool = False,
+    time_mapping: dict[str, str]={"days_since_tpx": "time"},
+    eav_mappings: dict[str, str]={
+        "entity_id": "entity",
+        "attribute_id": "attribute",
+        "value_id": "value_binned",
+    },
 ) -> tuple[DatasetDict, dict[str, pd.IntervalIndex], dict[str, int]]:
     """
     Consumer/creator pattern
@@ -45,36 +52,36 @@ def load_hf_data_and_metadata(
     print(f"Loading raw data from disk...")
     dataset = DatasetDict({
         "train": _load_and_tag(
-            root_path, fup_train, "train",
-            label_key=label_key, do_undersampling=do_undersampling,
+            root_path, fup_train, "train", label_key=label_key,
+            target_undersampling_ratio=target_undersampling_ratio,
         ),
         "validation": _load_and_tag(root_path, fup_valid, "validation"),
+        "test": _load_and_tag(root_path, fup_test, "test"),
     })
     
     # Create bin intervals in pretraining mode, apply existing ones in finetuning mode
     dataset, bin_intervals = bin_values_by_attribute(dataset, existing_bins=bin_intervals)
     if vocab is None:  # in pretraining mode, compute new vocabulary
         base_vocab = {"[PAD]": 0, "[MASK]": 1, "[BOS]": 2, "[EOS]": 3, "[UNK]": 4}
-        vocab = get_vocab(dataset, base_vocab=base_vocab)
+        vocab = get_vocab(dataset, base_vocab=base_vocab, eav_keys=list(eav_mappings.values()))
     
     # Map tokens to IDs using vocabulary
     unk_id = vocab["[UNK]"]
     def map_to_ids(example):
         return {
-            "entity_id": [vocab.get(t, unk_id) for t in example["entity"]],
-            "attribute_id": [vocab.get(t, unk_id) for t in example["attribute"]],
-            "value_id": [vocab.get(t, unk_id) for t in example["value_binned"]],
+            eav_key: [vocab.get(token_id, unk_id) for token_id in example[eav_raw]]
+            for eav_key, eav_raw in eav_mappings.items()
         }
-    dataset = dataset.map(map_to_ids, desc="Mapping tokens to Unified IDs", num_proc=8)
+    dataset = dataset.map(map_to_ids, desc="Mapping tokens to IDs", num_proc=8)
 
     # Final formatting
-    dataset = dataset.map(lambda x: {"days_since_tpx": [0.0 if pd.isna(t) else t for t in x["time"]]})
+    time_key, time_key_raw = list(time_mapping.keys())[0], list(time_mapping.values())[0]
+    clean_time_fn = lambda x: {time_key: [0.0 if pd.isna(t) else t for t in x[time_key_raw]]}
+    dataset = dataset.map(clean_time_fn, desc="Cleaning time entries", num_proc=8)
     all_cols = dataset["train"].column_names
     label_cols = [c for c in all_cols if c.startswith("label_")]
-    cols_to_keep = [
-        "entity_id", "attribute_id", "value_id", "days_since_tpx",
-        "entity", "attribute", "value_binned", "patientid", "fup", *label_cols,
-    ]
+    teav_cols = list(eav_mappings.keys()) + [time_key] + list(eav_mappings.values())
+    cols_to_keep = [*teav_cols, *label_cols, "patientid", "fup"]
     available_cols = [c for c in cols_to_keep if c in dataset["train"].column_names]
     dataset.set_format(type="numpy", columns=available_cols)
 
@@ -98,7 +105,7 @@ def _load_and_tag(
     fup_input: int | list[int] | None,
     split: str,
     label_key: str | None = None,
-    do_undersampling: bool = False,
+    target_undersampling_ratio: float | None = None,
 ):
     """Loads specific follow-up folders, tags follow-up, concatenates."""
     fups = fup_input if isinstance(fup_input, list) else [fup_input]
@@ -109,7 +116,10 @@ def _load_and_tag(
         if not folder_path.exists():
             raise FileNotFoundError(f"Dataset not found: {folder_path}")
         ds = load_from_disk(str(folder_path))[split]
-        if do_undersampling: ds = undersample_dataset(ds, label_key)
+        
+        # Soft undersampling, usually only for training data
+        if target_undersampling_ratio is not None:
+            ds = undersample_dataset(ds, label_key, target_undersampling_ratio)
         
         # Tag samples with fup-integer (use -1 for None, even if not used anyways)
         fup_val = fup if fup is not None else -1
@@ -120,17 +130,22 @@ def _load_and_tag(
     return concatenate_datasets(datasets)
 
 
-def get_vocab(dataset: DatasetDict, base_vocab: dict) -> dict[str, int]:
-    """Computes vocabulary from current dataset."""
-    print("Computing new vocabulary...")
-    
+def get_vocab(
+    dataset: DatasetDict,
+    base_vocab: dict,
+    eav_keys: list[str] = ["entity", "attribute", "value_binned"],
+) -> dict[str, int]:
+    """
+    Computes entity-attribute-value vocabulary from current dataset
+    """
     # Combine train and validation for vocab building
+    print("Computing new vocabulary...")
     unique_tokens = set()
     for sample in concatenate_datasets([dataset["train"], dataset["validation"]]):
-        unique_tokens.update(sample["entity"])
-        unique_tokens.update(sample["attribute"])
-        unique_tokens.update(sample["value_binned"])
-
+        for key in eav_keys:
+            unique_tokens.update(sample[key])
+    
+    # Build vocabulary dictionary
     vocab = dict(base_vocab)
     start_idx = len(vocab)
     for idx, term in enumerate(sorted(list(unique_tokens))):
@@ -143,6 +158,8 @@ def bin_values_by_attribute(
     dataset: DatasetDict,
     existing_bins: dict[str, pd.IntervalIndex] | None = None,
     bin_labels: list[str] = None,
+    attribute_key: str = "attribute",
+    value_key: str = "value",
 ) -> tuple[DatasetDict, dict[str, np.ndarray]]:
     """
     Bins numerical values. If existing bins are provided, uses those intervals
@@ -159,24 +176,24 @@ def bin_values_by_attribute(
     # Only scan data if we need to compute bins (existing_bins is None)
     # or if we need to know which attributes are categorical vs numerical for processing
     for sample in train_val_data:
-        for entity, attribute, value in zip(sample["entity"], sample["attribute"], sample["value"]):
+        for attribute, value in zip(sample[attribute_key], sample[value_key]):
             try:
                 if existing_bins is None: 
                     values_by_attr[attribute].append(float(value))
             except ValueError:
                 attribute_types[attribute] = "categorical"
 
-    # Compute or Assign Bin Intervals
+    # Compute or assign bin intervals
     bin_intervals: dict[str, pd.IntervalIndex] = {}
     
+    # In fine-tuning mode, use the intervals from pre-training
     if existing_bins is not None:
-        # Fine-tuning path: Use the intervals from pre-training
         bin_intervals = existing_bins
-        # We assume attributes in existing_bins are numerical
-        for attr in existing_bins:
+        for attr in existing_bins:  # attributes in existing_bins must be numerical
             attribute_types[attr] = "numerical"
+    
+    # In pretraining mode, compute new intervals
     else:
-        # Pre-training path: Compute new intervals
         for attribute, values in values_by_attr.items():
             if attribute_types[attribute] == "numerical" and len(set(values)) > 10:
                 try:
@@ -198,19 +215,23 @@ def bin_values_by_attribute(
 
             # Numerical attribute with known bins
             if attr in bin_intervals:
+                
+                # Check intervals
                 try:
                     f_val = float(val)
-                    # Check intervals
                     idx = bin_intervals[attr].get_loc(f_val)
                     processed_val = labels_map[idx]
+                
+                # Outlier handling (outside training range)
                 except KeyError:
-                    # Outlier handling (outside training range)
                     if f_val > bin_intervals[attr].right.max():
                         processed_val = labels_map[len(bin_labels)-1] # Highest
                     else:
                         processed_val = labels_map[0] # Lowest
+                
+                # Keep original string if conversion fails
                 except ValueError:
-                    pass  # keep original string if conversion fails
+                    pass
 
             # Categorical or unknown attribute
             else:
@@ -225,42 +246,48 @@ def bin_values_by_attribute(
 
     # Apply the binning
     binned_dataset = dataset.map(
-        function=lambda s: bin_sample_values(s["value"], s["attribute"]),
-        desc="Binning values", load_from_cache_file=False,
+        function=lambda s: bin_sample_values(s[value_key], s[attribute_key]),
+        desc="Binning values", load_from_cache_file=False, num_proc=8,
     )
 
     return binned_dataset, bin_intervals
 
 
-def undersample_dataset(dataset, label_key, seed=1234):
+def undersample_dataset(
+    dataset: Dataset,
+    label_key: str,
+    target_ratio: float = 1.0,
+    seed: int = 1234,
+):
     """
-    Optimized undersampling using index selection instead of row filtering.
+    Undersamples majority class to match minority * target_ratio
     """
-    # Computes positive and negative samples
     labels = np.array(dataset[label_key])
     pos_indices = np.where(labels == 1)[0]
     neg_indices = np.where(labels == 0)[0]
-    n_pos, n_neg = len(pos_indices), len(neg_indices)
-    if n_pos == n_neg: return dataset  # no undersampling required
+    n_pos = len(pos_indices)
+    n_neg = len(neg_indices)
 
-    # Identify majority and minority indices
-    if n_pos > n_neg:
+    # Determine which is truly majority/minority
+    if n_pos > n_neg: 
         majority_indices = pos_indices
         minority_indices = neg_indices
-        n_min = n_neg
+        keep_n = int(len(neg_indices) * target_ratio)
     else:
         majority_indices = neg_indices
         minority_indices = pos_indices
-        n_min = n_pos
+        keep_n = int(len(pos_indices) * target_ratio)
 
-    # Undersample shuffled majority indices
+    # If majority is already smaller than target ratio, keep all
+    if len(majority_indices) <= keep_n:
+        return dataset
+
     rng = np.random.default_rng(seed)
-    selected_majority_indices = rng.choice(majority_indices, size=n_min, replace=False)
-    final_indices = np.concatenate([selected_majority_indices, minority_indices])
+    selected_majority = rng.choice(majority_indices, size=keep_n, replace=False)
+    final_indices = np.concatenate([selected_majority, minority_indices])
     rng.shuffle(final_indices)
     
     return dataset.select(final_indices)
-
 
 def format_eav_to_tree(df: pd.DataFrame) -> list[str]:
     """
@@ -289,8 +316,7 @@ def format_eav_to_tree(df: pd.DataFrame) -> list[str]:
 
 def format_eav_to_markdown(df: pd.DataFrame) -> list[str]:
     """
-    Format a dataframe group into a list of markdown strings.
-    Input dataframe should have columns: "entity", "attribute", "value"
+    Format a dataframe group into a list of markdown strings
     """
     if not all(col in df.columns for col in ["entity", "attribute", "value"]):
         raise ValueError("Dataframe must contain 'entity', 'attribute', and 'value' columns")

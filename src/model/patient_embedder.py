@@ -56,7 +56,7 @@ class PatientEmbeddingModelFactory:
 
         # Initialize Custom Layer (Always random at creation)
         custom_embed = PatientEmbeddingLayer(
-            embedding_dim=config.hidden_size, **embedding_layer_config
+            embedding_dim=config.hidden_size, **embedding_layer_config,
         )
 
         # Graft custom input patient embedding layer to the classic backbone
@@ -85,7 +85,7 @@ class PatientEmbeddingModelFactory:
 
         # Re-create the custom Layer
         custom_embed = PatientEmbeddingLayer(
-            embedding_dim=config.hidden_size, **embedding_layer_config
+            embedding_dim=config.hidden_size, **embedding_layer_config,
         )
 
         # Patch model structure before loading weights
@@ -148,10 +148,14 @@ class PatientEmbeddingLayer(nn.Module):
         self,
         vocab_size: int,
         embedding_dim: int,
-        eav_keys: list[str]=["entity_id", "attribute_id", "value_id"],
-        time_key: str="days_since_tpx",
-        use_direct_text_input: bool=False,
-        sentence_embedding_model: str|None=None,
+        eav_mappings: dict[str, str] = {
+            "entity_id": "entity",
+            "attribute_id": "attribute",
+            "value_id": "value_binned",
+        },
+        time_mapping: dict[str, str] = {"days_since_tpx": "time"},
+        use_direct_text_input: bool = False,
+        sentence_embedding_model: str | None = None,
     ):
         """
         Layer to generate input embedddings given patient data sequences
@@ -165,8 +169,8 @@ class PatientEmbeddingLayer(nn.Module):
         """
         super().__init__()
         self.embedding_dim = embedding_dim
-        self.eav_keys = eav_keys
-        self.time_key = time_key
+        self.time_key = list(time_mapping.keys())[0]
+        self.eav_keys = list(eav_mappings.keys())
         self.use_direct_text_input = use_direct_text_input
         self.sentence_embedding_model = sentence_embedding_model
 
@@ -295,13 +299,10 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
     unk_token_id: int | str = 4
     
     # Configuration
-    feature_keys: list[str] = field(default_factory=lambda: [
-        "days_since_tpx",
-        "entity_id",
-        "attribute_id",
-        "value_id",
-    ])
-    time_key: str = "days_since_tpx"
+    time_mapping: dict[str, str] = field(default_factory=lambda: {"days_since_tpx": "time"})
+    eav_mappings: dict[str, str] = field(default_factory=lambda: {
+        "entity_id": "entity", "attribute_id": "attribute", "value_id": "value_binned"
+    })
     mlm_masking_rules: dict[str, float] = field(default_factory=lambda: {"value_id": 0.15})
     mlm_label_keys: list[str] = field(default_factory=lambda: ["value_id"])
     
@@ -309,6 +310,12 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
     do_augmentation: bool = False  # updated for different dataset splits
     max_position_embeddings: int = 512
     return_tensors: str = "pt"
+    
+    def __post_init__(self):
+        """Anything that must be initialized dynamically"""
+        self.time_key = list(self.time_mapping.keys())[0]
+        self.eav_keys = list(self.eav_mappings.keys())
+        self.feature_keys = [self.time_key] + self.eav_keys
     
     @staticmethod
     def _pad_sequences_numpy(
@@ -523,7 +530,6 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
         padded_batch, attention_mask = self._process_batch(samples)
         masked_input_dict, labels = self._masked_modelling(padded_batch)
         batch = {
-            # "input_dict": self._check_types(masked_input_dict),
             "input_dict": {k: torch.tensor(v) for k, v in masked_input_dict.items()},
             "attention_mask": torch.tensor(attention_mask),
             "labels": torch.tensor(labels).long(),
@@ -531,19 +537,6 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
         batch.update(non_features)
 
         return batch
-
-    # def _check_types(
-    #     self,
-    #     input_dict: dict[str, np.ndarray],
-    # ) -> dict[str, np.ndarray|torch.Tensor]:
-    #     """ Make sure the type of the batch elements is the correct one.
-    #         The reason for this is that strings can only be put to np.ndarray,
-    #         while other elements are better inside tensors
-    #     """
-    #     for key, value in input_dict.items():
-    #         if key == self.time_key or not self.use_direct_text_input:
-    #             input_dict[key] = torch.tensor(value)
-    #     return input_dict
 
     def _masked_modelling(
         self,
@@ -632,7 +625,6 @@ class PatientDataCollatorForClassification(PatientDataCollatorForMaskedLanguageM
 
         # Assemble batch
         batch = {
-            # "input_dict": self._check_types(padded_batch),
             "input_dict": {k: torch.tensor(v) for k, v in padded_batch.items()},
             "attention_mask": torch.tensor(attention_mask),
             "labels": torch.tensor(labels).long(),  # classification loss expects long tensors

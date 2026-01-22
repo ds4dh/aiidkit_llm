@@ -37,7 +37,9 @@ dependencies = [
     "hdbscan",
     "lifelines",
     "wandb",
-    "weave",
+    "seaborn",
+    "openpyxl",
+    "kaleido",
 ]
 
 # Project links

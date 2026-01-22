@@ -1,5 +1,6 @@
 import argparse
 import yaml
+import json
 import sys
 import gc
 import torch
@@ -7,7 +8,7 @@ import wandb
 import itertools
 from typing import Any
 from pathlib import Path
-from datasets import DatasetDict
+from datasets import Dataset, DatasetDict
 from transformers import Trainer, TrainingArguments, EarlyStoppingCallback
 from transformers.trainer_utils import get_last_checkpoint
 from src.data.patient_dataset import load_hf_data_and_metadata
@@ -22,6 +23,7 @@ CLI_CFG: dict[str, dict] = {}
 parser = argparse.ArgumentParser(description="Fine-tune a model to predict future infections.")
 parser.add_argument("--config", "-c", type=str, default="configs/discriminative_training.yaml")
 parser.add_argument("--reset_weights", "-r", action="store_true", help="Whether to reset model weights before fine-tuning.")
+parser.add_argument("--debug", "-d", action="store_true", help="Disable wandb logging for debugging.")
 cli_args = parser.parse_args()
 
 
@@ -33,7 +35,7 @@ def main():
         
         # Iterate over filtering options and horizons
         settings = itertools.product(
-            [False],  # is_train_data_filtered -> [True, False] to run both
+            [False, True],  # is_train_data_filtered -> [True, False] to run both
             task_specs["horizons"],
         )
         for is_train_data_filtered, horizon in settings:
@@ -44,7 +46,8 @@ def main():
                 run_configs = [([f], [f]) for f in valid_fups]
             else:  # single run with all follow-up periods
                 data_dir = Path(CLI_CFG["hf_data_dir"])
-                train_fups = scan_all_fups(data_dir)  # all available
+                # train_fups = scan_all_fups(data_dir)  # all available
+                train_fups = valid_fups  # all of interest
                 run_configs = [(train_fups, valid_fups)]
 
             # Execute the runs
@@ -59,6 +62,7 @@ def main():
                     horizon=horizon,
                     fup_train=train_fups,
                     fup_valid=valid_fups,
+                    fup_test=valid_fups,  # same as validation
                     is_train_data_filtered=is_train_data_filtered,
                 )
 
@@ -68,36 +72,31 @@ def finetune_disciminative_model(
     horizon: int,
     fup_valid: list[int],
     fup_train: list[int],
+    fup_test: list[int],
     is_train_data_filtered: bool,
 ):
     """
     Fine-tune one model on a specific infection prediction task
     """
     # Load data for classification task, using vocabulary from pretraining phase
+    time_mapping = CLI_CFG["data_collator"]["time_mapping"]
+    eav_mappings = CLI_CFG["data_collator"]["eav_mappings"]
     label_key = f"label_{task_key}_{horizon:04d}d"
     do_undersampling = (not is_train_data_filtered)
     dataset, _, vocab = load_hf_data_and_metadata(
         data_dir=Path(CLI_CFG["hf_data_dir"]),
-        fup_train=fup_train,
-        fup_valid=fup_valid,
+        fup_train=fup_train, fup_valid=fup_valid, fup_test=fup_test,
         label_key=label_key,  # used for undersampling
-        do_undersampling=do_undersampling,
+        target_undersampling_ratio=10.0 if do_undersampling else None,
+        time_mapping=time_mapping,
+        eav_mappings=eav_mappings,
     )
     
     # Prepare training dataset
-    has_label = lambda x: x[label_key] != -100
-    train_dataset = dataset["train"].map(lambda x: {"split": "train"})
-    train_dataset = train_dataset.filter(has_label)
-    
-    # Prepare validation dataset dictionary
-    val_labeled = dataset["validation"].filter(has_label)
-    eval_datasets = {"all": val_labeled.map(lambda x: {"split": "val_all"})}
-    for fup in fup_valid:
-        subset = val_labeled.filter(lambda x: x["fup"] == fup)        
-        if len(subset) > 0:
-            eval_datasets[f"fup_{fup:04d}"] = subset.map(lambda x: {"split": f"val_{fup}"})
-        else:
-            print(f"Warning: No labeled samples found for follow-up {fup}.")
+    dataset = dataset.filter(lambda x: x[label_key] != -100)  # remove unlabelled samples
+    train_dataset = dataset["train"].map(lambda x: {"split": "train"}, desc="Tagging split", num_proc=8)
+    eval_datasets = prepare_dataset_fup_dict(dataset["validation"], "val", fup_valid)
+    test_datasets = prepare_dataset_fup_dict(dataset["test"], "test", fup_test)
 
     # Auto-detect model sub-directory and best pre-trained model checkpoint
     mlm_masking_rules = CLI_CFG["data_collator"]["mlm_masking_rules"]
@@ -125,7 +124,7 @@ def finetune_disciminative_model(
     # Evaluation pipelines
     patience = CLI_CFG["finetuner"].pop("early_stopping_patience", 20)
     callbacks = [EarlyStoppingCallback(early_stopping_patience=patience)]
-    evaluator = CustomEvaluator(do_clustering=True)
+    evaluator = CustomEvaluator(do_clustering=False)
 
     # Training arguments, with the correct output directory
     ft_cfg = CLI_CFG["finetuner"].copy()
@@ -135,10 +134,11 @@ def finetune_disciminative_model(
     task_subdir = f"hrz({horizon:04d})_fut({fut_str})_fuv({fuv_str})"
     run_subdir = str(Path(task_key) / task_subdir)
     ft_cfg["output_dir"] = str(Path(CLI_CFG["result_dir"]) / run_id / "finetuning" / run_subdir)
+    if cli_args.debug: ft_cfg["report_to"] = "none"
     ft_args = TrainingArguments(**ft_cfg)
 
     # Re-initialize a wandb run within the same worspace
-    use_wandb = CLI_CFG.get("finetuner", {}).get("report_to") == "wandb"
+    use_wandb = (not cli_args.debug) and (CLI_CFG.get("finetuner", {}).get("report_to") == "wandb")
     if use_wandb:
         workspace = Path(__file__).stem
         run_name = f"{run_id}_{run_subdir}"
@@ -149,7 +149,7 @@ def finetune_disciminative_model(
     loss_func = make_loss_func('focal', loss_args)  # weighted_ce, focal, dice, poly1
 
     # Trainer (standard HuggingFace)
-    trainer = Trainer(
+    trainer = PrefixAwareTrainer(
         model=model,
         train_dataset=train_dataset, 
         eval_dataset=eval_datasets,  # dictionary with different follow-up periods
@@ -162,6 +162,12 @@ def finetune_disciminative_model(
 
     # Fine-tune the model and reset wandb for the next run
     trainer.train()  # best model saved automatically
+    
+    # Test best model, using calibration from validation set
+    if "test" in dataset:
+        output_path = Path(ft_cfg["output_dir"]) / "test_results.json"
+        test_model(trainer, eval_datasets, test_datasets, output_path)
+        print(f"Final test results saved to {output_path}")
 
     # Reset wandb and clean up CUDA memory for the next run
     if use_wandb: wandb.finish()
@@ -169,6 +175,18 @@ def finetune_disciminative_model(
     gc.collect()  # ensure deleted objects are collected by the garbage collector
     torch.cuda.empty_cache()  # free deleted local objects from CUDA memory 
 
+
+class PrefixAwareTrainer(Trainer):
+    """
+    Inject the current prefix (e.g., "eval_fup_0030") into the evaluator, to
+    access it from the custom evaluator, which allows to have stratified plots
+    """
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        if hasattr(self.compute_metrics, "current_prefix"):
+            self.compute_metrics.current_prefix = metric_key_prefix
+            
+        return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
+    
 
 def compute_loss_args(dataset: DatasetDict, label_key: str) -> dict[str, Any]:
     """ 
@@ -186,6 +204,58 @@ def compute_loss_args(dataset: DatasetDict, label_key: str) -> dict[str, Any]:
     }
 
 
+def prepare_dataset_fup_dict(
+    dataset: Dataset,
+    prefix_name: str,
+    fup_list: list[int],
+):
+    """
+    Creates a dictionary of datasets for different follow-up periods
+    """
+    out_dict = {"all": dataset.map(
+        lambda x: {"split": f"{prefix_name}_all"}, desc="Tagging split", num_proc=8,
+    )}
+    for fup in fup_list:
+        subset = dataset.filter(lambda x: x["fup"] == fup)
+        if len(subset) > 0:
+            out_dict[f"fup_{fup:04d}"] = subset.map(
+                lambda x: {"split": f"{prefix_name}_{fup}"}, desc="Tagging split", num_proc=8,
+            )
+        else:
+            print(f"Warning: No labeled samples found for follow-up {fup} in {prefix_name}.")
+            
+    return out_dict
+
+
+def test_model(
+    trainer: Trainer,
+    eval_datasets: dict[str, Dataset],
+    test_datasets: dict[str, Dataset],
+    output_path: str,
+):
+    """
+    Aggregates evaluation on all subsplits of the test set and save to output file
+    """
+    final_metrics = {}
+
+    # Fit calibration on validation dataset
+    print("\nFitting calibration on validation set...")
+    val_metrics = trainer.evaluate(eval_datasets["all"], metric_key_prefix="val_all")
+    final_metrics.update(val_metrics)
+
+    # Evaluate on test sets
+    test_all = test_datasets.pop("all")
+    results_all = trainer.evaluate(test_all, metric_key_prefix="test_all")
+    final_metrics.update(results_all)
+    for fup_key, fup_test_dataset in test_datasets.items():
+        results = trainer.evaluate(fup_test_dataset, metric_key_prefix=f"test_{fup_key}")
+        final_metrics.update(results)
+
+    # Save to disk for later plotting
+    with open(output_path, "w") as f:
+        json.dump(final_metrics, f, indent=4)
+
+
 def scan_all_fups(data_dir: Path) -> list[int]:
     """
     Find all available follow-up folders (fup_XXXX) in the data directory
@@ -198,7 +268,7 @@ def scan_all_fups(data_dir: Path) -> list[int]:
                 val = int(path.name.split("_")[-1])
                 fups.append(val)
             except ValueError:
-                continue # skip fup_None or malformed folders
+                continue  # skip fup_None or malformed folders
     return sorted(fups)
 
 

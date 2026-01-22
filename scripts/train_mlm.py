@@ -16,6 +16,7 @@ from src.model.evaluate_models import (
 CLI_CFG: dict[str, dict] = {}
 parser = argparse.ArgumentParser(description="Train a UMLS normalization model.")
 parser.add_argument("--config", "-c", type=str, default="configs/discriminative_training.yaml")
+parser.add_argument("--debug", "-d", action="store_true", help="Disable wandb logging for debugging.")
 
 
 def main():
@@ -24,17 +25,26 @@ def main():
     """
     # Load whole patient dataset (all sequences) for masked language modelling
     # and associated entity-attribute-value vocabulary (required for encoding)
+    time_mapping = CLI_CFG["data_collator"]["time_mapping"]
+    eav_mappings = CLI_CFG["data_collator"]["eav_mappings"]
     dataset, _, vocab = load_hf_data_and_metadata(
         data_dir=Path(CLI_CFG["hf_data_dir"]),
         fup_train=None,  # look for folder 'fup_None'
         fup_valid=None,  # look for folder 'fup_None'
+        time_mapping=time_mapping,
+        eav_mappings=eav_mappings,
     )
-    dataset = {k: v.map(lambda x: {"split": k}) for k, v in dataset.items()}
+    dataset = {
+        k: v.map(lambda x: {"split": k}, desc="Tagging split", num_proc=8)
+        for k, v in dataset.items()
+    }
 
     # Initialize custom patient embedding model for masked language modelling
     CLI_CFG["model"]["task"] = "masked"
     CLI_CFG["model"]["config_args"]["vocab_size"] = len(vocab)
     CLI_CFG["model"]["embedding_layer_config"]["vocab_size"] = len(vocab)
+    CLI_CFG["model"]["embedding_layer_config"]["time_mapping"] = time_mapping
+    CLI_CFG["model"]["embedding_layer_config"]["eav_mappings"] = eav_mappings
     model = PatientEmbeddingModelFactory.create_from_backbone(**CLI_CFG["model"])
 
     # Use custom data collator for t-EAV formatted patient loading
@@ -51,12 +61,13 @@ def main():
     # Training arguments, with the correct output directory
     mlm_masking_rules = CLI_CFG["data_collator"]["mlm_masking_rules"]
     run_id = "-".join([f"{k[0]}{int(v * 100):02d}" for k, v in mlm_masking_rules.items()])
-    pt_config = CLI_CFG["pretrainer"].copy()
-    pt_config["output_dir"] = str(Path(CLI_CFG["result_dir"]) / run_id / "pretraining")
-    pt_args = TrainingArguments(**pt_config)
+    pt_cfg = CLI_CFG["pretrainer"].copy()
+    pt_cfg["output_dir"] = str(Path(CLI_CFG["result_dir"]) / run_id / "pretraining")
+    if cli_args.debug: pt_cfg["report_to"] = "none"
+    pt_args = TrainingArguments(**pt_cfg)
 
     # Re-initialize a wandb run within the same worspace
-    use_wandb = CLI_CFG.get("pretrainer", {}).get("report_to") == "wandb"
+    use_wandb = (not cli_args.debug) and (CLI_CFG.get("pretrainer", {}).get("report_to") == "wandb")
     if use_wandb:
         workspace = Path(__file__).stem
         wandb.init(project=workspace, name=run_id, config=CLI_CFG)

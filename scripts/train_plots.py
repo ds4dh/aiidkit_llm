@@ -1,15 +1,46 @@
 import os
 import argparse
-import yaml
 import json
 import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
 
+#==========================#
+# To report for Mélanie:   #
+# FUP 00: HRZ: 30, 90, 365 #
+# FUP 30: HRZ: __, 60, 335 #
+# FUP 90: HRZ: __, __, 275 #
+#==========================#
+
 # Plotting configuration
-INVERSE_FUP_PLOT_ORDER = False 
-TRAIN_DATA_FILTERED = False 
-TARGET_METRICS = ["roc_auc", "pr_auc"] # Suffixes only
+TRAIN_DATA_FILTERED = False
+MAIN_RESULTS_DIR = "results_all_possible_fups_train"
+TARGET_METRICS = ["roc_auc", "brier_raw", "brier_cal"]
+MLM_RULES_SET_TO_PLOT = [
+    # {"entity_id": 0.00, "attribute_id": 0.00, "value_id": 0.15},
+    {"entity_id": 0.00, "attribute_id": 0.00, "value_id": 0.25},
+#   {"entity_id": 0.00, "attribute_id": 0.00, "value_id": 0.45},
+#   {"entity_id": 0.00, "attribute_id": 0.00, "value_id": 0.75},
+#   {"entity_id": 0.00, "attribute_id": 0.05, "value_id": 0.15},
+#   {"entity_id": 0.00, "attribute_id": 0.15, "value_id": 0.45},
+#   {"entity_id": 0.00, "attribute_id": 0.25, "value_id": 0.75},
+    {"entity_id": 0.05, "attribute_id": 0.15, "value_id": 0.25},
+    {"entity_id": 0.15, "attribute_id": 0.25, "value_id": 0.45},
+    # {"entity_id": 0.05, "attribute_id": 0.05, "value_id": 0.05},
+    {"entity_id": 0.15, "attribute_id": 0.15, "value_id": 0.15},
+    {"entity_id": 0.25, "attribute_id": 0.25, "value_id": 0.25},
+    # {"entity_id": 0.35, "attribute_id": 0.35, "value_id": 0.35},
+]
+TASKS_TO_PLOT = {
+    "infection_bacteria": {"fups": [0, 30, 90], "horizons": [30, 60, 90, 275, 335, 365]},
+    # "infection_bacteria": {"fups": [0, 30, 60, 90, 180, 365], "horizons": [30, 60, 90]},
+    # "infection_virus": {"fups": [0, 30, 60, 90, 180, 365], "horizons": [30, 60, 90]},
+    # "infection_fungi": {"fups": [0, 30, 60, 90, 180, 365], "horizons": [30, 60, 90]},
+    # "infection": {"fups": [0, 30, 60, 90, 180, 365], "horizons": [30, 60, 90]},
+    # "graft_loss": {"fups": [0, 180, 365, 730, 1095], "horizons": [180, 365, 730]},
+    # "death": {"fups": [0, 180, 365, 730, 1095], "horizons": [180, 365, 730]},
+}
+
 Y_AXIS_DICT = {
     "roc_auc": {"label": "ROC AUC", "lim": (0.5, 1.0)},
     "pr_auc": {"label": "PR AUC", "lim": (0.0, 1.0)},
@@ -19,37 +50,39 @@ Y_AXIS_DICT = {
     "acc": {"label": "Accuracy", "lim": (0.0, 1.0)},
     "bal_acc": {"label": "Balanced accuracy", "lim": (0.5, 1.0)},
 }
-BAR_WIDTH = 0.25
-COLORS = ["tab:blue", "tab:green", "tab:orange"]
+COLORS = ["tab:blue", "tab:green", "tab:orange", "tab:red", "tab:purple", "tab:brown"]
 
 parser = argparse.ArgumentParser(description="Plot fine-tuning results.")
-parser.add_argument("--config", "-c", type=str, default="configs/discriminative_training.yaml")
+parser.add_argument("--test", "-t", action="store_true", help="Plots final test results.")
 cli_args = parser.parse_args()
-CLI_CFG: dict = {}
 
 
 def main():
-    mlm_rules = CLI_CFG["data_collator"]["mlm_masking_rules"]
-    run_id = "-".join([f"{k[0]}{int(v * 100):02d}" for k, v in mlm_rules.items()])
-    base_result_dir = Path(CLI_CFG["result_dir"]) / run_id / "finetuning"
-    print(f"Loading results from: {base_result_dir}")
+    for mlm_rules in MLM_RULES_SET_TO_PLOT:
+        run_id = "-".join([f"{k[0]}{int(v * 100):02d}" for k, v in mlm_rules.items()])
+        base_result_dir = Path(MAIN_RESULTS_DIR) / run_id / "finetuning"
+        
+        mode_str = "test" if cli_args.test else "validation"
+        print(f"Loading {mode_str} results from: {base_result_dir}")
 
-    for task_key, task_specs in CLI_CFG["prediction_tasks"].items():
-        print(f"Plotting results for task: {task_key}")
-        plot_one_task(task_key, task_specs, base_result_dir)
+        for task_key, task_specs in TASKS_TO_PLOT.items():
+            print(f"Plotting results for task: {task_key}")
+            plot_one_task(task_key, task_specs, base_result_dir)
 
 
 def plot_one_task(task_key: str, task_specs: dict[str, dict], base_dir: Path):
-    """Plot finetuning results for a specific prediction task
-    """
+    """Plot finetuning results for a specific prediction task"""
     # Retrieve task specifics
     task_result_dir = base_dir / task_key
     horizons = task_specs["horizons"]
     all_fups = task_specs["fups"]
     
     # Figure and axes setup
+    n_horizons = len(horizons)
     num_metrics = len(TARGET_METRICS)
-    fig_width = BAR_WIDTH * 2 * (1 + (1 + len(all_fups)) * len(horizons))
+    bar_width = 0.8 / n_horizons
+    group_width = n_horizons * bar_width
+    fig_width = max(8, (len(all_fups) * group_width * 1.5))
     fig_height = 4 * num_metrics
     _, axes = plt.subplots(num_metrics, 1, figsize=(fig_width, fig_height), dpi=300, sharex=True)
     axes = np.atleast_1d(axes)
@@ -60,62 +93,92 @@ def plot_one_task(task_key: str, task_specs: dict[str, dict], base_dir: Path):
         ax = axes[idx]
         y_config = Y_AXIS_DICT.get(metric_suffix, {"label": metric_suffix, "lim": (0, 1)})
         data = {h: [] for h in horizons}
+        
         for h in horizons:
-
-            # Format helper: [30, 90] -> "0030-0090"
             fmt_fn = lambda x: "-".join(f"{i:04d}" for i in sorted(([x] if isinstance(x, int) else x or [])))
             
-            # Single run with all training samples, and multiple validation
+            # Construct run path
             if not TRAIN_DATA_FILTERED:
-                # Path construction: hrz(XXXX)_fut(all)_fuv(0000-0030-0060...)
                 fut_str = "all"
-                fuv_str = fmt_fn(all_fups)  # matching config list passed to finetuner                
+                fuv_str = fmt_fn(all_fups)                
                 run_id_str = f"hrz({h:04d})_fut({fut_str})_fuv({fuv_str})"
-                run_path = task_result_dir / run_id_str
+            else:
+                pass 
+
+            # Single run path with all follow-up periods trained simultaneously
+            if not TRAIN_DATA_FILTERED:
                 
-                # Extract metric for each stratified follow-up period
-                log_history, best_step = get_run_history(run_path)
+                # Load correct set of results
+                run_path = task_result_dir / run_id_str
+                if cli_args.test:
+                    source_data = load_test_results(run_path)
+                    prefix = "test"
+                else:
+                    source_data, best_step = get_run_history(run_path)
+                    prefix = "eval"
+
+                # Extract values in the correct way
                 for f in all_fups:
-                    metric_key = f"eval_fup_{f:04d}_{metric_suffix}"
-                    val = extract_metric_from_history(log_history, best_step, metric_key)
+                    metric_key = f"{prefix}_fup_{f:04d}_{metric_suffix}"
+                    if cli_args.test:
+                        val = source_data.get(metric_key, 0.0)
+                    else:
+                        val = extract_metric_from_history(source_data, best_step, metric_key)
                     data[h].append(val)
 
-            # Separate runs for each follow-up period, with filtered training data
+            # Separate runs for each follow-up period
             else:
                 for f in all_fups:
-                    # Path construction: hrz(XXXX)_fut(0090)_fuv(0090)
                     str_f = fmt_fn(f)
                     run_id_str = f"hrz({h:04d})_fut({str_f})_fuv({str_f})"
                     run_path = task_result_dir / run_id_str
                     
-                    # Extract metric for this follow-up period
-                    log_history, best_step = get_run_history(run_path)
-                    metric_key = f"eval_fup_{f:04d}_{metric_suffix}"
-                    val = extract_metric_from_history(log_history, best_step, metric_key)
+                    # Load correct set of results
+                    if cli_args.test:
+                        source_data = load_test_results(run_path)
+                        prefix = "test"
+                    else:
+                        source_data, best_step = get_run_history(run_path)
+                        prefix = "eval"
+                    
+                    # Extract values in the correct way
+                    metric_key = f"{prefix}_fup_{f:04d}_{metric_suffix}"
+                    if cli_args.test:
+                        val = source_data.get(metric_key, 0.0)
+                    else:
+                        val = extract_metric_from_history(source_data, best_step, metric_key)
+                        
                     data[h].append(val)
 
         # Plot bars
         for i, horizon in enumerate(horizons):
-            offset = (i - 1) * BAR_WIDTH 
-            color = COLORS[i % len(COLORS)]
+            offset = (i - (n_horizons - 1) / 2) * bar_width
             plot_vals = [v if v is not None else 0.0 for v in data[horizon]]
-            rects = ax.bar(x + offset, plot_vals, BAR_WIDTH, label=f"{horizon} days", edgecolor='black', color=color, linewidth=0.5)
+            rects = ax.bar(
+                x + offset, plot_vals, bar_width, label=f"{horizon} days", 
+                edgecolor='black', color=COLORS[i % len(COLORS)], linewidth=0.5
+            )
             ax.bar_label(rects, fmt='%.2f', padding=2, fontsize=9)
 
         y_label = f"{task_key.replace('_', ' ').capitalize()} - {y_config['label']}"
         ax.set_ylabel(y_label, fontsize=12, labelpad=10)
         ax.set_ylim(*y_config['lim'])
         ax.grid(axis='y', linestyle='--', alpha=0.7, zorder=0)
+        ax.set_xticks(x)
+        ax.set_xticklabels(all_fups, fontsize=11)
+        ax.tick_params(axis='x', labelbottom=True) 
         if idx == 0:
             ax.legend(title="Prediction horizon", title_fontsize=11, fontsize=11, loc='upper left')
         if idx == num_metrics - 1:
             ax.set_xlabel('Follow-up period (days)', fontsize=12, labelpad=10)
-            ax.set_xticks(x)
-            ax.set_xticklabels(all_fups, fontsize=11)
 
+    # Save final plot
     os.makedirs(task_result_dir, exist_ok=True)
+    mode_str = "test" if cli_args.test else "validation"
+    save_path = task_result_dir / f"combined_{mode_str}_results.png"
     plt.tight_layout()
-    plt.savefig(task_result_dir / "combined_results.png")
+    plt.savefig(save_path)
+    print(f"Saved plot to {save_path}")
     plt.close()
 
 
@@ -148,11 +211,21 @@ def extract_metric_from_history(log_history, best_step, metric_name):
         if best_log: return best_log[metric_name]
     for log in reversed(log_history):
         if metric_name in log: return log[metric_name]
-    # Silent fail for cleaner output, or print warning if debugging
     return 0.0
 
 
+def load_test_results(run_dir: Path) -> dict:
+    """Helper to load the flat JSON test results file"""
+    json_path = run_dir / "test_results.json"
+    if not json_path.exists():
+        return {}  # quiet warning if test results do not exist yet
+    try:
+        with open(json_path, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Error reading {json_path}: {e}")
+        return {}
+
+
 if __name__ == "__main__":
-    with open(cli_args.config, 'r') as f:
-        CLI_CFG = yaml.safe_load(f)
     main()
