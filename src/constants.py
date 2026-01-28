@@ -3,32 +3,12 @@ import pandas as pd
 from pathlib import Path
 from dataclasses import dataclass
 
+##########################################################################
+# DISCLAIMER: ALL VARIABLES IN THIS FILE ARE NOT USED WITH THE NEW DATASET
+##########################################################################
 
 @dataclass(frozen=True)
 class ConstantsNamespace():
-
-    # Raw data paths
-    RAW_DATA_DIR = Path("/home/shares/ds4dh/aiidkit_project/data")
-    EXCEL_DATA_PATH = RAW_DATA_DIR / "Datacut_FUP226_raw-01Jan2023_v1.xlsx"
-    PICKLE_DATA_PATH = RAW_DATA_DIR / "Datacut_FUP226_raw-01Jan2023_v1.pkl"
-    
-    # Processed data paths
-    HOME_DIR = Path.home()  # user home directory
-    HUGGINGFACE_DIR_PATH = HOME_DIR / "aiidkit_mhmmdrz" / "processed_data"
-    METADATA_DIR_PATH = HOME_DIR / "aiidkit_mhmmdrz" / "processed_data" / "metadata"
-
-    # Useful in discriminative or generative LLM training
-    BASE_VOCAB = {
-        "[PAD]": 0,
-        "[MASK]": 1,
-        "[BOS]": 2,
-        "[EOS]": 3,
-        "[UNK]": 4,
-    }
-
-    ##############################################################################
-    # DISCLAIMER: ALL VARIABLES BELOW THIS POINT ARE NOT USED WITH THE NEW DATASET
-    ##############################################################################
     
     # Mapping for reference transplant center
     REFERENCE_CENTER_NORMALIZATION_MAP = {

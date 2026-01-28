@@ -1,22 +1,18 @@
-import wandb
 import math
+import inspect
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Any
+from datasets import DatasetDict
 from transformers import TrainerState, TrainerControl, TrainingArguments
-from transformers.trainer_callback import TrainerCallback, EarlyStoppingCallback
+from transformers.trainer_callback import EarlyStoppingCallback
 
 
-def preprocess_logits_for_metrics(logits, labels):
-    """
-    Align logits and labels for metric computation (useful for causal language models)
-    """
-    # The first element of the tuple is the prediction scores
-    if isinstance(logits, tuple): logits = logits[0]
-
-    # For causal LM, last logit not needed for prediction and first label not predicted
-    return logits[:, :-1, :].argmax(dim=-1), labels[:, 1:]
-
+# -------------------------------------------------------------------
+#  Positional and time embedding layers
+# -------------------------------------------------------------------
 
 class TimeEmbedding(nn.Module):
     """
@@ -83,6 +79,22 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+
+# -------------------------------------------------------------------
+#  Potentially useful custom callbacks
+# -------------------------------------------------------------------
+
+def preprocess_logits_for_metrics(logits, labels):
+    """
+    Align logits and labels for metric computation (useful for causal language models)
+    """
+    # The first element of the tuple is the prediction scores
+    if isinstance(logits, tuple): logits = logits[0]
+
+    # For causal LM, last logit not needed for prediction and first label not predicted
+    return logits[:, :-1, :].argmax(dim=-1), labels[:, 1:]
+
+
 class EarlyStoppingCallbackWithWarmup(EarlyStoppingCallback):
     """
     An EarlyStoppingCallback that disables early stopping for some warm-up steps
@@ -113,42 +125,56 @@ class EarlyStoppingCallbackWithWarmup(EarlyStoppingCallback):
         super().on_evaluate(args, state, control, metrics, **kwargs)
 
 
+# -------------------------------------------------------------------
+#  Loss Functions (refactored for multi-label / BCE)
+# -------------------------------------------------------------------
+
 class FocalLoss(nn.Module):
     """
-    Focal Loss for Dense Object Detection (He et al.)
+    Binary Focal Loss for Multi-Label Classification.
     """
     def __init__(
         self,
         gamma: float = 2.0,
         alpha: float | list | torch.Tensor = None,
         reduction: str = "mean",
-        *args, **kwargs,
     ):
         super().__init__()
         self.gamma = gamma
         self.reduction = reduction
-
-        # Prepare alpha
-        if isinstance(alpha, float):
-            self.register_buffer("alpha", torch.tensor([1 - alpha, alpha]))
-        elif isinstance(alpha, list):
+        
+        # In multi-label, alpha acts as a positive class weight (pos_weight)
+        if isinstance(alpha, (float, int)):
+            self.register_buffer("alpha", torch.tensor([alpha]))
+        elif isinstance(alpha, (list, tuple)):
             self.register_buffer("alpha", torch.tensor(alpha))
         else:
-            self.register_buffer("alpha", alpha) # Assumed Tensor or None
+            self.register_buffer("alpha", alpha)
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        # standard cross entropy (no reduction yet)
-        ce_loss = F.cross_entropy(inputs, targets, reduction="none")
-
-        pt = torch.exp(-ce_loss)
+        """
+        inputs: Logits [Batch, Num_Labels]
+        targets: Binary Targets [Batch, Num_Labels] (float)
+        """
+        # Compute binary cross entropy (element-wise)
+        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+        
+        # Compute probabilities (pt) for the correct class
+        # - if target=1, pt = sigmoid(input)
+        # - if target=0, pt = 1 - sigmoid(input)
+        p = torch.sigmoid(inputs)
+        pt = p * targets + (1 - p) * (1 - targets)
+        
+        # Focal term: (1 - pt)^gamma
         focal_term = (1 - pt) ** self.gamma
-        loss = focal_term * ce_loss
+        loss = focal_term * bce_loss
 
+        # Apply alpha (simple scalar weighting)
         if self.alpha is not None:
-            # Alpha is registered buffer, so it matches device automatically
-            alpha_t = self.alpha.gather(0, targets)
-            loss = alpha_t * loss
-
+             if self.alpha.device != inputs.device:
+                 self.alpha = self.alpha.to(inputs.device)
+             loss = loss * self.alpha
+             
         if self.reduction == "mean":
             return loss.mean()
         elif self.reduction == "sum":
@@ -158,169 +184,164 @@ class FocalLoss(nn.Module):
 
 class WeightedCELoss(nn.Module):
     """
-    Standard Cross Entropy but with explicit class weights for imbalance.
-    Args:
-        class_weights (list | Tensor): Weights for each class (e.g., [1.0, 10.0])
+    Binary Cross Entropy with specific positive weights for imbalance.
     """
     def __init__(
         self,
         class_weights: list | torch.Tensor = None,
         reduction: str = "mean",
-        *args, **kwargs,
     ):
         super().__init__()
         if class_weights is not None:
             if isinstance(class_weights, list):
                 class_weights = torch.tensor(class_weights)
-            # Register as buffer to handle device placement automatically
-            self.register_buffer("weight", class_weights)
+            self.register_buffer("pos_weight", class_weights)
         else:
-            self.weight = None
-        
+            self.pos_weight = None
+            
         self.reduction = reduction
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        return F.cross_entropy(inputs, targets, weight=self.weight, reduction=self.reduction)
-
-
-class DiceLoss(nn.Module):
-    """
-    Dice Loss for checking overlap. Excellent for strong imbalance.
-    Calculates 1 - DiceCoefficient.
-    """
-    def __init__(
-        self,
-        smooth: float = 1e-6,
-        square_denominator: bool = False,
-        reduction: str = "mean",
-        *args, **kwargs,
-    ):
-        super().__init__()
-        self.smooth = smooth
-        self.square_denominator = square_denominator
-        self.reduction = reduction
-
-    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """
-        inputs: Logits [B, C]
-        targets: Labels [B]
-        """
-        # Get probabilities
-        probs = F.softmax(inputs, dim=1)
-        
-        # One-hot encode targets
-        num_classes = inputs.shape[1]
-        targets_one_hot = F.one_hot(targets, num_classes=num_classes)
-        
-        # Intersection: sum(probs * targets)
-        intersection = (probs * targets_one_hot).sum(dim=1)
-        
-        if self.square_denominator:
-            # Soft dice approach (squares in denominator)
-            cardinality = (probs ** 2).sum(dim=1) + (targets_one_hot ** 2).sum(dim=1)
-        else:
-            # Standard dice
-            cardinality = probs.sum(dim=1) + targets_one_hot.sum(dim=1)
-
-        dice_score = (2. * intersection + self.smooth) / (cardinality + self.smooth)
-
-        # We want to minimize loss, so loss = 1 - dice
-        loss = 1.0 - dice_score
-
-        if self.reduction == "mean":
-            return loss.mean()
-        elif self.reduction == "sum":
-            return loss.sum()
-        return loss
+        weight = self.pos_weight
+        if weight is not None and weight.device != inputs.device:
+            self.pos_weight = weight.to(inputs.device)
+            weight = self.pos_weight
+        return F.binary_cross_entropy_with_logits(
+            inputs, 
+            targets, 
+            pos_weight=weight, 
+            reduction=self.reduction
+        )
 
 
 class Poly1FocalLoss(nn.Module):
     """
-    Combines standard Focal Loss with a polynomial term to prevent gradient 
-    vanishing when the model is confident (fixes the "flatline" issue).
-    Formula: Loss = FL(pt) + epsilon * (1 - pt)
+    Poly1 Focal Loss adapted for Multi-Label (Binary) Classification.
+    Loss = FL(pt) + epsilon * (1 - pt)
     """
     def __init__(
         self,
-        num_classes: int = 2,
         epsilon: float = 1.0,
         gamma: float = 2.0,
         alpha: float | list | torch.Tensor = None,
         reduction: str = "mean",
-        *args, **kwargs,
     ):
         super().__init__()
-        self.num_classes = num_classes
         self.epsilon = epsilon
         self.gamma = gamma
         self.reduction = reduction
 
-        # Prepare alpha (class weights)
-        if isinstance(alpha, float):
-            self.register_buffer("alpha", torch.tensor([1 - alpha, alpha]))
-        elif isinstance(alpha, list):
+        if isinstance(alpha, (float, int)):
+            self.register_buffer("alpha", torch.tensor([alpha]))
+        elif isinstance(alpha, (list, tuple)):
             self.register_buffer("alpha", torch.tensor(alpha))
         else:
             self.register_buffer("alpha", alpha)
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        # Compute Probabilities (pt)
-        ce_loss = F.cross_entropy(inputs, targets, reduction="none")
-        pt = torch.exp(-ce_loss)
-
-        # Compute loss
+        # Base binary focal loss
+        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+        p = torch.sigmoid(inputs)
+        pt = p * targets + (1 - p) * (1 - targets)
         focal_term = (1 - pt) ** self.gamma
-        fl_loss = focal_term * ce_loss
+        fl_loss = focal_term * bce_loss
+        
+        # Add poly1 term
         poly1_loss = self.epsilon * (1 - pt)
         loss = fl_loss + poly1_loss
 
-        # Apply Alpha (class Balancing)
+        # Alpha weighting
         if self.alpha is not None:
-            if self.alpha.device != targets.device:
-                self.alpha = self.alpha.to(targets.device)
-            alpha_t = self.alpha.gather(0, targets)
-            loss = alpha_t * loss
+            if self.alpha.device != inputs.device:
+                self.alpha = self.alpha.to(inputs.device)
+            loss = loss * self.alpha
 
-        # Reduction
         if self.reduction == "mean":
             return loss.mean()
         elif self.reduction == "sum":
             return loss.sum()
         return loss
+
+
+# -------------------------------------------------------------------
+#  Factory
+# -------------------------------------------------------------------
+
+
+def compute_loss_args(dataset: DatasetDict, label_keys: list[str]) -> dict[str, Any]:
+    """ 
+    Compute robust class weights for Multi-Label Poly1 Focal Loss.
+    """
+    pos_counts = []
+    neg_counts = []
     
+    # Count positives and negatives for each label
+    for key in label_keys:
+        labels = np.array(dataset[key])
+        labels = labels[labels != -100]  # filter valid (-100) if not done
+        n_pos = np.sum(labels == 1)
+        n_neg = np.sum(labels == 0)
+        pos_counts.append(n_pos)
+        neg_counts.append(n_neg)
+
+    print(f"Label statistics (pos/neg):")
+    for k, p, n in zip(label_keys, pos_counts, neg_counts):
+        print(f"  {k}: {p}/{n} (ratio: {n/max(p,1):.1f})")
+
+    # Compute weights
+    # - standard BCE uses neg/pos (linear). 
+    # - focal loss / poly1 works best with sqrt(neg/pos).
+    raw_ratios = [n / max(p, 1) for n, p in zip(neg_counts, pos_counts)]
+    dampened_weights = [np.sqrt(r) for r in raw_ratios]
+
+    return {
+        # Used by focal loss / poly1 (dampened to avoid exploding gradients)
+        "alpha": torch.tensor(dampened_weights, dtype=torch.float),
+        
+        # Used by WeightedBCE
+        "class_weights": torch.tensor(raw_ratios, dtype=torch.float),
+        
+        "gamma": 2.0, 
+        "epsilon": 1.0,
+    }
+
 
 def make_loss_func(loss_name: str, loss_args: dict = None):
     """
-    Factory to create a compute_loss function for HF Trainer.
-    
-    Args:
-        loss_name: 'focal', 'weighted_ce', 'dice', 'poly1'
-        loss_args: Dictionary of arguments for the specific loss class.
+    Factory to create a compute_loss function for HF Trainer (Multi-Label).
+    Automatically filters loss_args to match the chosen loss class signature.
     """
-    if loss_args is None:
-        loss_args = {}
+    if loss_args is None: loss_args = {}
+    loss_name = loss_name.lower()
 
-    # Instantiate the correct Loss Module
-    if loss_name.lower() == "focal":
-        loss_fct = FocalLoss(**loss_args)
-    elif loss_name.lower() == "weighted_ce":
-        loss_fct = WeightedCELoss(**loss_args)
-    elif loss_name.lower() == "dice":
-        loss_fct = DiceLoss(**loss_args)
-    elif loss_name.lower() in ["poly1", "poly"]:
-        loss_fct = Poly1FocalLoss(**loss_args)
+    # Select the class (but don't instantiate it yet)
+    if loss_name == "ce":
+        loss_cls = nn.BCEWithLogitsLoss
+    elif loss_name == "weighted_ce":
+        loss_cls = WeightedCELoss
+    elif loss_name == "focal":
+        loss_cls = FocalLoss
+    elif loss_name in ["poly1", "poly"]:
+        loss_cls = Poly1FocalLoss
     else:
         raise ValueError(f"Loss name '{loss_name}' not recognized.")
 
-    # Define the inner function compatible with Hugging Face Trainer
+    # Instantiate loss function with clean arguments
+    sig = inspect.signature(loss_cls)
+    filtered_args = {k: v for k, v in loss_args.items() if k in sig.parameters}
+    loss_fct = loss_cls(**filtered_args)
+
+    # Define the wrapper function required by HF Trainer
     def compute_loss(outputs, labels, num_items_in_batch=None):
-        # Handle HF ModelOutput object or tuple
         if isinstance(outputs, dict):
             logits = outputs["logits"]
         else:
-            # Fallback for tuple outputs
             logits = outputs[0]
-        
+            
+        # Ensure labels are float for binary cross-entropy
+        if labels.dtype != torch.float:
+            labels = labels.float()
+            
         return loss_fct(logits, labels)
 
     return compute_loss

@@ -15,7 +15,7 @@ from transformers import (
 from peft import LoraConfig, prepare_model_for_kbit_training
 from trl import SFTTrainer, SFTConfig
 from src.data.process.patient_dataset import load_hf_data_and_metadata
-from src.model.evaluate_models import (
+from src.evaluation.evaluate_models import (
     GenerativeEmbeddingEvaluatorForClassification as CustomEvaluator,
     make_preprocess_logits_for_metrics_generative,
 )

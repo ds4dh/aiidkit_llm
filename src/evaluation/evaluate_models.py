@@ -16,7 +16,8 @@ from contextlib import redirect_stdout
 
 import plotly.graph_objects as go
 from plotly.colors import qualitative
-from scipy.special import softmax
+from scipy.stats import hmean, gmean
+from scipy.special import expit
 from sklearn.calibration import calibration_curve
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import (
@@ -353,84 +354,138 @@ class DiscriminativeEmbeddingEvaluatorForMaskedLanguageModelling:
 
 
 class BaseEmbeddingEvaluatorForClassification:
-    """
-    Base class containing shared logic for metrics, clustering, and logging.
-    Subclasses must implement `prepare_predictions`.
-    """
     def __init__(
         self,
         do_clustering: bool = False,
         n_optuna_trials: int = 0,
         max_clustered_samples: int = 2500,
-        pos_label: int = 1,
-        
+        label_names: list[str] = None,
+        early_stopping_metric: str = "roc_auc",
     ):
         self.do_clustering = do_clustering
         self.max_clustered_samples = max_clustered_samples
-        self.pos_label = pos_label
-        self.current_prefix = "eval"  # to updated during each _log_plot call
-        self.iso_reg = None  # used for calibration plots
+        self.label_names = label_names
+        self.early_stopping_metric = early_stopping_metric
+        self.current_prefix = "eval"
+        self.calibrators = None 
         if do_clustering:
             self.clusterer_module = UMAP_HDBSCAN_Clusterer(n_optuna_trials=n_optuna_trials)
 
     def prepare_predictions(self, eval_preds: EvalPrediction) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
-        """
-        Abstract method to unpack predictions.
-        Must return: (logits, labels, embeddings)
-        """
-        raise NotImplementedError("Subclasses must implement prepare_predictions")
+        raise NotImplementedError
 
     def __call__(self, eval_preds: EvalPrediction) -> dict[str, float]:
         """
-        Main entry point called by the Trainer
+        This is called by Huggingface's Trainer at evaluation time.
         """
-        # Retrieve model outputs and compute probabilities
+        # Extract logits, labels, embeddings, and output probabilities
         logits, labels, embeddings = self.prepare_predictions(eval_preds)
-        probs = softmax(logits, axis=-1)
-        probs_pos = probs[:, self.pos_label] if logits.shape[1] == 2 else probs.max(axis=1)
-        probs_cal = self._apply_calibration_strategy(labels, probs_pos)
+        if labels.ndim == 1:  # standardize shapes to [batch_size, num_labels]
+            labels = labels[:, None]
+            logits = logits[:, None]
+        num_labels = labels.shape[1]
+        probs = expit(logits)  # sigmoid is valid for both binary (1 col) and multi-label
+        probs_cal = self._apply_calibration_strategy(labels, probs)
 
-        # Calibration metrics (Brier score, expected calibration error)
+        # Prepare metrics for logging by Huggingface's Trainer
         metrics = {}
-        metrics["brier_raw"] = brier_score_loss(labels, probs_pos, pos_label=self.pos_label)
-        metrics["brier_cal"] = brier_score_loss(labels, probs_cal, pos_label=self.pos_label)
-        metrics["ece_raw"] = self._expected_calibration_error(labels, probs_pos)
-        metrics["ece_cal"] = self._expected_calibration_error(labels, probs_cal)
+        valid_early_stopping_metric = []
+        names = self.label_names if self.label_names else [f"lbl{i}" for i in range(num_labels)]
+        for i, name in enumerate(names[:num_labels]):
+            
+            # Gather data
+            y_true = labels[:, i]
+            y_prob = probs[:, i]
+            y_cal  = probs_cal[:, i]
+            
+            # Compute metrics
+            if len(np.unique(y_true)) < 2: continue   # skip empty labels (e.g. all -100)
+            sub_metrics = self._compute_single_label_metrics(y_true, y_prob, y_cal)
+            metrics.update({f"{k}_{name}": v for k, v in sub_metrics.items()})
+            
+            # Record valid early stopping metrics
+            if sub_metrics[self.early_stopping_metric] != -1.0:
+                valid_early_stopping_metric.append(sub_metrics[self.early_stopping_metric])
 
+        # Compute macro-average early stopping metric
+        if valid_early_stopping_metric:
+            valid_early_stopping_metric = np.array(valid_early_stopping_metric) + 1e-6
+            # metrics["early_stopping_metric"] = np.mean(valid_early_stopping_metric)
+            # metrics["early_stopping_metric"] = gmean(valid_early_stopping_metric)
+            metrics["early_stopping_metric"] = hmean(valid_early_stopping_metric)
+        else:
+            metrics["early_stopping_metric"] = 0.0  # fallback if nothing valid
+
+        # Log plots directly to WandB
+        if wandb.run is not None:
+            if num_labels == 1:  # detailed clinical plots (risk, calibration, decision curves)
+                y_true = labels[:, 0]
+                y_prob = probs[:, 0]
+                y_cal = probs_cal[:, 0]
+                _, preds = self._get_preds_from_threshold(y_true, y_prob, threshold=0.1)
+                self._log_plots(y_true, preds, y_prob, y_cal)
+            else:  # summary plots only
+                self._log_multilabel_plots(labels, probs, probs_cal)
+
+        return metrics
+
+    def _apply_calibration_strategy(self, labels, probs):
+        """Calibrate model output probabilities given outcome probabilities."""
+        is_train = "test" not in self.current_prefix
+        num_labels = labels.shape[1]
+
+        # Init list if needed
+        if is_train and self.calibrators is None:
+            self.calibrators = [
+                IsotonicRegression(out_of_bounds="clip", y_min=0, y_max=1) 
+                for _ in range(num_labels)
+            ]
+        
+        if self.calibrators is None:
+            return probs
+
+        probs_cal = np.zeros_like(probs)
+        for i in range(num_labels):
+            try:
+                if is_train:
+                    self.calibrators[i].fit(probs[:, i], labels[:, i])
+                probs_cal[:, i] = self.calibrators[i].transform(probs[:, i])
+            except Exception:
+                probs_cal[:, i] = probs[:, i]  # fallback
+        
+        return np.clip(probs_cal, 0.0, 1.0)
+
+    def _compute_single_label_metrics(self, y_true, y_prob, y_cal):
+        """
+        Calculates metrics given a fixed clinical threshold.
+        """
+        metrics = {}
+        
         # Probability-based metrics
+        metrics["brier"] = brier_score_loss(y_true, y_cal)
+        metrics["ece"] = self._expected_calibration_error(y_true, y_cal)
         try:
-            metrics["roc_auc"] = roc_auc_score(labels, probs_pos)
-            metrics["pr_auc"] = average_precision_score(labels, probs_pos)
+            metrics["roc_auc"] = roc_auc_score(y_true, y_prob)
+            metrics["pr_auc"] = average_precision_score(y_true, y_prob)
         except ValueError:
-            # Fail if we have only one class in the batch
             metrics["roc_auc"] = -1.0
             metrics["pr_auc"] = -1.0
 
-        # Threshold-based metrics
-        t = 0.1  # for optimal-f1 threshold, use "best_f1", else use float between 0.0 and 1.0
-        threshold, preds = self._get_preds_from_threshold(labels, probs_pos, t)
-        avg_method = "binary" if logits.shape[1] == 2 else "macro"
-        if isinstance(t, float): t = int(t * 100)
-        metrics[f"acc_t{t}"] = accuracy_score(labels, preds)
-        metrics[f"bal_acc_t{t}"] = balanced_accuracy_score(labels, preds)
-        metrics[f"precision_t{t}"] = precision_score(labels, preds, average=avg_method, zero_division=0)
-        metrics[f"recall_t{t}"] = recall_score(labels, preds, average=avg_method, zero_division=0)
-        metrics[f"f1_t{t}"] = f1_score(labels, preds, average=avg_method, zero_division=0)
-        metrics[f"net_benefit_t{t}"] = self._calculate_net_benefit(labels, probs_pos, threshold=threshold)
-        
-        # Plot logging, directly to WandB
-        if wandb.run is not None and probs.shape[1] == 2:
-            self._log_plots(labels, preds, probs_pos, probs_cal)
-
-        # Clustering analysis  # for now, skipping
-        if 0 and self.do_clustering and embeddings is not None:
-            cluster_metrics, cluster_fig = self.clusterer_module.perform_analysis(
-                embeddings, 
-                max_samples=self.max_clustered_samples
-            )
-            metrics.update(cluster_metrics)
-            if cluster_fig is not None and wandb.run is not None:
-                wandb.log({"eval_plots/clusters": cluster_fig}, commit=False)
+        # Threshold-based metrics at multiple thresholds
+        thresholds = [i / 10 for i in range(1, 10)] + ["best_f1"]
+        for t in thresholds:
+            
+            # Determine threshold (if best_f1) and associated predictions
+            t, preds = self._get_preds_from_threshold(y_true, y_prob, t)
+            t_str = (f"t{int(t * 100)}" if isinstance(t, float) else t)
+            
+            # Log metrics
+            metrics[f"acc_{t_str}"] = accuracy_score(y_true, preds)
+            metrics[f"bal_acc_{t_str}"] = balanced_accuracy_score(y_true, preds)
+            metrics[f"precision_{t_str}"] = precision_score(y_true, preds, zero_division=0)
+            metrics[f"recall_{t_str}"] = recall_score(y_true, preds, zero_division=0)
+            metrics[f"f1_{t_str}"] = f1_score(y_true, preds, zero_division=0)
+            metrics[f"nb_{t_str}"] = self._calculate_net_benefit(y_true, y_prob, t)
 
         return metrics
 
@@ -443,9 +498,6 @@ class BaseEmbeddingEvaluatorForClassification:
         """
         Infer predictions with a given threshold or computing the f1-optimal threshold
         """
-        if len(np.unique(y_true)) < 2:
-            return threshold if isinstance(threshold, float) else 0.5, np.round(y_score)
-
         if threshold == "best_f1":
             precisions, recalls, thresholds = precision_recall_curve(y_true, y_score)
             denominator = precisions + recalls
@@ -460,7 +512,7 @@ class BaseEmbeddingEvaluatorForClassification:
         
         preds = (y_score >= threshold).astype(int)
         return threshold, preds
-    
+
     @staticmethod
     def _expected_calibration_error(y_true, y_prob_pos, n_bins=10):
         if y_prob_pos.ndim > 1: y_prob_pos = y_prob_pos[:, 1]
@@ -499,208 +551,181 @@ class BaseEmbeddingEvaluatorForClassification:
         return nb
     
     def _log_plots(self, labels, preds, probs_pos, probs_cal):
-        """Generates and logs plots directly to WandB with the correct prefix."""
+        """
+        Generates and logs detailed clinical plots for a SINGLE label (Binary case).
+        Logs directly to WandB with the correct prefix.
+        """
         try:
             plots = {}
             prefix = self.current_prefix
             
-            # Standard metric plots
+            # Probability-based plots
             plots[f"{prefix}/conf_mat"] = wandb.plot.confusion_matrix(probs=None, y_true=labels, preds=preds)
+            plots[f"{prefix}/roc_curve"] = self._plot_roc_curve(labels, probs_pos)
+            
+            # Clinically relevant plots
             plots[f"{prefix}/decision_curve"] = self._plot_decision_curve(labels, probs_pos)
             plots[f"{prefix}/risk_distribution"] = self._plot_risk_distribution(labels, probs_pos)
-            plots[f"{prefix}/roc_curve"] = self._plot_roc_curve(labels, probs_pos)
 
-            # Calibration plots (using raw and calibrated probabilities)
-            plots[f"{prefix}/calibration_inf_raw"] = self._plot_calibration(labels, probs_pos, False, False)
-            plots[f"{prefix}/calibration_inf_cal"] = self._plot_calibration(labels, probs_cal, False, True)
+            # Calibration plots
+            # We plot both to see if Isotonic Regression actually helped
+            plots[f"{prefix}/calibration_inf_raw"] = self._plot_calibration(labels, probs_pos, is_corr=False)
+            plots[f"{prefix}/calibration_inf_cal"] = self._plot_calibration(labels, probs_cal, is_corr=True)
 
-            # Log without committing (let HF's trainer commit at the end of the step)
+            # Log without committing (HuggingFace's Trainer commits at end of step)
             wandb.log(plots, commit=False)
 
         except Exception as e:
-            print(f"Plot logging error: {e}")
+            print(f"Single-label plot logging error: {e}")
 
-    def _apply_calibration_strategy(
-        self,
-        probs_pos: np.ndarray,
-        labels: np.ndarray,
-    ) -> np.ndarray:
+    def _log_multilabel_plots(self, labels, probs, probs_cal):
         """
-        Stateful calibration logic:
-        - If prefix is NOT 'test' (e.g., 'eval', 'val'): fit a new calibrator.
-        - If prefix IS 'test': transform using the existing calibrator.
+        Generates summary plots for MULTIPLE labels.
+        Plots all labels on the SAME chart for easy comparison.
         """
-        # Validation phase (fit)
-        if "test" not in self.current_prefix:
-            self.iso_reg = IsotonicRegression(out_of_bounds="clip", y_min=0, y_max=1)
-            try:
-                self.iso_reg.fit(probs_pos, labels)
-                return self.iso_reg.transform(probs_pos)
-            except Exception as e:
-                print(f"Calibration fitting failed (data too small?): {e}")
-                self.iso_reg = None
-                return probs_pos
+        try:
+            prefix = self.current_prefix
+            if self.label_names:
+                label_names = self.label_names
+            else:
+                label_names = [f"L{i}" for i in range(labels.shape[1])]
             
-        # Test phase (transform)
-        else:
-            if self.iso_reg is None:
-                print(
-                    f"Warning: evaluating '{self.current_prefix}' but no "
-                    "calibration was fit! (Did you run validation first?)"
-                )
-                return probs_pos
-            try:
-                return self.iso_reg.transform(probs_pos)
-            except Exception as e:
-                print(f"Calibration transform failed: {e}")
-                return probs_pos
+            # Combined ROC Curve
+            fig_roc = go.Figure()
+            fig_roc.add_trace(go.Scatter(
+                x=[0, 1], y=[0, 1], mode='lines', 
+                line=dict(dash='dash', color='gray'), showlegend=False
+            ))
+            
+            for i, name in enumerate(label_names):
+                # Skip if label is constant (cannot compute ROC)
+                if len(np.unique(labels[:, i])) < 2: continue
+                
+                fpr, tpr, _ = roc_curve(labels[:, i], probs[:, i])
+                auc = roc_auc_score(labels[:, i], probs[:, i])
+                fig_roc.add_trace(go.Scatter(
+                    x=fpr, y=tpr, mode='lines', 
+                    name=f"{name} (AUC={auc:.2f})", opacity=0.8
+                ))
+            
+            fig_roc.update_layout(
+                title=f"Multi-Label ROC ({prefix})", 
+                xaxis_title="False Positive Rate", 
+                yaxis_title="True Positive Rate", 
+                width=700, height=500
+            )
+            
+            # Combined calibration curve (reliability diagram)
+            fig_cal = go.Figure()
+            fig_cal.add_trace(go.Scatter(
+                x=[0, 1], y=[0, 1], mode='lines', 
+                line=dict(dash='dash', color='gray'), showlegend=False
+            ))
+            
+            for i, name in enumerate(label_names):
+                if len(np.unique(labels[:, i])) < 2: continue
 
-    def _plot_calibration(self, y_true, y_prob_infection, is_surv=False, is_corr=False, n_bins=10):
-        """
-        Flexible calibration plotter
-        - is_surv=True: plots survival probability vs observed survival fraction
-        - is_surv=False: plots infection probability vs observed infection fraction
-        """
-        # Determine labels and probabilities based on mode
-        if is_surv:
-            # Target: Survival (0 -> 1, 1 -> 0)
-            target_y = 1 - y_true
-            target_prob = 1 - y_prob_infection
-            title_mode = "Survival (non-infection)"
-            axis_label = "Probability of survival"
-            line_color = "royalblue"
-        else:
-            # Target: Infection
-            target_y = y_true
-            target_prob = y_prob_infection
-            title_mode = "Infection event"
-            axis_label = "Probability of infection"
-            line_color = "firebrick"
+                # Compute calibration curve (observed vs predicted)
+                prob_true, prob_pred = calibration_curve(labels[:, i], probs_cal[:, i], n_bins=10)
+                fig_cal.add_trace(go.Scatter(
+                    x=prob_pred, y=prob_true, mode='lines+markers', 
+                    name=f"{name}", opacity=0.8
+                ))
+                
+            fig_cal.update_layout(
+                title=f"Multi-Label Calibration ({prefix})", 
+                xaxis_title="Predicted Probability", 
+                yaxis_title="Observed Fraction", 
+                width=700, height=500
+            )
 
-        # Compute Calibration Curve
-        prob_true, prob_pred = calibration_curve(target_y, target_prob, n_bins=n_bins)
-        
-        # Initialize figure
-        title_suffix = "(with isotonic correction)" if is_corr else "(raw model output)"
-        symbol = "diamond" if is_corr else "circle"
-        fig = go.Figure()
-        
-        # Diagonal "perfect" line
-        fig.add_trace(go.Scatter(
-            x=[0, 1], y=[0, 1], mode='lines', name='Ideal',
-            line=dict(dash='dash', color='gray'), showlegend=False
-        ))
-        
-        # The Model Curve
-        fig.add_trace(go.Scatter(
-            x=prob_pred, y=prob_true, mode='lines+markers', 
-            name='Model',
-            marker=dict(color=line_color, symbol=symbol, size=8),
-            line=dict(color=line_color, width=2)
-        ))
+            wandb.log({
+                f"{prefix}/roc_combined": fig_roc,
+                f"{prefix}/cal_combined": fig_cal
+            }, commit=False)
 
-        # Polish figure
-        fig.update_layout(
-            title=f"Reliability: {title_mode} <br><sup>{title_suffix}</sup>",
-            xaxis_title=f"Predicted {axis_label}",
-            yaxis_title="Observed fraction",
-            width=600, height=600,
-            xaxis=dict(range=[0, 1]),
-            yaxis=dict(range=[0, 1]),
-            margin=dict(l=40, r=40, t=60, b=40),
-        )
-        
-        return fig
+        except Exception as e:
+            print(f"Multi-label plot logging error: {e}")
 
-    def _plot_decision_curve(self, y_true, y_prob):
-        """Decision curve analysis plotting model net benefit vs threshold."""
-        # Calculate model net benefit for each threshold using the helper
-        thresholds = np.linspace(0.01, 0.99, 100)
-        net_benefits = [self._calculate_net_benefit(y_true, y_prob, t) for t in thresholds]
-        
-        # Calculate "treat all" strategy (reference as only positive predictions)
-        n = len(y_true)
-        prevalence = np.sum(y_true) / n
-        net_benefit_all = prevalence - (1 - prevalence) * (thresholds / (1 - thresholds))
-        
-        # The "treat none" strategy is always 0
-        net_benefit_none = np.zeros_like(thresholds)
-
-        # Generate decision curve plot
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=thresholds, y=net_benefits,
-            mode='lines', name='Model',
-        ))
-        fig.add_trace(go.Scatter(
-            x=thresholds, y=net_benefit_all,
-            mode='lines', name='Treat All', line=dict(dash='dot', color='gray'),
-        ))
-        fig.add_trace(go.Scatter(
-            x=thresholds, y=net_benefit_none,
-            mode='lines', name='Treat None', line=dict(color='black'),
-        ))
-        fig.update_layout(
-            title="Decision curve analysis",
-            xaxis_title="Threshold probability",
-            yaxis_title="Net benefit",
-            width=600, height=600,
-            yaxis=dict(range=[-0.1, prevalence + 0.1]),
-        )
-        return fig
-
-    def _plot_risk_distribution(self, y_true, y_prob):
-        """Violin/box plot of predicted probabilities for events vs non-events."""
-        fig = go.Figure()
-        fig.add_trace(go.Violin(
-            x=y_true[y_true==0], y=y_prob[y_true==0],
-            name="Class 0 (no event)", side='positive', line_color='blue',
-        ))
-        fig.add_trace(go.Violin(
-            x=y_true[y_true==1], y=y_prob[y_true==1],
-            name="Class 1 (event)", side='negative', line_color='red',
-        ))
-        fig.update_layout(
-            title="Risk distribution by outcome",
-            yaxis_title="Predicted probability",
-            xaxis_title="Outcome",
-            width=600, height=600,
-            xaxis=dict(range=[-0.5, 1.5]),
-            yaxis=dict(range=[0.0, 1.0]),
-        )
-        return fig
-    
     def _plot_roc_curve(self, y_true, y_score):
-        """
-        Custom ROC Curve using Plotly (replacing wandb.plot.roc_curve)
-        """
+        """Standard ROC Curve using Plotly"""
         fpr, tpr, _ = roc_curve(y_true, y_score)
         auc_score = roc_auc_score(y_true, y_score)
 
         fig = go.Figure()
-        
-        # Diagonal reference line
         fig.add_trace(go.Scatter(
-            x=[0, 1], y=[0, 1], mode='lines', name='Chance',
-            line=dict(dash='dash', color='gray'), showlegend=False
+            x=[0, 1], y=[0, 1], mode='lines',
+            line=dict(dash='dash', color='gray'), showlegend=False,
         ))
-
-        # Model ROC
         fig.add_trace(go.Scatter(
             x=fpr, y=tpr, mode='lines', 
-            name=f'Model (AUC = {auc_score:.3f})',
-            line=dict(color='darkorange', width=2)
+            name=f'AUC = {auc_score:.3f}', line=dict(color='darkorange', width=2)
         ))
-
         fig.update_layout(
-            title="ROC Curve",
-            xaxis_title="False Positive Rate",
-            yaxis_title="True Positive Rate",
-            width=600, height=600,
-            xaxis=dict(range=[0, 1], constrain='domain'),
-            yaxis=dict(range=[0, 1], scaleanchor="x", scaleratio=1),
-            margin=dict(l=40, r=40, t=60, b=40),
-            legend=dict(x=0.6, y=0.1)
+            title="ROC Curve", xaxis_title="FPR", yaxis_title="TPR", 
+            width=600, height=600, xaxis=dict(range=[0, 1]), yaxis=dict(range=[0, 1])
+        )
+        return fig
+
+    def _plot_calibration(self, y_true, y_prob, is_corr=False, n_bins=10):
+        """Reliability Diagram"""
+        prob_true, prob_pred = calibration_curve(y_true, y_prob, n_bins=n_bins)
+        title_suffix = "(Calibrated)" if is_corr else "(Raw)"
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=[0, 1], y=[0, 1], mode='lines',
+            line=dict(dash='dash', color='gray'), showlegend=False,
+        ))
+        fig.add_trace(go.Scatter(
+            x=prob_pred, y=prob_true, mode='lines+markers', 
+            name='Model', marker=dict(color='firebrick')
+        ))
+        fig.update_layout(
+            title=f"Reliability {title_suffix}", 
+            xaxis_title="Predicted", yaxis_title="Observed", 
+            width=600, height=600, xaxis=dict(range=[0, 1]), yaxis=dict(range=[0, 1])
+        )
+        return fig
+
+    def _plot_risk_distribution(self, y_true, y_prob):
+        """Violin plot of probabilities split by outcome"""
+        fig = go.Figure()
+        fig.add_trace(go.Violin(
+            x=y_true[y_true==0], y=y_prob[y_true==0], 
+            name="Negatives", side='positive', line_color='blue'
+        ))
+        fig.add_trace(go.Violin(
+            x=y_true[y_true==1], y=y_prob[y_true==1], 
+            name="Positives", side='negative', line_color='red'
+        ))
+        fig.update_layout(
+            title="Risk Distribution", yaxis_title="Predicted Probability", 
+            width=600, height=600, yaxis=dict(range=[0, 1])
+        )
+        return fig
+
+    def _plot_decision_curve(self, y_true, y_prob):
+        """Decision curve analysis (DCA), showing net nenefit vs threshold"""
+        thresholds = np.linspace(0.01, 0.99, 100)
+        net_benefits = [self._calculate_net_benefit(y_true, y_prob, t) for t in thresholds]
+        prev = np.sum(y_true) / len(y_true)
+        nb_all = prev - (1 - prev) * (thresholds / (1 - thresholds))
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=thresholds, y=net_benefits, mode='lines', name='Model',
+        ))
+        fig.add_trace(go.Scatter(
+            x=thresholds, y=nb_all, mode='lines',
+            name='Treat All', line=dict(dash='dot', color='gray'),
+        ))
+        fig.add_trace(go.Scatter(
+            x=thresholds, y=np.zeros_like(thresholds), mode='lines',
+            name='Treat None', line=dict(color='black'),
+        ))
+        fig.update_layout(
+            title="Decision Curve Analysis", 
+            xaxis_title="Threshold", yaxis_title="Net Benefit", 
+            width=600, height=600, yaxis=dict(range=[-0.05, prev + 0.1])
         )
         return fig
 

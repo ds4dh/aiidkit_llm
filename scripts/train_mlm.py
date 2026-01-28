@@ -8,7 +8,7 @@ from transformers import Trainer, TrainingArguments, EarlyStoppingCallback
 from src.data.patient_dataset import load_hf_data_and_metadata
 from src.model.patient_embedder import PatientEmbeddingModelFactory
 from src.model.patient_embedder import PatientDataCollatorForMaskedLanguageModelling
-from src.model.evaluate_models import (
+from src.evaluation.evaluate_models import (
     DiscriminativeEmbeddingEvaluatorForMaskedLanguageModelling as CustomEvaluator,
     preprocess_logits_for_mlm_metrics,
 )

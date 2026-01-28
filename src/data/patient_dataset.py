@@ -1,3 +1,5 @@
+
+import os
 import pickle
 import numpy as np
 import pandas as pd
@@ -8,6 +10,7 @@ from collections import defaultdict
 from datasets import Dataset, DatasetDict, load_from_disk, concatenate_datasets
 import src.constants as constants
 csts = constants.ConstantsNamespace()
+safe_num_proc = max(1, len(os.sched_getaffinity(0)) - 2)
 
 
 def load_hf_data_and_metadata(
@@ -16,7 +19,7 @@ def load_hf_data_and_metadata(
     fup_valid: int | list[int] | None = None,
     fup_test: int | list[int] | None = None,
     target_undersampling_ratio: float | None = None,
-    label_key: str | None = None,
+    label_keys: str | list[str] | None = None,
     time_mapping: dict[str, str]={"days_since_tpx": "time"},
     eav_mappings: dict[str, str]={
         "entity_id": "entity",
@@ -29,6 +32,12 @@ def load_hf_data_and_metadata(
     - if `metadata_cache_key` provided (finetuning), load metadata from cache
     - if `metadata_cache_key` not provided (pretraining) compute and save metadata
     """
+    # Safety checks
+    if isinstance(label_keys, str):
+        label_keys = [label_keys]    
+    if target_undersampling_ratio is not None and not label_keys:
+        raise ValueError("Cannot perform undersampling without valid 'label_keys'.")
+    
     # Initialization
     root_path = Path(data_dir)
     metadata_path = root_path / "processed_cache" / "pretraining_metadata"
@@ -52,7 +61,7 @@ def load_hf_data_and_metadata(
     print(f"Loading raw data from disk...")
     dataset = DatasetDict({
         "train": _load_and_tag(
-            root_path, fup_train, "train", label_key=label_key,
+            root_path, fup_train, "train", label_keys=label_keys,
             target_undersampling_ratio=target_undersampling_ratio,
         ),
         "validation": _load_and_tag(root_path, fup_valid, "validation"),
@@ -72,12 +81,12 @@ def load_hf_data_and_metadata(
             eav_key: [vocab.get(token_id, unk_id) for token_id in example[eav_raw]]
             for eav_key, eav_raw in eav_mappings.items()
         }
-    dataset = dataset.map(map_to_ids, desc="Mapping tokens to IDs", num_proc=8)
+    dataset = dataset.map(map_to_ids, desc="Mapping tokens to IDs", num_proc=safe_num_proc)
 
     # Final formatting
     time_key, time_key_raw = list(time_mapping.keys())[0], list(time_mapping.values())[0]
     clean_time_fn = lambda x: {time_key: [0.0 if pd.isna(t) else t for t in x[time_key_raw]]}
-    dataset = dataset.map(clean_time_fn, desc="Cleaning time entries", num_proc=8)
+    dataset = dataset.map(clean_time_fn, desc="Cleaning time entries", num_proc=safe_num_proc)
     all_cols = dataset["train"].column_names
     label_cols = [c for c in all_cols if c.startswith("label_")]
     teav_cols = list(eav_mappings.keys()) + [time_key] + list(eav_mappings.values())
@@ -104,7 +113,7 @@ def _load_and_tag(
     root_path: Path,
     fup_input: int | list[int] | None,
     split: str,
-    label_key: str | None = None,
+    label_keys: list[str] | None = None,
     target_undersampling_ratio: float | None = None,
 ):
     """Loads specific follow-up folders, tags follow-up, concatenates."""
@@ -119,7 +128,7 @@ def _load_and_tag(
         
         # Soft undersampling, usually only for training data
         if target_undersampling_ratio is not None:
-            ds = undersample_dataset(ds, label_key, target_undersampling_ratio)
+            ds = undersample_dataset(ds, label_keys, target_undersampling_ratio)
         
         # Tag samples with fup-integer (use -1 for None, even if not used anyways)
         fup_val = fup if fup is not None else -1
@@ -247,7 +256,7 @@ def bin_values_by_attribute(
     # Apply the binning
     binned_dataset = dataset.map(
         function=lambda s: bin_sample_values(s[value_key], s[attribute_key]),
-        desc="Binning values", load_from_cache_file=False, num_proc=8,
+        desc="Binning values", load_from_cache_file=False, num_proc=safe_num_proc,
     )
 
     return binned_dataset, bin_intervals
@@ -255,39 +264,66 @@ def bin_values_by_attribute(
 
 def undersample_dataset(
     dataset: Dataset,
-    label_key: str,
+    label_keys: list[str],
     target_ratio: float = 1.0,
     seed: int = 1234,
+    balancing_label_key: str | None = None,
 ):
     """
-    Undersamples majority class to match minority * target_ratio
+    Multi-label undersampling.
+    If 'balancing_label_key' is provided:
+        Undersamples based on that specific key (binary logic).
+    Else:
+        Undersamples "clean" patients (0 on all labels) to match 
+        patients with "at least one event" (1 on any label).
     """
-    labels = np.array(dataset[label_key])
-    pos_indices = np.where(labels == 1)[0]
-    neg_indices = np.where(labels == 0)[0]
-    n_pos = len(pos_indices)
-    n_neg = len(neg_indices)
-
-    # Determine which is truly majority/minority
-    if n_pos > n_neg: 
-        majority_indices = pos_indices
-        minority_indices = neg_indices
-        keep_n = int(len(neg_indices) * target_ratio)
+    rng = np.random.default_rng(seed)
+    
+    # Balance on a specific key
+    if balancing_label_key is not None:
+        if balancing_label_key not in label_keys:
+            raise ValueError(f"Balancing key {balancing_label_key} not in label_keys")
+        
+        # Standard binary logic
+        labels = np.array(dataset[balancing_label_key])
+        pos_indices = np.where(labels == 1)[0]
+        neg_indices = np.where(labels == 0)[0]
+        
+    # Clever Union (balance "any Positive" vs "all negative")
     else:
+        # Identify "Any Positive" (The valuable minority)
+        label_matrix = np.stack([dataset[k] for k in label_keys], axis=1)
+        any_positive_mask = (np.max(label_matrix, axis=1) == 1)
+        pos_indices = np.where(any_positive_mask)[0]
+        neg_indices = np.where(~any_positive_mask)[0]  # all zeros (or -100s)
+
+    # Common undersampling logic
+    n_pos = len(pos_indices)
+    n_neg = len(neg_indices)    
+    print(f"Undersampling: Found {n_pos} any-pos samples and {n_neg} all-neg samples.")
+    if n_pos < n_neg:
         majority_indices = neg_indices
         minority_indices = pos_indices
-        keep_n = int(len(pos_indices) * target_ratio)
+        keep_n = int(n_pos * target_ratio)
+    else:
+        majority_indices = pos_indices
+        minority_indices = neg_indices
+        keep_n = int(n_neg * target_ratio)
 
-    # If majority is already smaller than target ratio, keep all
+    # Check if we even need to drop anything
     if len(majority_indices) <= keep_n:
+        print("Majority class is already smaller than target ratio. No undersampling applied.")
         return dataset
 
-    rng = np.random.default_rng(seed)
+    # Select random subset of majority
     selected_majority = rng.choice(majority_indices, size=keep_n, replace=False)
+    
+    # Combine and Shuffle
     final_indices = np.concatenate([selected_majority, minority_indices])
     rng.shuffle(final_indices)
     
     return dataset.select(final_indices)
+
 
 def format_eav_to_tree(df: pd.DataFrame) -> list[str]:
     """

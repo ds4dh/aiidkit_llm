@@ -185,5 +185,9 @@ data/preprocessed/*
 data/huggingface/*
 *.sif
 archives
-results
+results*
 wandb
+digest.txt
+configs/run_configs
+scoping_review/data
+scoping_review/results

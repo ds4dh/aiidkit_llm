@@ -77,11 +77,12 @@ class PatientEmbeddingModelFactory:
         """
         print(f"From pretrained unused arguments: {kwargs}")
         # Load Config from the local directory
+        model_args.update(kwargs)  # in case some were given as top-level arguments
         config = AutoConfig.from_pretrained(pretrained_dir, **model_args)
 
         # Build the skeleton with random weights
         model_cls = cls._get_model_class(task)
-        model = model_cls.from_config(config, **model_args)
+        model = model_cls.from_config(config)  # (config, **model_args)
 
         # Re-create the custom Layer
         custom_embed = PatientEmbeddingLayer(
@@ -606,17 +607,25 @@ class PatientDataCollatorForClassification(PatientDataCollatorForMaskedLanguageM
     Inherits padding/truncation logic from the MLM collator, 
     but disables masking and extracts a specific target label.
     """
-    label_key: str|None = None
+    label_keys: str | list[str] | None = None
+
+    def __post_init__(self):
+        """Anything that must be initialized dynamically"""
+        super().__post_init__()
+        if self.label_keys is None:
+            raise ValueError("Label keys missing in patient data collator for classification")
+        if isinstance(self.label_keys, str):
+            self.label_keys = [self.label_keys]
 
     def torch_call(self, samples: list[dict[str, np.ndarray]]) -> dict:
         """
         Collate patient sequences and create labels for supervised fine-tuning
         Used by HuggingFace's trainer
         """
-        # Separate features and labels
-        if self.label_key is None:
-            raise ValueError("Label key missing in patient data collator for classification")
-        labels = [s.pop(self.label_key) for s in samples]
+        batch_labels = []
+        for s in samples:
+            patient_labels = [s.pop(k) for k in self.label_keys]
+            batch_labels.append(patient_labels)
 
         # Preprocess the input samples
         self.do_augmentation = (samples[0]["split"] == "train")
@@ -627,7 +636,7 @@ class PatientDataCollatorForClassification(PatientDataCollatorForMaskedLanguageM
         batch = {
             "input_dict": {k: torch.tensor(v) for k, v in padded_batch.items()},
             "attention_mask": torch.tensor(attention_mask),
-            "labels": torch.tensor(labels).long(),  # classification loss expects long tensors
+            "labels": torch.tensor(batch_labels, dtype=torch.float),
         }
         batch.update(non_features)  # in case useful somewhere
 
