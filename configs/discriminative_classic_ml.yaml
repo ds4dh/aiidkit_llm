@@ -1,8 +1,16 @@
+# Run parameters
 data_path: /home/shares/ds4dh/aiidkit_project/data_new/processed/classic_ml
-results_dir: results_classic_ml
-run_id: xgboost_optuna_v1
+results_dir: results_classic_ml_balanced_tda_all
+selected_model_type: xgboost  # logistic_regression, random_forest, xgboost
+prediction_tasks:
+    infection_bacteria: {fups: [0,  30,  60,  90,  180, 365], horizons: [ 30,  60,  90]}
+    infection_virus:    {fups: [0,  30,  60,  90,  180, 365], horizons: [ 30,  60,  90]}
+    infection_fungi:    {fups: [0,  30,  60,  90,  180, 365], horizons: [ 30,  60,  90]}
+    # infection:          {fups: [0,  30,  60,  90,  180, 365], horizons: [ 30,  60,  90]}
+    graft_loss:         {fups: [0, 180, 365, 730, 1095],      horizons: [180, 365, 730, 1095]}
+    death:              {fups: [0, 180, 365, 730, 1095],      horizons: [180, 365, 730, 1095]}
 
-# Columns to exclude from X (features)
+# Columns to exclude
 ignore_columns:
   - "patientkey"
   - "patientid"
@@ -11,29 +19,45 @@ ignore_columns:
   - "split"
   - "label_*"
 
-# model:
-#   type: "xgboost" # or "logistic_regression", "random_forest"
-#   params:
-#     n_estimators: 100
-#     learning_rate: 0.1
-#     max_depth: 5
-#     eval_metric: "logloss"
-#     n_jobs: -1
-model:
-  type: "xgboost"  # "xgboost", "random_forest", "logistic_regression"
-  n_optuna_trials: 25
-  optuna_params:
-    learning_rate: ["float", 0.01, 0.3]  # log-uniform suggestion
-    n_estimators: ["int", 50, 300]
-    max_depth: ["int", 3, 10]
-    subsample: ["float", 0.5, 1.0]
-    colsample_bytree: ["float", 0.5, 1.0]
-    feature_fraction: ["int", 10, 100]  # for feature selector
-    n_jobs: -1  # fixed params can be passed directly as values if needed
-    eval_metric: "logloss"
+# Hyper parameters for all model types
+train_data_augment: all  # none, valid, all
+target_undersampling_ratio: 0.1  # same as for transformer pipeline (undersample if worse than this ratio)
+models:
 
-# Same structure as in configs/discriminative_training.yaml
-prediction_tasks:
-  infection_bacteria:
-    horizons: [30, 60, 90]
-    fups: [0, 30, 60, 90, 180, 365]
+  # Linear baseline
+  logistic_regression:
+    n_optuna_trials: 25
+    optuna_params:
+      C: ["float", 0.0001, 100.0, "log"]
+      penalty: ["categorical", "l1", "l2"]
+      feature_fraction: ["int", 25, 100]
+      solver: "liblinear"
+      max_iter: 1000
+      n_jobs: -1
+
+  # Non-linear baseline
+  random_forest:
+    n_optuna_trials: 25
+    optuna_params:
+      n_estimators: ["int", 100, 500]
+      max_depth: ["int", 5, 30]
+      min_samples_split: ["int", 2, 20]
+      min_samples_leaf: ["int", 1, 10]
+      max_features: ["categorical", "sqrt", "log2"]
+      feature_fraction: ["int", 25, 100]
+      n_jobs: -1
+
+  # State-of-the-art baseline with tabular data
+  xgboost:
+    n_optuna_trials: 25
+    optuna_params:
+      learning_rate: ["float", 0.005, 0.2, "log"]
+      n_estimators: ["int", 100, 500]
+      max_depth: ["int", 3, 8]
+      subsample: ["float", 0.6, 1.0]
+      colsample_bytree: ["float", 0.5, 1.0]
+      min_child_weight: ["int", 1, 10]
+      gamma: ["float", 0.0, 5.0]
+      feature_fraction: ["int", 25, 100]
+      n_jobs: -1
+      eval_metric: "logloss"

@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import optuna
 from pathlib import Path
+from tqdm.auto import tqdm
 from scipy.special import logit
 from xgboost import XGBClassifier
 from sklearn.linear_model import LogisticRegression
@@ -16,6 +17,8 @@ from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import roc_auc_score
 from transformers.trainer_utils import EvalPrediction
+from imblearn.pipeline import Pipeline as ImbPipeline
+from imblearn.under_sampling import RandomUnderSampler
 from src.evaluation.plot_results import plot_task_results
 from src.evaluation.evaluate_models import (
     DiscriminativeEmbeddingEvaluatorForClassification as CustomEvaluator
@@ -33,99 +36,182 @@ def parse_args():
     return parser.parse_args()
 
 
+def scan_all_fups(data_root: Path) -> list[int]:
+    """Find all available follow-up folders (fup_XXXXd) in the data directory."""
+    fups = []
+    if not data_root.exists(): return []
+    for path in data_root.iterdir():
+        if path.is_dir() and path.name.startswith("fup_") and path.name.endswith("d"):
+            try:
+                # Extract integer from "fup_0090d" -> 90
+                val = int(path.name.split("_")[-1].replace("d", ""))
+                fups.append(val)
+            except ValueError:
+                continue
+    return sorted(fups)
+
+
+def format_fup_string(fups: list[int] | str) -> str:
+    """Matches the folder naming convention of the transformer script."""
+    if isinstance(fups, str): return fups
+    if not fups: return "none"
+    return "-".join(f"{i:04d}" for i in sorted(fups))
+
+
 def main():
     # Load configuration
     args = parse_args()
     with open(args.config, 'r') as f:
         cfg = yaml.safe_load(f)
 
+    # Check model
+    model_type = cfg['selected_model_type']
+    if model_type not in cfg['models']:
+        raise ValueError(f"Model '{model_type}' not found in 'models' config section.")
+    model_config = cfg['models'][model_type]
+
+    # Check data
     data_root = Path(cfg['data_path'])
     print(f"Data Root: {data_root}")
 
     # Iterate over tasks
+    train_data_augment = cfg.get("train_data_augment", "none")
     for task_key, task_specs in cfg["prediction_tasks"].items():
         
-        # Run training for all horizons and follow-up periods for this task
-        for horizon in task_specs["horizons"]:
-            for fup in task_specs["fups"]:
-                print(f"\nProcessing task: {task_key} | horizon: {horizon}d | FUP: {fup}d")
-                train_one_fup_run(cfg, data_root, task_key, fup, horizon)
+        valid_fups = task_specs["fups"]
 
-        # Using train_data_augment="none" tells the plotter to look for "fut(XXXX)_fuv(XXXX)" folders
+        # Determine training configuration (train vs valid follow-up periods)
+        if train_data_augment == "none":
+            # One run per follow-up period
+            run_configs = [([f], [f]) for f in valid_fups]
+        else:
+            # Single run with aggregated data
+            if train_data_augment == "valid":
+                train_fups = valid_fups
+            elif train_data_augment == "all":
+                train_fups = scan_all_fups(data_root)
+            else:
+                raise ValueError(f"Unknown train_data_augment: {train_data_augment}")
+            
+            run_configs = [(train_fups, valid_fups)]
+
+        # Iterate over horizons
+        for horizon in task_specs["horizons"]:
+            
+            # Execute runs
+            for train_fups_list, valid_fups_list in run_configs:
+                
+                # Naming for display
+                t_str = "All" if train_data_augment == "all" else str(train_fups_list)
+                print(f"\nProcessing task: {task_key} | horizon: {horizon}d | train FUPs: {t_str}")
+
+                train_model_run(
+                    cfg, data_root,
+                    task_key, train_fups_list, valid_fups_list, horizon,
+                    model_type, model_config, train_data_augment
+                )
+
+        # Plotting results
         print(f"\nGenerating plots for task: {task_key}...")
-        finetuning_dir = Path(cfg['results_dir']) / cfg['run_id']
+        finetuning_dir = Path(cfg['results_dir']) / model_type
         plot_task_results(
             task_key=task_key,
             task_specs=task_specs,
             finetuning_dir=finetuning_dir,
-            train_data_augment="none",
+            train_data_augment=train_data_augment,
         )
 
 
-def train_one_fup_run(cfg, data_root, task_key, fup, horizon):
+def load_combined_data(
+    data_root, fups, filename, label_key, ignore_cols, enforced_features=None,
+):
     """
-    Trains one model for a specific FUP directory.
-    Output directory structure matches transformers: task / hrz(...)_fut(...)_fuv(...)
+    Loads and concatenates data from multiple FUP directories.
+    
+    Args:
+        enforced_features (list):
+        - If provided, the output X will be reindexed to match features exactly
+        - If None (training time), features are detected dynamically
     """
-    # Define paths
-    fup_dir = data_root / f"fup_{fup:04d}d"
-    if not fup_dir.exists():
-        print(f"Skipping missing directory: {fup_dir}")
-        return
+    dfs = []    
+    for fup in fups:
+        fup_dir = data_root / f"fup_{fup:04d}d"
+        file_path = fup_dir / filename
+        if file_path.exists():
+            df_chunk = pd.read_parquet(file_path)
+            if label_key in df_chunk.columns:
+                df_chunk = df_chunk[df_chunk[label_key] != -100]
+            dfs.append(df_chunk)
 
-    # Load data helper
-    # We determine feature columns dynamically from the first file loaded
+    if not dfs: return None, None, None
+    full_df = pd.concat(dfs, ignore_index=True)
+
+    # Feature selection logic
+    if enforced_features is None:
+        # Dynamic detection (training phase)
+        feats = [c for c in full_df.columns if c not in ignore_cols and not c.startswith("label_")]
+        X_df = full_df[feats]
+    else:
+        # Strict enforcement (validation/test phase)
+        feats = enforced_features
+        # reindex ensures X has exactly 'feats' columns in the right order.
+        # Missing columns in 'full_df' become NaNs (which SimpleImputer will handle).
+        X_df = full_df.reindex(columns=feats)
+
+    X = X_df.values
+    y = full_df[label_key].values if label_key in full_df.columns else None
+    
+    return X, y, feats
+
+
+def train_model_run(
+    cfg, data_root, task_key, train_fups, valid_fups, horizon,
+    model_type, model_config, train_data_augment,
+):
+    """
+    Trains one model using aggregated training data, evaluates on stratified test sets.
+    """
     label_key = f"label_{task_key}_{horizon:04d}d"
     ignore_cols = set(cfg['ignore_columns'] + [label_key])
-    
-    def load_split(filename):
-        df = pd.read_parquet(fup_dir / filename)
-        # Filter rows where target is invalid (-100)
-        if label_key in df.columns:
-            df = df[df[label_key] != -100]
-        else:
-            raise KeyError(f"Label key {label_key} not in dataset")
-        
-        # Identify features
-        feats = [c for c in df.columns if c not in ignore_cols and not c.startswith("label_")]
-        X = df[feats].values
-        y = df[label_key].values if label_key in df.columns else None
-        return X, y, feats
 
-    # Load data splits
-    print(f"Loading data from {fup_dir}...")
-    try:
-        X_train, y_train, features = load_split("train.parquet")
-        X_val, y_val, _ = load_split("validation.parquet")
-        X_test, y_test, _ = load_split("test.parquet")
-    except FileNotFoundError as e:
-        print(f"Error loading splits (skipping run): {e}")
+    # Load training data
+    print(f"Loading training data from {len(train_fups)} folders...")
+    X_train, y_train, features = load_combined_data(
+        data_root, train_fups, "train.parquet",
+        label_key, ignore_cols, enforced_features=None,
+    )
+    if X_train is None or len(X_train) == 0:
+        print("Training set empty. Skipping.")
         return
 
-    if len(X_train) == 0:
-        print("Training set empty after filtering labels. Skipping.")
+    # Load validation data
+    X_val, y_val, _ = load_combined_data(
+        data_root, valid_fups, "validation.parquet",
+        label_key, ignore_cols, enforced_features=features,
+    )
+    if X_val is None:
+        print("Validation set empty. Skipping.")
         return
-    
-    # Initialize output directory
-    run_id = cfg['run_id']
+
+    # Setup output directory    
+    # Logic: if "none", we list the specific FUP (e.g., 0090). If "valid"/"all", we use the string "valid"/"all" 
     hrz_str = f"{horizon:04d}"
-    fup_str = f"{fup:04d}"
-    task_subdir = f"hrz({hrz_str})_fut({fup_str})_fuv({fup_str})"
-    output_dir = Path(cfg['results_dir']) / run_id / task_key / task_subdir
+    if train_data_augment == "none":
+        fut_str = format_fup_string(train_fups) # e.g. "0090"
+    else:
+        fut_str = train_data_augment # e.g. "valid" or "all"
+    fuv_str = format_fup_string(valid_fups)
+    task_subdir = f"hrz({hrz_str})_fut({fut_str})_fuv({fuv_str})"
+    output_dir = Path(cfg['results_dir']) / model_type / task_key / task_subdir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize trainer and train
-    # trainer = BaselineTrainer(
-    #     model_type=cfg['model']['type'],
-    #     model_params=cfg['model']['params'],
-    #     output_dir=output_dir,
-    # )
-    # trainer.train(X_train, y_train)
+    # Train
     trainer = OptunaTrainer(
-        model_type=cfg['model']['type'],
-        optuna_config=cfg['model'].get('optuna_params', {}),
-        n_trials=cfg['model'].get('n_optuna_trials', 10),
+        model_type=model_type,
+        optuna_config=model_config.get('optuna_params', {}),
+        n_trials=model_config.get('n_optuna_trials', 10),
         output_dir=output_dir,
+        target_ratio=cfg.get('target_undersampling_ratio', None),
     )
     trainer.optimize_and_train(X_train, y_train, X_val, y_val)
 
@@ -136,19 +222,36 @@ def train_one_fup_run(cfg, data_root, task_key, fup, horizon):
         early_stopping_metric="roc_auc"
     )
 
-    # Calibration (on validation)
+    # Calibration (on aggregated validation set)
     print("Fitting calibration...")
     evaluator.current_prefix = "val_all"
     _ = trainer.evaluate(X_val, y_val, evaluator, prefix="val_all")
-
-    # Testing
+    
+    # Test all follow-up periods
     final_metrics = {}
-    metrics_all = trainer.evaluate(X_test, y_test, evaluator, prefix="test_all")
-    final_metrics.update(metrics_all)
-    metrics_fup = trainer.evaluate(X_test, y_test, evaluator, prefix=f"test_fup_{fup:04d}")
-    final_metrics.update(metrics_fup)
+    X_test_all, y_test_all, _ = load_combined_data(
+        data_root, valid_fups, "test.parquet",
+        label_key, ignore_cols, enforced_features=features,
+    )
+    if X_test_all is not None:
+        metrics_all = trainer.evaluate(
+            X_test_all, y_test_all, evaluator, prefix="test_all",
+        )
+        final_metrics.update(metrics_all)
 
-    # Save
+    # Test per follow-up period (stratified)
+    for fup in valid_fups:
+        X_test_fup, y_test_fup, _ = load_combined_data(
+            data_root, [fup], "test.parquet",
+            label_key, ignore_cols, enforced_features=features,
+        )
+        if X_test_fup is not None and len(X_test_fup) > 0:
+            metrics_fup = trainer.evaluate(
+                X_test_fup, y_test_fup, evaluator, prefix=f"test_fup_{fup:04d}"
+            )
+            final_metrics.update(metrics_fup)
+
+    # Save results
     json_path = output_dir / "test_results.json"
     with open(json_path, "w") as f:
         json.dump(final_metrics, f, indent=4)
@@ -160,18 +263,20 @@ def train_one_fup_run(cfg, data_root, task_key, fup, horizon):
 # ================
 
 class BaselineTrainer:
-    def __init__(self, model_type, model_params, output_dir):
+    def __init__(self, model_type, model_params, output_dir, target_ratio):
         self.output_dir = Path(output_dir)
         self.model_type = model_type
         self.model_params = model_params
-        # Pipeline is now built lazily in train() once we see the data
         self.pipeline = None 
+        self.target_ratio = target_ratio
 
     def train(self, X_train, y_train):
         print(f"Training {self.model_type}...")
         
         # Build a data transform + model pipeline based on X_train statistics
-        self.pipeline = build_model_pipeline(X_train, self.model_type, self.model_params)
+        self.pipeline = build_model_pipeline(
+            X_train, y_train, self.model_type, self.model_params, self.target_ratio,
+        )
         
         # Fit model with nicer data
         self.pipeline.fit(X_train, y_train)
@@ -202,27 +307,28 @@ class BaselineTrainer:
 
 
 class OptunaTrainer:
-    def __init__(self, model_type, optuna_config, n_trials, output_dir):
+    def __init__(self, model_type, optuna_config, n_trials, output_dir, target_ratio):
         self.model_type = model_type
         self.optuna_config = optuna_config
         self.n_trials = n_trials
         self.output_dir = output_dir
         self.pipeline = None
         self.best_params = None
+        self.target_ratio = target_ratio
 
     def optimize_and_train(self, X_train, y_train, X_val, y_val):
         """
         Runs Optuna optimization to find best params, then retrains on full data.
         """
-        print(f"Starting Optuna optimization ({self.n_trials} trials)...")
-        
         # Define objective function
         def objective(trial):
             # Sample parameters
             params = self._suggest_params(trial)
             
             # Build temporary pipeline
-            pipeline = build_model_pipeline(X_train, self.model_type, params)
+            pipeline = build_model_pipeline(
+                X_train, y_train, self.model_type, params, self.target_ratio,
+            )
             
             # Fit on Train, Score on Val (Simple Hold-out optimization)
             # For more robustness, replace this with cross_val_score on X_train
@@ -238,9 +344,15 @@ class OptunaTrainer:
                 score = 0.5
             return score
 
-        # Run optimization
+        # Run hyper-parameter optimization
+        print(f"Starting Optuna optimization ({self.n_trials} trials)...")
         study = optuna.create_study(direction="maximize")
-        study.optimize(objective, n_trials=self.n_trials)
+        with tqdm(total=self.n_trials, colour='green', desc="Tuning") as pbar:
+            study.optimize(
+                objective, 
+                n_trials=self.n_trials, 
+                callbacks=[lambda study, trial: pbar.update(1)]
+            )
         
         self.best_params = study.best_trial.params
         print(f"Best params found: {self.best_params} (AUC: {study.best_value:.4f})")
@@ -250,7 +362,9 @@ class OptunaTrainer:
 
         # Train final model on Train data (or Train+Val if you prefer)
         print("Retraining final model on training set...")
-        self.pipeline = build_model_pipeline(X_train, self.model_type, final_params)
+        self.pipeline = build_model_pipeline(
+            X_train, y_train, self.model_type, final_params, self.target_ratio,
+        )
         self.pipeline.fit(X_train, y_train)
 
         # Save best params for reference
@@ -346,13 +460,13 @@ def infer_feature_types(X, cat_threshold=20):
     return binary_cols, categorical_cols, numerical_cols
 
 
-def build_model_pipeline(X_train, model_type, model_params):
+def build_model_pipeline(X_train, y_train, model_type, model_params, target_ratio=None):
     """
     Constructs a ColumnTransformer pipeline that treats features differently.
     """
     # Infer types
     bin_idx, cat_idx, num_idx = infer_feature_types(X_train)
-    print(f"   [Auto-Preprocessing] Detected: {len(bin_idx)} Binary, {len(cat_idx)} Categorical, {len(num_idx)} Numerical features.")
+    # print(f"   [Auto-Preprocessing] Detected: {len(bin_idx)} Binary, {len(cat_idx)} Categorical, {len(num_idx)} Numerical features.")
 
     # Numerical: median impute -> standard scale (robust to outliers/skew)
     num_transformer = Pipeline([
@@ -398,12 +512,35 @@ def build_model_pipeline(X_train, model_type, model_params):
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
-    return Pipeline([
+    # Return full pipeline
+    # return Pipeline([
+    #     ('preprocessor', preprocessor),
+    #     ('dropper', dropper),
+    #     ('selector', selector),
+    #     ('clf', clf)
+    # ])
+    
+    # Initialize pipeline step list
+    steps = [
         ('preprocessor', preprocessor),
         ('dropper', dropper),
         ('selector', selector),
-        ('clf', clf)
-    ])
+    ]
+    
+    # Add under-sampler if ratio was provided and data needs to be under-sampled
+    if target_ratio is not None:
+        n_pos, n_neg = np.sum(y_train == 1), np.sum(y_train == 0)
+        if n_neg > 0:
+            current_ratio = n_pos / n_neg
+            if current_ratio < target_ratio:
+                # print(f"   [Balancing] Current: {current_ratio:.3f} < Target: {target_ratio}")
+                sampler = RandomUnderSampler(sampling_strategy=target_ratio, random_state=42)
+                steps.append(('sampler', sampler))
+    
+    # Add model
+    steps.append(('clf', clf))
+
+    return ImbPipeline(steps)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 # Run configuration and task (data collator) definition
 hf_data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/teav
-result_dir: results  # base directory name for all results
+result_dir: results_tda_all  # base directory name for all results
 data_collator:
   eav_mappings:
     entity_id: entity
@@ -9,23 +9,17 @@ data_collator:
   time_mapping:
     days_since_tpx: time
   mlm_masking_rules:  # these numbers will set the result subdirectory name
-    # {"entity_id": 0.00, "attribute_id": 0.00, "value_id": 0.15} NOT NOW
-    # {"entity_id": 0.00, "attribute_id": 0.00, "value_id": 0.25}  # TRIED THIS ONE WITH LORA
-    # {"entity_id": 0.00, "attribute_id": 0.00, "value_id": 0.45} NOT NOW
-    # {"entity_id": 0.00, "attribute_id": 0.00, "value_id": 0.75} NOT NOW
-    # {"entity_id": 0.00, "attribute_id": 0.05, "value_id": 0.15} NOT NOW
-    # {"entity_id": 0.00, "attribute_id": 0.15, "value_id": 0.45} NOT NOW
-    # {"entity_id": 0.00, "attribute_id": 0.25, "value_id": 0.75} NOT NOW
-    {"entity_id": 0.05, "attribute_id": 0.15, "value_id": 0.25}
-    # {"entity_id": 0.15, "attribute_id": 0.25, "value_id": 0.45}
-    # {"entity_id": 0.05, "attribute_id": 0.05, "value_id": 0.05}  NOW NOW
+    # {"entity_id": 0.00, "attribute_id": 0.00, "value_id": 0.15}
+    # {"entity_id": 0.00, "attribute_id": 0.00, "value_id": 0.75}
+    # {"entity_id": 0.05, "attribute_id": 0.15, "value_id": 0.25}
+    {"entity_id": 0.15, "attribute_id": 0.25, "value_id": 0.45}
     # {"entity_id": 0.15, "attribute_id": 0.15, "value_id": 0.15}
     # {"entity_id": 0.25, "attribute_id": 0.25, "value_id": 0.25}
-    # {"entity_id": 0.35, "attribute_id": 0.35, "value_id": 0.35}  # TRIED THIS ONE WITH LORA
+    # {"entity_id": 0.35, "attribute_id": 0.35, "value_id": 0.35}
   mlm_label_keys:
-    - entity_id         # mlm task must predict 'entity_id' labels
-    - attribute_id      # mlm task must predict 'attribute_id' labels
-    - value_id          # mlm task must predict 'value_id' labels
+    - entity_id     # mlm task must predict 'entity_id' labels
+    - attribute_id  # mlm task must predict 'attribute_id' labels
+    - value_id      # mlm task must predict 'value_id' labels
 
 # PRETRAINING A FULL MODERN BERT MODEL TAKES UP TO 1 HOUR PER MASKING STRATEGY
 # FINETUNING TAKES UP TO 30 MINUTES PER TASK IF JOINTLY-TRAINED, OR PER HORIZON IF NOT
@@ -39,7 +33,7 @@ prediction_tasks:  # horizon elements can be lists (multi-label) or integers / s
   infection_bacteria: {fups: [0,  30,  60,  90,  180, 365], horizons: [[ 30,  60,  90]]}
   infection_virus:    {fups: [0,  30,  60,  90,  180, 365], horizons: [[ 30,  60,  90]]}
   infection_fungi:    {fups: [0,  30,  60,  90,  180, 365], horizons: [[ 30,  60,  90]]}
-  infection:          {fups: [0,  30,  60,  90,  180, 365], horizons: [[ 30,  60,  90]]}
+  # infection:          {fups: [0,  30,  60,  90,  180, 365], horizons: [[ 30,  60,  90]]}
   graft_loss:         {fups: [0, 180, 365, 730, 1095],      horizons: [[180, 365, 730, 1095]]}
   death:              {fups: [0, 180, 365, 730, 1095],      horizons: [[180, 365, 730, 1095]]}
 
