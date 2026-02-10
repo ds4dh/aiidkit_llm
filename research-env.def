@@ -1,5 +1,5 @@
 Bootstrap: docker
-From: nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04
+From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
 
 %files
     pyproject.toml /opt/pyproject.toml
@@ -11,33 +11,36 @@ From: nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04
     export PATH="/opt/venv/bin:$PATH"
     export PYTHONPATH="${PWD}:${PYTHONPATH}"
 
+    # Avoid writes to /root or a read-only $HOME inside SIF
+    export MPLCONFIGDIR=/tmp/matplotlib
+    export XDG_CACHE_HOME=/tmp/.cache
+    export XDG_CONFIG_HOME=/tmp/.config
+
 %post
-    # Set up permissions inside the container
     chmod 1777 /tmp
+    mkdir -p /tmp/matplotlib /tmp/.cache /tmp/.config
     export DEBIAN_FRONTEND=noninteractive
 
-    # Install system dependencies 
     apt-get update && apt-get install -y \
-    python3-pip python3-venv git curl build-essential ninja-build nvtop screen
+      python3-pip python3-venv git curl build-essential ninja-build nvtop screen
 
-    # Create venv
     curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="/usr/local/bin" sh
+
     uv venv /opt/venv
     . /opt/venv/bin/activate
 
-    # Install dependencies
     cd /opt
-    uv pip install -r pyproject.toml --extra dev
+    uv pip install -e ".[dev]"
     uv pip install flash-attn --no-build-isolation
 
 %test
-    echo "Running tests..."
     . /opt/venv/bin/activate
+    python3 -c "import sklearn; print('sklearn', sklearn.__version__)"
+    python3 -c "import cuml; print('cuml import OK')"
     python3 -c "import torch; print(f'Torch: {torch.__version__}, CUDA: {torch.version.cuda}')"
     python3 -c "import cupy; print(f'CuPy: {cupy.__version__}')"
+    python3 -c "import captum; print(f'Captum: {captum.__version__}')"
     python3 -c "import flash_attn; print(f'Flash Attn: {flash_attn.__version__}')"
-    
-    echo "All tests passed!"
 
 %runscript
     exec /bin/bash "$@"

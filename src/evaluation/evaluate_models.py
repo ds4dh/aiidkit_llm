@@ -1,23 +1,12 @@
+import os
 import wandb
 import numpy as np
 import torch
-from transformers.trainer_utils import EvalPrediction
+import warnings
+warnings.simplefilter(action="ignore", category=FutureWarning)
+warnings.simplefilter(action="ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=SyntaxWarning, module="hdbscan")
 
-import optuna
-from optuna.samplers import TPESampler
-optuna.logging.set_verbosity(optuna.logging.WARNING)
-import umap
-import hdbscan
-import cupy as cp
-import cuml
-import gc
-import io
-from contextlib import redirect_stdout
-
-import plotly.graph_objects as go
-from plotly.colors import qualitative
-from scipy.stats import hmean, gmean
-from scipy.special import expit
 from sklearn.calibration import calibration_curve
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import (
@@ -26,12 +15,36 @@ from sklearn.metrics import (
     brier_score_loss, accuracy_score, balanced_accuracy_score,
     precision_score, recall_score, f1_score,
 )
+from transformers.trainer_utils import EvalPrediction
+from scipy.stats import hmean, gmean
+from scipy.special import expit
 
-import warnings
-warnings.simplefilter(action="ignore", category=FutureWarning)
-warnings.simplefilter(action="ignore", category=UserWarning)
-import src.constants as constants
-csts = constants.ConstantsNamespace()
+import optuna
+from optuna.samplers import TPESampler
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+import umap
+import hdbscan
+import gc
+import io
+from contextlib import redirect_stdout
+import plotly.graph_objects as go
+from plotly.colors import qualitative
+
+from functools import lru_cache
+@lru_cache(maxsize=1)
+def _get_gpu_backend():
+    """
+    Return (cp, cuml, error_str). Cached so we try import once per process.
+    """
+    if os.environ.get("AIIDKIT_DISABLE_GPU", "").lower() in {"1", "true", "yes"}:
+        return None, None, "Disabled by AIIDKIT_DISABLE_GPU"
+    try:
+        print("Importing cupy and cuml...")
+        import cupy as cp
+        import cuml
+        return cp, cuml, ""
+    except Exception as e:
+        return None, None, f"{type(e).__name__}: {e}"
 
 
 class UMAP_HDBSCAN_Clusterer:
@@ -157,71 +170,76 @@ class UMAP_HDBSCAN_Clusterer:
     def predict(
         self,
         embeddings: np.ndarray,
-        compute_clusters: bool=True,
-        use_cuml: bool=False,
-        **kwargs,
-    ) -> tuple[np.ndarray, np.ndarray|None]:
+        compute_clusters: bool = True,
+        use_cuml: bool = False,
+        **kwargs
+    ):
         """
         Reduce a set of embeddings with UMAP and cluster them with HDBSCAN
         """
-        # Filter kwargs to create dictionaries for each function
         UMAP_KEYS = {"n_components", "n_neighbors", "min_dist"}
         HDBSCAN_KEYS = {"min_cluster_size", "min_samples"}
         umap_args = {k: v for k, v in kwargs.items() if k in UMAP_KEYS}
         hdbscan_args = {k: v for k, v in kwargs.items() if k in HDBSCAN_KEYS}
 
-        # Using CUML for GPU acceleration
         if use_cuml:
-            return self.reduce_and_cluster_gpu(
-                embeddings,
-                compute_clusters=compute_clusters,
-                umap_args=umap_args,
-                hdbscan_args=hdbscan_args,
-            )
+            cp, cuml, err = _get_gpu_backend()
+            if cp is None:
+                # Optional: only print once, because _get_gpu_backend is cached.
+                print(f"GPU mode disabled (cuml/cupy unavailable): {err}")
+            else:
+                try:
+                    return self.reduce_and_cluster_gpu(
+                        embeddings,
+                        compute_clusters=compute_clusters,
+                        umap_args=umap_args,
+                        hdbscan_args=hdbscan_args,
+                        cp=cp,
+                        cuml=cuml,
+                    )
+                except Exception as e:
+                    print(f"GPU clustering failed, falling back to CPU: {type(e).__name__}: {e}")
 
-        # Fall back to CPU if GPU is unavailable
-        else:
-            return self.reduce_and_cluster_cpu(
-                embeddings,
-                compute_clusters=compute_clusters,
-                umap_args=umap_args,
-                hdbscan_args=hdbscan_args,
-            )
+        return self.reduce_and_cluster_cpu(
+            embeddings,
+            compute_clusters=compute_clusters,
+            umap_args=umap_args,
+            hdbscan_args=hdbscan_args,
+        )
 
     @staticmethod
     def reduce_and_cluster_gpu(
         embeddings: np.ndarray,
-        compute_clusters=True,
-        umap_args: dict[str, int|float|str]={},
-        hdbscan_args: dict[str, int|float|str]={},
+        compute_clusters: bool = True,
+        umap_args: dict | None = None,
+        hdbscan_args: dict | None = None,
+        *, cp, cuml,
     ):
         """
         Reduce embeddings with UMAP and cluster them with HDBSCAN on GPU
         """
-        # Compute dimensionality-reduced embeddings on GPU
-        embeddings_gpu = cp.asarray(embeddings, dtype=cp.float16)
+        umap_args = umap_args or {}
+        hdbscan_args = hdbscan_args or {}
+        
+        embeddings_gpu = cp.asarray(embeddings, dtype=cp.float32)
         reducer = cuml.UMAP(**umap_args, verbose=False)
-        with redirect_stdout(io.StringIO()):  # suppressing an info message
-            reduced_embeddings_gpu = reducer.fit_transform(embeddings_gpu)
-
-        # Move result back to CPU and return, if no clustering is needed
+        with redirect_stdout(io.StringIO()):
+            reduced_gpu = reducer.fit_transform(embeddings_gpu)
+            
         if not compute_clusters:
-            return cp.asnumpy(reduced_embeddings_gpu), None
+            return cp.asnumpy(reduced_gpu).astype(np.float32), None
 
-        # Compute clusters on GPU
         clusterer = cuml.cluster.hdbscan.HDBSCAN(**hdbscan_args, verbose=False)
-        cluster_labels_gpu = clusterer.fit_predict(reduced_embeddings_gpu)
+        labels_gpu = clusterer.fit_predict(reduced_gpu)
+        reduced = cp.asnumpy(reduced_gpu).astype(np.float32)
+        labels = cp.asnumpy(labels_gpu).astype(np.int32)  # keep labels integral
 
-        # Move results back to CPU
-        reduced_embeddings = cp.asnumpy(reduced_embeddings_gpu).astype(np.float32)
-        cluster_labels = cp.asnumpy(cluster_labels_gpu).astype(np.float32)
-
-        # Free GPU memory used by CUML
-        del embeddings_gpu, reduced_embeddings_gpu, cluster_labels_gpu
+        del embeddings_gpu, reduced_gpu, labels_gpu
         gc.collect()
         cp.get_default_memory_pool().free_all_blocks()
-        
-        return reduced_embeddings, cluster_labels
+
+        return reduced, labels
+
 
     @staticmethod
     def reduce_and_cluster_cpu(
@@ -411,8 +429,8 @@ class BaseEmbeddingEvaluatorForClassification:
         if valid_early_stopping_metric:
             valid_early_stopping_metric = np.array(valid_early_stopping_metric) + 1e-6
             # metrics["early_stopping_metric"] = np.mean(valid_early_stopping_metric)
-            # metrics["early_stopping_metric"] = gmean(valid_early_stopping_metric)
-            metrics["early_stopping_metric"] = hmean(valid_early_stopping_metric)
+            # metrics["early_stopping_metric"] = hmean(valid_early_stopping_metric)
+            metrics["early_stopping_metric"] = gmean(valid_early_stopping_metric)
         else:
             metrics["early_stopping_metric"] = 0.0  # fallback if nothing valid
 

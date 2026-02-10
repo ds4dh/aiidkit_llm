@@ -2,65 +2,59 @@
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
-# Metadata
 [project]
 name = "aiidkit_llm"
 version = "0.1.0"
 description = "A project to train discriminative and generative LLMs to predict infections in post-transplant patient trajectories."
 readme = "README.md"
-authors = [
-    { name = "Alban Bornet", email = "alban.bornet@gmail.com" },
-    { name = "Yamil Vindas", email = "yamil.vindasyassine@unige.ch" },
-    { name = "Mohammadreza Alizadeh", email = "mohammadreza.alizadeh@unige.ch" },
-    { name = "Mélanie Huck", email = "melanie.huck@etu.unige.ch"},
-]
+authors = [{ name = "Alban Bornet", email = "alban.bornet@unige.ch" }]
 license = { text = "MIT" }
-requires-python = ">=3.11"
-classifiers = [
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
-]
 
-# Dependencies (uv pip install -e .)
+# Keep Python bounded to avoid “works on 3.11, breaks on 3.12” wheel drift.
+requires-python = ">=3.11,<3.13"
+
 dependencies = [
-    "trl[vllm]==0.25.1",
-    "peft",
-    "sentence-transformers",
-    "optuna",
-    "pandas",
-    "matplotlib",
-    "plotly",
-    "cudf-cu12==25.10.*",
-    "cuml-cu12==25.10.*",
-    "umap-learn",
-    "hdbscan",
-    "lifelines",
-    "wandb",
-    "seaborn",
-    "openpyxl",
-    "kaleido",
+  # LLM stack
+  "trl[vllm]==0.25.1",
+  "peft",
+  "sentence-transformers",
+  "captum>=0.8,<1.0",
+
+  # Core science stack (aligned with cuML required constraints)
+  "numpy>=1.26,<2.0",
+  "scipy>=1.11,<2.0",
+  "numba>=0.60.0,<0.62.0",
+  "scikit-learn>=1.6,<1.8",
+
+  # RAPIDS GPU stack (CUDA 12)
+  "cupy-cuda12x>=13.6.0",
+  "treelite==4.4.1",
+  "cudf-cu12==25.10.*",
+  "cuml-cu12==25.10.*",
+
+  # ML stack
+  "xgboost>=2.1.0",
+  "umap-learn==0.5.7",
+  "hdbscan>=0.8.39,<0.8.40",
+
+  # Experiment / data / visualization
+  "optuna",
+  "pandas>=2.2,<3",
+  "matplotlib",
+  "plotly",
+  "seaborn",
+  "openpyxl",
+  "kaleido",
+  "tabulate",
+  "adjustText",
+  "lifelines",
+  "wandb",
+  "tqdm",
 ]
 
-# Project links
-[project.urls]
-Homepage = "https://github.com/ds4dh/aiidkit_llm"
-Repository = "https://github.com/ds4dh/aiidkit_llm"
-
-# Development dependencies (uv pip install -e ".[dev]")
 [project.optional-dependencies]
-dev = [
-    "ipdb",
-    "pytest",
-    "pytest-mock",
-]
+dev = ["ipdb", "pytest", "pytest-mock"]
 
-# Package discovery
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*"]
-
-# # Configuration for Pytest
-# [tool.pytest.ini_options]
-# minversion = "7.0"
-# testpaths = ["tests"]

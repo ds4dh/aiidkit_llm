@@ -1,6 +1,6 @@
 # Run configuration and task (data collator) definition
 hf_data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/teav
-result_dir: results_tda_all  # base directory name for all results
+result_dir: results_optuna_big  # base directory name for all results
 data_collator:
   eav_mappings:
     entity_id: entity
@@ -8,34 +8,34 @@ data_collator:
     value_id: value_binned
   time_mapping:
     days_since_tpx: time
-  mlm_masking_rules:  # these numbers will set the result subdirectory name
-    # {"entity_id": 0.00, "attribute_id": 0.00, "value_id": 0.15}
-    # {"entity_id": 0.00, "attribute_id": 0.00, "value_id": 0.75}
-    # {"entity_id": 0.05, "attribute_id": 0.15, "value_id": 0.25}
-    {"entity_id": 0.15, "attribute_id": 0.25, "value_id": 0.45}
-    # {"entity_id": 0.15, "attribute_id": 0.15, "value_id": 0.15}
-    # {"entity_id": 0.25, "attribute_id": 0.25, "value_id": 0.25}
-    # {"entity_id": 0.35, "attribute_id": 0.35, "value_id": 0.35}
   mlm_label_keys:
     - entity_id     # mlm task must predict 'entity_id' labels
     - attribute_id  # mlm task must predict 'attribute_id' labels
     - value_id      # mlm task must predict 'value_id' labels
-
-# PRETRAINING A FULL MODERN BERT MODEL TAKES UP TO 1 HOUR PER MASKING STRATEGY
-# FINETUNING TAKES UP TO 30 MINUTES PER TASK IF JOINTLY-TRAINED, OR PER HORIZON IF NOT
+  mlm_masking_rules:  # these numbers will set the result subdirectory name
+    {"entity_id": 0.15, "attribute_id": 0.25, "value_id": 0.45}
 
 # Configuration for finetuning tasks to run
 train_data_augment: all  # "all", "none", "valid", whether other fups are added to training samples
 target_undersampling_ratio: 10.0  # maximum ratio of positive to negative samples during training
 early_stopping_metric: roc_auc  # metric to use for early stopping (per label, then averaged)
 prediction_tasks:  # horizon elements can be lists (multi-label) or integers / singletons (binary)
-  # infection_bacteria: {fups: [0, 30, 90], horizons: [[30, 60, 90, 275, 335, 365]]}  # Mélanie's version
+  # # infection_bacteria: {fups: [0, 30, 90], horizons: [[30, 60, 90, 275, 335, 365]]}  # Mélanie's version
   infection_bacteria: {fups: [0,  30,  60,  90,  180, 365], horizons: [[ 30,  60,  90]]}
-  infection_virus:    {fups: [0,  30,  60,  90,  180, 365], horizons: [[ 30,  60,  90]]}
-  infection_fungi:    {fups: [0,  30,  60,  90,  180, 365], horizons: [[ 30,  60,  90]]}
-  # infection:          {fups: [0,  30,  60,  90,  180, 365], horizons: [[ 30,  60,  90]]}
-  graft_loss:         {fups: [0, 180, 365, 730, 1095],      horizons: [[180, 365, 730, 1095]]}
-  death:              {fups: [0, 180, 365, 730, 1095],      horizons: [[180, 365, 730, 1095]]}
+  # infection_virus:    {fups: [0,  30,  60,  90,  180, 365], horizons: [[ 30,  60,  90]]}
+  # # infection_fungi:    {fups: [0,  30,  60,  90,  180, 365], horizons: [[ 30,  60,  90]]}
+  # # infection:          {fups: [0,  30,  60,  90,  180, 365], horizons: [[ 30,  60,  90]]}
+  # graft_loss:         {fups: [0, 180, 365, 730, 1095],      horizons: [[180, 365, 730, 1095]]}
+  # death:              {fups: [0, 180, 365, 730, 1095],      horizons: [[180, 365, 730, 1095]]}
+
+# Arguments for optuna run (perform both pretraining and finetuning for different hyper-parameters)
+optuna:
+  metric_to_optimize: val_all_roc_auc  # if possible, will add prediction tasks common denominator
+  num_trials: 50
+  num_trials_debug: 2
+  skip_pretraining_if_ckpt_exists: true
+  db_name: optuna_study.db
+  study_name: pretraining_finetuning_hp_optimization
 
 # Arguments for HF's trainer for the pre-training phase
 pretrainer:
@@ -59,7 +59,7 @@ pretrainer:
   load_best_model_at_end: true  # required for early stopping
   metric_for_best_model: eval_mlm_accuracy  # format: "eval_" + metric name
   greater_is_better: true
-  early_stopping_patience: 10  # evaluations without improvement before stopping
+  early_stopping_patience: 5  # evaluations without improvement before stopping
 
 # Arguments for HF's trainer for the fine-tuning phase
 finetuner:
@@ -83,7 +83,7 @@ finetuner:
   load_best_model_at_end: true
   metric_for_best_model: eval_all_early_stopping_metric  # see evaluator arguments
   greater_is_better: true
-  early_stopping_patience: 20  # evaluations without improvement before stopping
+  early_stopping_patience: 10  # evaluations without improvement before stopping
 
 # LoRA configuration for fine-tuning (experimentally, it did not improve results)
 use_lora: false  # false for full fine-tuning
@@ -110,10 +110,12 @@ model:
     eos_token_id: 3
     sep_token_id: 3
     # Comment below for default ModernBERT config (so far provided better results)
+    # Careful! Layer types should match num_hidden_layers and end with full_attention!
     # num_hidden_layers: 4      #   4 //    8 //   12
     # num_attention_heads: 4    #   4 //    8 //   12
     # hidden_size: 128          # 128 //  256 //  512
     # intermediate_size: 512    # 512 // 1024 // 2048
+    # layer_types: [full_attention, sliding_attention, sliding_attention, full_attention]
   model_args:
     dtype: bfloat16
     attn_implementation: sdpa  # flash_attention_2 will create a shape mismatch in ModernBERT, with input_embeds as input

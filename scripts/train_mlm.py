@@ -5,6 +5,7 @@ import torch
 import wandb
 from pathlib import Path
 from transformers import Trainer, TrainingArguments, EarlyStoppingCallback
+from src.utils import apply_config_overrides
 from src.data.patient_dataset import load_hf_data_and_metadata
 from src.model.patient_embedder import PatientEmbeddingModelFactory
 from src.model.patient_embedder import PatientDataCollatorForMaskedLanguageModelling
@@ -16,7 +17,8 @@ from src.evaluation.evaluate_models import (
 CLI_CFG: dict[str, dict] = {}
 parser = argparse.ArgumentParser(description="Train a UMLS normalization model.")
 parser.add_argument("--config", "-c", type=str, default="configs/discriminative_training.yaml")
-parser.add_argument("--debug", "-d", action="store_true", help="Disable wandb logging for debugging.")
+parser.add_argument("--silent", "-s", action="store_true", help="Disable wandb logging.")
+parser.add_argument("--overrides", "-o", type=str, default="{}", help="Overrides config (JSON string).")
 
 
 def main():
@@ -35,8 +37,10 @@ def main():
         eav_mappings=eav_mappings,
     )
     dataset = {
-        k: v.map(lambda x: {"split": k}, desc="Tagging split", num_proc=8)
-        for k, v in dataset.items()
+        k: v.map(
+            lambda x: {"split": k}, desc="Tagging split",
+            num_proc=8, load_from_cache_file=False,
+        ) for k, v in dataset.items()
     }
 
     # Initialize custom patient embedding model for masked language modelling
@@ -63,11 +67,11 @@ def main():
     run_id = "-".join([f"{k[0]}{int(v * 100):02d}" for k, v in mlm_masking_rules.items()])
     pt_cfg = CLI_CFG["pretrainer"].copy()
     pt_cfg["output_dir"] = str(Path(CLI_CFG["result_dir"]) / run_id / "pretraining")
-    if cli_args.debug: pt_cfg["report_to"] = "none"
+    if cli_args.silent: pt_cfg["report_to"] = "none"
     pt_args = TrainingArguments(**pt_cfg)
 
     # Re-initialize a wandb run within the same worspace
-    use_wandb = (not cli_args.debug) and (CLI_CFG.get("pretrainer", {}).get("report_to") == "wandb")
+    use_wandb = (not cli_args.silent) and (CLI_CFG.get("pretrainer", {}).get("report_to") == "wandb")
     if use_wandb:
         workspace = Path(__file__).stem
         wandb.init(project=workspace, name=run_id, config=CLI_CFG)
@@ -98,4 +102,5 @@ if __name__ == "__main__":
     cli_args = parser.parse_args()
     with open(cli_args.config, 'r') as f:
         CLI_CFG = yaml.safe_load(f)
+    CLI_CFG = apply_config_overrides(CLI_CFG, cli_args.overrides)
     main()

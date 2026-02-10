@@ -11,6 +11,7 @@ from datasets import Dataset
 from transformers import Trainer, TrainingArguments, EarlyStoppingCallback
 from transformers.trainer_utils import get_last_checkpoint
 from peft import LoraConfig, get_peft_model
+from src.utils import apply_config_overrides
 from src.data.patient_dataset import load_hf_data_and_metadata
 from src.model.model_utils import make_loss_func, compute_loss_args
 from src.model.patient_embedder import PatientEmbeddingModelFactory
@@ -21,12 +22,14 @@ from src.evaluation.evaluate_models import (
 )
 
 CLI_CFG: dict[str, dict] = {}
-safe_num_proc = max(1, len(os.sched_getaffinity(0)) - 2)
+SAFE_NUM_PROCS = 4  # max(1, len(os.sched_getaffinity(0)) - 2)
+
 parser = argparse.ArgumentParser(description="Fine-tune a model to predict future infections.")
 parser.add_argument("--config", "-c", type=str, default="configs/discriminative_training.yaml")
 parser.add_argument("--reset_weights", "-r", action="store_true", help="Whether to reset model weights before fine-tuning.")
 parser.add_argument("--plot_only", "-p", action="store_true", help="Skip run and goes directly to the plot.")
-parser.add_argument("--debug", "-d", action="store_true", help="Disable wandb logging for debugging.")
+parser.add_argument("--silent", "-s", action="store_true", help="Disable wandb logging.")
+parser.add_argument("--overrides", "-o", type=str, default="{}", help="Overrides config (JSON string).")
 cli_args = parser.parse_args()
 
 
@@ -121,11 +124,13 @@ def finetune_disciminative_model(
     )
 
     # Prepare training dataset
-    filter_valid = lambda x: all(x[k] != -100 for k in label_keys)
-    dataset = dataset.filter(filter_valid, num_proc=safe_num_proc)
+    dataset = dataset.filter(
+        lambda x: all(x[k] != -100 for k in label_keys), desc="Keeping valid labels",
+        num_proc=SAFE_NUM_PROCS, load_from_cache_file=False,
+    )
     train_dataset = dataset["train"].map(
-        lambda x: {"split": "train"},
-        desc="Tagging split", num_proc=safe_num_proc,
+        lambda x: {"split": "train"}, desc="Tagging split",
+        num_proc=SAFE_NUM_PROCS, load_from_cache_file=False,
     )
     eval_datasets = prepare_dataset_fup_dict(dataset["validation"], "val", fup_valid)
     test_datasets = prepare_dataset_fup_dict(dataset["test"], "test", fup_test)
@@ -180,11 +185,11 @@ def finetune_disciminative_model(
     task_subdir = f"hrz({hrz_str})_fut({fut_str})_fuv({fuv_str})"
     run_subdir = str(Path(task_key) / task_subdir)
     ft_cfg["output_dir"] = str(finetuning_dir / run_subdir)
-    if cli_args.debug: ft_cfg["report_to"] = "none"
+    if cli_args.silent: ft_cfg["report_to"] = "none"
     ft_args = TrainingArguments(**ft_cfg)
 
     # Re-initialize a wandb run within the same worspace
-    use_wandb = (not cli_args.debug) and (CLI_CFG.get("finetuner", {}).get("report_to") == "wandb")
+    use_wandb = (not cli_args.silent) and (CLI_CFG.get("finetuner", {}).get("report_to") == "wandb")
     if use_wandb:
         workspace = Path(__file__).stem
         run_name = f"{run_id}_{run_subdir}"
@@ -244,14 +249,14 @@ def prepare_dataset_fup_dict(
     """
     out_dict = {"all": dataset.map(
         lambda x: {"split": f"{prefix_name}_all"},
-        desc="Tagging split", num_proc=safe_num_proc,
+        desc="Tagging split", num_proc=SAFE_NUM_PROCS,
     )}
     for fup in fup_list:
-        subset = dataset.filter(lambda x: x["fup"] == fup, num_proc=safe_num_proc)
+        subset = dataset.filter(lambda x: x["fup"] == fup, num_proc=SAFE_NUM_PROCS)
         if len(subset) > 0:
             out_dict[f"fup_{fup:04d}"] = subset.map(
                 lambda x: {"split": f"{prefix_name}_{fup}"},
-                desc="Tagging split", num_proc=safe_num_proc,
+                desc="Tagging split", num_proc=SAFE_NUM_PROCS,
             )
         else:
             print(f"Warning: No labeled samples found for follow-up {fup} in {prefix_name}.")
@@ -307,4 +312,5 @@ def scan_all_fups(data_dir: Path) -> list[int]:
 if __name__ == "__main__":
     with open(cli_args.config, 'r') as f:
         CLI_CFG = yaml.safe_load(f)
+    CLI_CFG = apply_config_overrides(CLI_CFG, cli_args.overrides)
     main()

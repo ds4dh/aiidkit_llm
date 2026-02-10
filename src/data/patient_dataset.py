@@ -3,18 +3,22 @@ import os
 import pickle
 import numpy as np
 import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
 from typing import Any
 from pathlib import Path
 from filelock import FileLock
+from tqdm import tqdm
 from collections import defaultdict
-from datasets import Dataset, DatasetDict, load_from_disk, concatenate_datasets
-import src.constants as constants
-csts = constants.ConstantsNamespace()
-safe_num_proc = max(1, len(os.sched_getaffinity(0)) - 2)
+from datasets import Dataset, DatasetDict, load_from_disk, concatenate_datasets, disable_caching
+disable_caching()
+SAFE_NUM_PROCS = 4  # max(1, len(os.sched_getaffinity(0)) - 2)
+BIN_LABELS = ["Lowest", "Lower", "Low", "Middle", "High", "Higher", "Highest"]
 
 
 def load_hf_data_and_metadata(
     data_dir: str,
+    sanity_check_output_dir: str | None = None,
     fup_train: int | list[int] | None = None,
     fup_valid: int | list[int] | None = None,
     fup_test: int | list[int] | None = None,
@@ -70,6 +74,8 @@ def load_hf_data_and_metadata(
     
     # Create bin intervals in pretraining mode, apply existing ones in finetuning mode
     dataset, bin_intervals = bin_values_by_attribute(dataset, existing_bins=bin_intervals)
+    if sanity_check_output_dir is not None:
+        plot_category_distributions(dataset, bin_intervals, output_dir=sanity_check_output_dir)
     if vocab is None:  # in pretraining mode, compute new vocabulary
         base_vocab = {"[PAD]": 0, "[MASK]": 1, "[BOS]": 2, "[EOS]": 3, "[UNK]": 4}
         vocab = get_vocab(dataset, base_vocab=base_vocab, eav_keys=list(eav_mappings.values()))
@@ -81,12 +87,18 @@ def load_hf_data_and_metadata(
             eav_key: [vocab.get(token_id, unk_id) for token_id in example[eav_raw]]
             for eav_key, eav_raw in eav_mappings.items()
         }
-    dataset = dataset.map(map_to_ids, desc="Mapping tokens to IDs", num_proc=safe_num_proc)
+    dataset = dataset.map(
+        map_to_ids, desc="Mapping tokens to IDs", num_proc=SAFE_NUM_PROCS,
+        load_from_cache_file=False, keep_in_memory=True,
+    )
 
     # Final formatting
     time_key, time_key_raw = list(time_mapping.keys())[0], list(time_mapping.values())[0]
     clean_time_fn = lambda x: {time_key: [0.0 if pd.isna(t) else t for t in x[time_key_raw]]}
-    dataset = dataset.map(clean_time_fn, desc="Cleaning time entries", num_proc=safe_num_proc)
+    dataset = dataset.map(
+        clean_time_fn, desc="Cleaning time entries", num_proc=SAFE_NUM_PROCS,
+        load_from_cache_file=False, keep_in_memory=True,
+    )
     all_cols = dataset["train"].column_names
     label_cols = [c for c in all_cols if c.startswith("label_")]
     teav_cols = list(eav_mappings.keys()) + [time_key] + list(eav_mappings.values())
@@ -119,7 +131,7 @@ def _load_and_tag(
     """Loads specific follow-up folders, tags follow-up, concatenates."""
     fups = fup_input if isinstance(fup_input, list) else [fup_input]
     datasets = []
-    for fup in fups:
+    for fup in tqdm(fups, desc=f"Loading {split} data from listed follow-up periods"):
         suffix = f"{fup:04d}" if fup is not None else "None"
         folder_path = root_path / f"fup_{suffix}"
         if not folder_path.exists():
@@ -166,17 +178,13 @@ def get_vocab(
 def bin_values_by_attribute(
     dataset: DatasetDict,
     existing_bins: dict[str, pd.IntervalIndex] | None = None,
-    bin_labels: list[str] = None,
     attribute_key: str = "attribute",
     value_key: str = "value",
 ) -> tuple[DatasetDict, dict[str, np.ndarray]]:
     """
     Bins numerical values. If existing bins are provided, uses those intervals
     instead of computing new ones (important for finetuning vs pretraining).
-    """
-    if bin_labels is None:
-        bin_labels = ["Lowest", "Lower", "Low", "Middle", "High", "Higher", "Highest"]
-        
+    """ 
     # Group training and validation longitudinal sample values by attribute
     train_val_data = concatenate_datasets([dataset["train"], dataset["validation"]])
     values_by_attr = defaultdict(list)
@@ -206,9 +214,12 @@ def bin_values_by_attribute(
         for attribute, values in values_by_attr.items():
             if attribute_types[attribute] == "numerical" and len(set(values)) > 10:
                 try:
-                    binned = pd.qcut(x=values, q=len(bin_labels))
+                    values_arr = np.array(values)
+                    noise = np.random.uniform(-1e-6, 1e-6, size=values_arr.shape)
+                    jit_values = values_arr + noise  # but will use true value below!
+                    binned = pd.qcut(x=jit_values, q=len(BIN_LABELS), duplicates='drop')
                 except ValueError:
-                    binned = pd.cut(x=values, bins=len(bin_labels))
+                    binned = pd.cut(x=values, bins=len(BIN_LABELS))
                 bin_intervals[attribute] = binned.categories
             else:
                 attribute_types[attribute] = "categorical"
@@ -216,9 +227,9 @@ def bin_values_by_attribute(
     # Define numerical value binning function
     def bin_sample_values(values: list, attributes: list) -> dict[str, list]:
         values_binned = []
-        labels_map = {i: label for i, label in enumerate(bin_labels)}
+        labels_map = {i: label for i, label in enumerate(BIN_LABELS)}
         
-        # Ensure bin_labels map to indices correctly
+        # Ensure BIN_LABELS map to indices correctly
         for val, attr in zip(values, attributes):
             processed_val = str(val)
 
@@ -234,7 +245,7 @@ def bin_values_by_attribute(
                 # Outlier handling (outside training range)
                 except KeyError:
                     if f_val > bin_intervals[attr].right.max():
-                        processed_val = labels_map[len(bin_labels)-1] # Highest
+                        processed_val = labels_map[len(BIN_LABELS)-1] # Highest
                     else:
                         processed_val = labels_map[0] # Lowest
                 
@@ -256,7 +267,8 @@ def bin_values_by_attribute(
     # Apply the binning
     binned_dataset = dataset.map(
         function=lambda s: bin_sample_values(s[value_key], s[attribute_key]),
-        desc="Binning values", load_from_cache_file=False, num_proc=safe_num_proc,
+        desc="Binning values", num_proc=SAFE_NUM_PROCS,
+        load_from_cache_file=False, keep_in_memory=True,
     )
 
     return binned_dataset, bin_intervals
@@ -325,6 +337,61 @@ def undersample_dataset(
     return dataset.select(final_indices)
 
 
+def plot_category_distributions(
+    dataset: DatasetDict,
+    bin_intervals: dict[str, pd.IntervalIndex],
+    output_dir: str,
+    attribute_key: str = "attribute",
+    value_key: str = "value_binned"
+):
+    """
+    Plots the distribution of values for binned attributes
+    """
+    print(f"Running sanity check: plotting distributions to {output_dir}")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # We only care about attributes that were actually binned (exist in bin_intervals)
+    binned_attrs = set(bin_intervals.keys())
+    
+    # Initialize counters for the relevant attributes
+    counts = defaultdict(lambda: defaultdict(int))
+    
+    # Aggregate counts from the training set
+    for sample in tqdm(dataset["train"], desc="Aggregating plot data"):
+        attrs = sample[attribute_key]
+        vals = sample[value_key]
+        
+        # Zip attributes and values to count pairs
+        for a, v in zip(attrs, vals):
+            if a in binned_attrs:
+                counts[a][v] += 1
+    
+    # Generate and save plots
+    for attr, val_counts in tqdm(counts.items(), desc="Generating plots"):
+
+        # Calculate total for proportions
+        total = sum(val_counts.values())
+        if total == 0:
+            continue
+
+        # Plot raw counts
+        data_y = [val_counts.get(label, 0) for label in BIN_LABELS]
+        plt.figure(figsize=(10, 6))
+        sns.barplot(x=BIN_LABELS, y=data_y, palette="viridis")
+        
+        plt.title(f"Distribution for: {attr}")
+        plt.xlabel("Category")
+        plt.ylabel("Count")
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        
+        # Sanitize filename
+        safe_name = "".join(c if c.isalnum() or c in (' ', '-', '_') else "_" for c in attr).strip()
+        plt.savefig(os.path.join(output_dir, f"{safe_name}.png"))
+        plt.close()
+
+    print(f"Sanity check complete. Plots saved to {output_dir}")
+    
+    
 def format_eav_to_tree(df: pd.DataFrame) -> list[str]:
     """
     Format a dataframe group into a list of tree-like strings

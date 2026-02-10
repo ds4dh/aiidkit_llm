@@ -186,6 +186,7 @@ data/huggingface/*
 *.sif
 archives
 results*
+BACKUP*
 wandb
 digest.txt
 configs/run_configs
