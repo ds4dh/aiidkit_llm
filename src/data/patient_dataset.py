@@ -1,4 +1,3 @@
-
 import os
 import pickle
 import numpy as np
@@ -10,7 +9,11 @@ from pathlib import Path
 from filelock import FileLock
 from tqdm import tqdm
 from collections import defaultdict
-from datasets import Dataset, DatasetDict, load_from_disk, concatenate_datasets, disable_caching
+from datasets import (
+    Dataset, DatasetDict,
+    load_from_disk, concatenate_datasets, disable_caching,
+)
+
 disable_caching()
 SAFE_NUM_PROCS = 4  # max(1, len(os.sched_getaffinity(0)) - 2)
 BIN_LABELS = ["Lowest", "Lower", "Low", "Middle", "High", "Higher", "Highest"]
@@ -31,37 +34,24 @@ def load_hf_data_and_metadata(
         "value_id": "value_binned",
     },
 ) -> tuple[DatasetDict, dict[str, pd.IntervalIndex], dict[str, int]]:
-    """
-    Consumer/creator pattern
-    - if `metadata_cache_key` provided (finetuning), load metadata from cache
-    - if `metadata_cache_key` not provided (pretraining) compute and save metadata
+    """ Build data, using a consumer/creator pattern
+        - if `metadata_cache_key` not provided (pretraining), compute and save metadata
+        - if `metadata_cache_key` provided (finetuning), load metadata from cache
     """
     # Safety checks
     if isinstance(label_keys, str):
-        label_keys = [label_keys]    
+        label_keys = [label_keys]     
     if target_undersampling_ratio is not None and not label_keys:
         raise ValueError("Cannot perform undersampling without valid 'label_keys'.")
-    
+
     # Initialization
     root_path = Path(data_dir)
     metadata_path = root_path / "processed_cache" / "pretraining_metadata"
     is_pretraining = (fup_train is None)
     vocab = None
     bin_intervals = None
-    
-    # In finetuning mode, load reference metadata
-    if not is_pretraining:
-        print(f"Finetuning mode. Loading pretraining metadata from {metadata_path}")
-        if not metadata_path.exists():
-            raise FileNotFoundError(f"Metadata not found at {metadata_path}. Run pre-training first.")
-        with open(metadata_path / "vocab.pkl", "rb") as f:
-            vocab = pickle.load(f)
-        with open(metadata_path / "bin_intervals.pkl", "rb") as f:
-            bin_intervals = pickle.load(f)
-    else:
-        print("Pretraining mode. Bins and vocabulary will be computed and saved.")
-        
-    # Load raw data
+
+    # Load data
     print(f"Loading raw data from disk...")
     dataset = DatasetDict({
         "train": _load_and_tag(
@@ -71,54 +61,180 @@ def load_hf_data_and_metadata(
         "validation": _load_and_tag(root_path, fup_valid, "validation"),
         "test": _load_and_tag(root_path, fup_test, "test"),
     })
-    
-    # Create bin intervals in pretraining mode, apply existing ones in finetuning mode
-    dataset, bin_intervals = bin_values_by_attribute(dataset, existing_bins=bin_intervals)
-    if sanity_check_output_dir is not None:
-        plot_category_distributions(dataset, bin_intervals, output_dir=sanity_check_output_dir)
-    if vocab is None:  # in pretraining mode, compute new vocabulary
-        base_vocab = {"[PAD]": 0, "[MASK]": 1, "[BOS]": 2, "[EOS]": 3, "[UNK]": 4}
-        vocab = get_vocab(dataset, base_vocab=base_vocab, eav_keys=list(eav_mappings.values()))
-    
-    # Map tokens to IDs using vocabulary
-    unk_id = vocab["[UNK]"]
-    def map_to_ids(example):
-        return {
-            eav_key: [vocab.get(token_id, unk_id) for token_id in example[eav_raw]]
-            for eav_key, eav_raw in eav_mappings.items()
-        }
-    dataset = dataset.map(
-        map_to_ids, desc="Mapping tokens to IDs", num_proc=SAFE_NUM_PROCS,
-        load_from_cache_file=False, keep_in_memory=True,
-    )
 
-    # Final formatting
-    time_key, time_key_raw = list(time_mapping.keys())[0], list(time_mapping.values())[0]
-    clean_time_fn = lambda x: {time_key: [0.0 if pd.isna(t) else t for t in x[time_key_raw]]}
-    dataset = dataset.map(
-        clean_time_fn, desc="Cleaning time entries", num_proc=SAFE_NUM_PROCS,
-        load_from_cache_file=False, keep_in_memory=True,
-    )
-    all_cols = dataset["train"].column_names
-    label_cols = [c for c in all_cols if c.startswith("label_")]
-    teav_cols = list(eav_mappings.keys()) + [time_key] + list(eav_mappings.values())
-    cols_to_keep = [*teav_cols, *label_cols, "patientid", "fup"]
-    available_cols = [c for c in cols_to_keep if c in dataset["train"].column_names]
-    dataset.set_format(type="numpy", columns=available_cols)
-
-    # Save metadata only in pretraining mode
-    if is_pretraining:
+    # Metadata: load or compute
+    if not is_pretraining:
+        print(f"Finetuning mode. Loading pretraining metadata from {metadata_path}")
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"Metadata not found at {metadata_path}. Run pre-training first.")
+        with open(metadata_path / "vocab.pkl", "rb") as f:
+            vocab = pickle.load(f)
+        with open(metadata_path / "bin_intervals.pkl", "rb") as f:
+            bin_intervals = pickle.load(f)
+    else:
+        print("Pretraining mode. Computing statistics and vocabulary...")
+        scanned_data = concatenate_datasets([dataset["train"], dataset["validation"]])
+        bin_intervals, vocab = scan_and_compute_metadata(scanned_data)
+        
+        # Save metadata
         print(f"Saving new pre-training metadata to: {metadata_path}")
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
-        lock_path = metadata_path.parent / "pretraining_metadata.lock"
-        with FileLock(lock_path):
+        with FileLock(metadata_path.parent / "pretraining_metadata.lock"):
             metadata_path.mkdir(parents=True, exist_ok=True)
             with open(metadata_path / "bin_intervals.pkl", "wb") as f: 
                 pickle.dump(bin_intervals, f)
             with open(metadata_path / "vocab.pkl", "wb") as f: 
                 pickle.dump(vocab, f)
 
+    # Sanity check, if required
+    if sanity_check_output_dir is not None:
+        plot_category_distributions(dataset, bin_intervals, output_dir=sanity_check_output_dir)
+
+    # Preprocessing (bin values, map tokens to IDs, format time entries)
+    dataset = DatasetDict({
+        split: ds.map(
+            preprocess_batch, batched=True, batch_size=1000, desc=f"Preprocessing {split} set",
+            num_proc=SAFE_NUM_PROCS, load_from_cache_file=False, keep_in_memory=True,
+            fn_kwargs={
+                "vocab": vocab, "bin_intervals": bin_intervals, "bin_labels": BIN_LABELS,
+                "time_mapping": time_mapping, "eav_mappings": eav_mappings,
+            },
+        )
+        for split, ds in dataset.items()
+    })
+
+    # Final formatting and filtering
+    all_cols = dataset["train"].column_names
+    label_cols = [c for c in all_cols if c.startswith("label_")]
+    time_key = list(time_mapping.keys())[0]
+    teav_cols = list(eav_mappings.keys()) + [time_key] 
+    cols_to_keep = [*teav_cols, *label_cols, "patientid", "fup"]
+    available_cols = [c for c in cols_to_keep if c in all_cols]
+    dataset.set_format(type="numpy", columns=available_cols)
+
     return dataset, bin_intervals, vocab
+
+
+def preprocess_batch(batch, vocab, bin_intervals, time_mapping, eav_mappings, bin_labels):
+    """
+    Module-level function to clean time, bin values, and map tokens to IDs in a single pass.
+    """
+    unk_id = vocab["[UNK]"]
+    labels_map = {i: label for i, label in enumerate(bin_labels)}
+    
+    # Process time
+    time_out_key = list(time_mapping.keys())[0]
+    time_in_key = list(time_mapping.values())[0]    
+    out_time = []
+    for seq in batch[time_in_key]:  # handle time cleaning (with NaN -> 0.0)
+        out_time.append([0.0 if (t is None or t != t) else t for t in seq])
+
+    # Process (entity, attribute, value) entries by batch
+    ent_in = eav_mappings["entity_id"]      # usually "entity"
+    attr_in = eav_mappings["attribute_id"]  # usually "attribute"
+    val_in = "value"                        # Raw values
+    out_ent_ids, out_attr_ids, out_val_ids = [], [], []
+    for entities, attributes, values in zip(batch[ent_in], batch[attr_in], batch[val_in]):
+        
+        # Map entity and attribute directly
+        out_ent_ids.append([vocab.get(e, unk_id) for e in entities])
+        out_attr_ids.append([vocab.get(a, unk_id) for a in attributes])
+        
+        # Map values (more complex: binning -> string -> token ID)
+        row_val_ids = []
+        for v, attr in zip(values, attributes):
+            token_str = str(v)
+            
+            # Numerical attribute (needs binning)
+            if attr in bin_intervals:
+                try:
+                    f_val = float(v)
+                    idx = bin_intervals[attr].get_loc(f_val)
+                    token_str = labels_map[idx]
+                except (ValueError, KeyError):
+                    try:  # handle outliers outside training range
+                        if float(v) > bin_intervals[attr].right.max():
+                            token_str = labels_map[len(bin_labels)-1]
+                        else:
+                            token_str = labels_map[0]
+                    except ValueError:
+                        pass  # keep original string if not a float
+            
+            # Categorical attribute (clean formatting)
+            else:
+                try:
+                    token_str = str(int(float(v)))  # "1.0" -> "1" for categorical integers
+                except ValueError:
+                    pass
+            
+            # Map the resulting token string to an ID
+            row_val_ids.append(vocab.get(token_str, unk_id))
+            
+        out_val_ids.append(row_val_ids)
+
+    # Return dictionary matching the model's expected input format
+    return {
+        time_out_key: out_time,
+        "entity_id": out_ent_ids,
+        "attribute_id": out_attr_ids,
+        "value_id": out_val_ids
+    }
+
+
+def scan_and_compute_metadata(dataset, attribute_key="attribute", value_key="value"):
+    """
+    Read-only scan of the dataset to calculate bin intervals and vocabulary.
+    """    
+    values_by_attr = defaultdict(list)
+    unique_tokens = set()
+    attribute_types = defaultdict(lambda: "numerical")
+    
+    # Single pass to collect data
+    for sample in tqdm(dataset, desc="Compute dataset metadata"):
+        unique_tokens.update(sample["entity"])  # add any entity immediately
+        unique_tokens.update(sample["attribute"])  # add any attribute immediately
+        
+        # Collect values
+        for attr, val in zip(sample[attribute_key], sample[value_key]):
+            try:
+                values_by_attr[attr].append(float(val))
+            except ValueError:
+                attribute_types[attr] = "categorical"
+                # If categorical, clean it and add to vocab candidates
+                try:
+                    clean_val = str(int(float(val)))
+                except ValueError:
+                    clean_val = str(val)
+                unique_tokens.add(clean_val)
+
+    # Compute bin intervals
+    bin_intervals = {}
+    for attr, values in values_by_attr.items():
+        # If numerical and enough unique values -> bin it
+        if attribute_types[attr] == "numerical" and len(set(values)) > 10:
+            try:
+                values_arr = np.array(values)
+                noise = np.random.uniform(-1e-6, 1e-6, size=values_arr.shape)
+                binned = pd.qcut(x=values_arr + noise, q=len(BIN_LABELS), duplicates='drop')
+            except ValueError:
+                binned = pd.cut(x=values, bins=len(BIN_LABELS))
+            
+            bin_intervals[attr] = binned.categories
+        else:
+            # Reclassify as categorical if too few values (e.g. {0, 1, 2})
+            attribute_types[attr] = "categorical"
+            for v in set(values):
+                unique_tokens.add(str(int(v)))
+
+    # Build vocabulary (always include special tokens and bin labels)
+    base_vocab = {"[PAD]": 0, "[MASK]": 1, "[BOS]": 2, "[EOS]": 3, "[UNK]": 4}
+    vocab = dict(base_vocab)
+    unique_tokens.update(BIN_LABELS)  # e.g. "Highest", "Low", ...
+    start_idx = len(vocab)
+    for idx, term in enumerate(sorted(list(unique_tokens))):
+        vocab[term] = idx + start_idx
+
+    return bin_intervals, vocab
 
 
 def _load_and_tag(
@@ -128,150 +244,31 @@ def _load_and_tag(
     label_keys: list[str] | None = None,
     target_undersampling_ratio: float | None = None,
 ):
-    """Loads specific follow-up folders, tags follow-up, concatenates."""
+    """Loads specific follow-up folders, tags follow-up, concatenates in-memory."""
     fups = fup_input if isinstance(fup_input, list) else [fup_input]
     datasets = []
+    
     for fup in tqdm(fups, desc=f"Loading {split} data from listed follow-up periods"):
         suffix = f"{fup:04d}" if fup is not None else "None"
         folder_path = root_path / f"fup_{suffix}"
         if not folder_path.exists():
             raise FileNotFoundError(f"Dataset not found: {folder_path}")
+        
+        # Load the dataset (initially memory-mapped from disk)
         ds = load_from_disk(str(folder_path))[split]
         
         # Soft undersampling, usually only for training data
         if target_undersampling_ratio is not None:
             ds = undersample_dataset(ds, label_keys, target_undersampling_ratio)
+            ds = ds.flatten_indices(keep_in_memory=True)
         
-        # Tag samples with fup-integer (use -1 for None, even if not used anyways)
+        # Tag samples with fup-integer (use -1 for None)
         fup_val = fup if fup is not None else -1
-        ds = ds.add_column("fup", [fup_val] * len(ds))
-        
+        ds = ds.add_column("fup", [fup_val] * len(ds))        
         datasets.append(ds)
         
-    return concatenate_datasets(datasets)
-
-
-def get_vocab(
-    dataset: DatasetDict,
-    base_vocab: dict,
-    eav_keys: list[str] = ["entity", "attribute", "value_binned"],
-) -> dict[str, int]:
-    """
-    Computes entity-attribute-value vocabulary from current dataset
-    """
-    # Combine train and validation for vocab building
-    print("Computing new vocabulary...")
-    unique_tokens = set()
-    for sample in concatenate_datasets([dataset["train"], dataset["validation"]]):
-        for key in eav_keys:
-            unique_tokens.update(sample[key])
-    
-    # Build vocabulary dictionary
-    vocab = dict(base_vocab)
-    start_idx = len(vocab)
-    for idx, term in enumerate(sorted(list(unique_tokens))):
-        vocab[term] = idx + start_idx
-    
-    return vocab
-
-
-def bin_values_by_attribute(
-    dataset: DatasetDict,
-    existing_bins: dict[str, pd.IntervalIndex] | None = None,
-    attribute_key: str = "attribute",
-    value_key: str = "value",
-) -> tuple[DatasetDict, dict[str, np.ndarray]]:
-    """
-    Bins numerical values. If existing bins are provided, uses those intervals
-    instead of computing new ones (important for finetuning vs pretraining).
-    """ 
-    # Group training and validation longitudinal sample values by attribute
-    train_val_data = concatenate_datasets([dataset["train"], dataset["validation"]])
-    values_by_attr = defaultdict(list)
-    attribute_types = defaultdict(lambda: "numerical")
-    
-    # Only scan data if we need to compute bins (existing_bins is None)
-    # or if we need to know which attributes are categorical vs numerical for processing
-    for sample in train_val_data:
-        for attribute, value in zip(sample[attribute_key], sample[value_key]):
-            try:
-                if existing_bins is None: 
-                    values_by_attr[attribute].append(float(value))
-            except ValueError:
-                attribute_types[attribute] = "categorical"
-
-    # Compute or assign bin intervals
-    bin_intervals: dict[str, pd.IntervalIndex] = {}
-    
-    # In fine-tuning mode, use the intervals from pre-training
-    if existing_bins is not None:
-        bin_intervals = existing_bins
-        for attr in existing_bins:  # attributes in existing_bins must be numerical
-            attribute_types[attr] = "numerical"
-    
-    # In pretraining mode, compute new intervals
-    else:
-        for attribute, values in values_by_attr.items():
-            if attribute_types[attribute] == "numerical" and len(set(values)) > 10:
-                try:
-                    values_arr = np.array(values)
-                    noise = np.random.uniform(-1e-6, 1e-6, size=values_arr.shape)
-                    jit_values = values_arr + noise  # but will use true value below!
-                    binned = pd.qcut(x=jit_values, q=len(BIN_LABELS), duplicates='drop')
-                except ValueError:
-                    binned = pd.cut(x=values, bins=len(BIN_LABELS))
-                bin_intervals[attribute] = binned.categories
-            else:
-                attribute_types[attribute] = "categorical"
-
-    # Define numerical value binning function
-    def bin_sample_values(values: list, attributes: list) -> dict[str, list]:
-        values_binned = []
-        labels_map = {i: label for i, label in enumerate(BIN_LABELS)}
-        
-        # Ensure BIN_LABELS map to indices correctly
-        for val, attr in zip(values, attributes):
-            processed_val = str(val)
-
-            # Numerical attribute with known bins
-            if attr in bin_intervals:
-                
-                # Check intervals
-                try:
-                    f_val = float(val)
-                    idx = bin_intervals[attr].get_loc(f_val)
-                    processed_val = labels_map[idx]
-                
-                # Outlier handling (outside training range)
-                except KeyError:
-                    if f_val > bin_intervals[attr].right.max():
-                        processed_val = labels_map[len(BIN_LABELS)-1] # Highest
-                    else:
-                        processed_val = labels_map[0] # Lowest
-                
-                # Keep original string if conversion fails
-                except ValueError:
-                    pass
-
-            # Categorical or unknown attribute
-            else:
-                try:
-                    processed_val = str(int(float(val)))
-                except ValueError:
-                    pass
-            
-            values_binned.append(processed_val)
-
-        return {"value_binned": values_binned}
-
-    # Apply the binning
-    binned_dataset = dataset.map(
-        function=lambda s: bin_sample_values(s[value_key], s[attribute_key]),
-        desc="Binning values", num_proc=SAFE_NUM_PROCS,
-        load_from_cache_file=False, keep_in_memory=True,
-    )
-
-    return binned_dataset, bin_intervals
+    # Concatenation is now a fast memory copy operation
+    return concatenate_datasets(datasets) if len(datasets) > 0 else Dataset.from_dict({})
 
 
 def undersample_dataset(
@@ -311,8 +308,8 @@ def undersample_dataset(
 
     # Common undersampling logic
     n_pos = len(pos_indices)
-    n_neg = len(neg_indices)    
-    print(f"Undersampling: Found {n_pos} any-pos samples and {n_neg} all-neg samples.")
+    n_neg = len(neg_indices)
+    # print(f"Undersampling: Found {n_pos} any-pos samples and {n_neg} all-neg samples.")
     if n_pos < n_neg:
         majority_indices = neg_indices
         minority_indices = pos_indices
@@ -324,17 +321,17 @@ def undersample_dataset(
 
     # Check if we even need to drop anything
     if len(majority_indices) <= keep_n:
-        print("Majority class is already smaller than target ratio. No undersampling applied.")
+        # print("Majority class is already smaller than target ratio. No undersampling applied.")
         return dataset
 
     # Select random subset of majority
     selected_majority = rng.choice(majority_indices, size=keep_n, replace=False)
     
-    # Combine and Shuffle
+    # Combine and shuffle
     final_indices = np.concatenate([selected_majority, minority_indices])
     rng.shuffle(final_indices)
     
-    return dataset.select(final_indices)
+    return dataset.select(final_indices, keep_in_memory=True)
 
 
 def plot_category_distributions(

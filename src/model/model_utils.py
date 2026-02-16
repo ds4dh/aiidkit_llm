@@ -11,7 +11,7 @@ from transformers.trainer_callback import EarlyStoppingCallback
 
 
 # -------------------------------------------------------------------
-#  Positional and time embedding layers
+# Positional and time embedding layers
 # -------------------------------------------------------------------
 
 class TimeEmbedding(nn.Module):
@@ -79,9 +79,8 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
-
 # -------------------------------------------------------------------
-#  Potentially useful custom callbacks
+# Potentially useful custom callbacks
 # -------------------------------------------------------------------
 
 def preprocess_logits_for_metrics(logits, labels):
@@ -126,12 +125,13 @@ class EarlyStoppingCallbackWithWarmup(EarlyStoppingCallback):
 
 
 # -------------------------------------------------------------------
-#  Loss Functions (refactored for multi-label / BCE)
+# Loss Functions (refactored for multi-label / BCE with -100 masking)
 # -------------------------------------------------------------------
 
 class FocalLoss(nn.Module):
     """
     Binary Focal Loss for Multi-Label Classification.
+    Handles -100 in targets by masking them out.
     """
     def __init__(
         self,
@@ -154,16 +154,22 @@ class FocalLoss(nn.Module):
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
         inputs: Logits [Batch, Num_Labels]
-        targets: Binary Targets [Batch, Num_Labels] (float)
+        targets: Binary Targets [Batch, Num_Labels] (float), can contain -100
         """
+        # Create mask for valid labels
+        valid_mask = (targets != -100).float()
+
+        # Create safe targets for calculation (replace -100 with 0 to avoid NaN in BCE)
+        safe_targets = targets.clamp(min=0, max=1)
+
         # Compute binary cross entropy (element-wise)
-        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+        bce_loss = F.binary_cross_entropy_with_logits(inputs, safe_targets, reduction="none")
         
         # Compute probabilities (pt) for the correct class
         # - if target=1, pt = sigmoid(input)
         # - if target=0, pt = 1 - sigmoid(input)
         p = torch.sigmoid(inputs)
-        pt = p * targets + (1 - p) * (1 - targets)
+        pt = p * safe_targets + (1 - p) * (1 - safe_targets)
         
         # Focal term: (1 - pt)^gamma
         focal_term = (1 - pt) ** self.gamma
@@ -174,17 +180,24 @@ class FocalLoss(nn.Module):
              if self.alpha.device != inputs.device:
                  self.alpha = self.alpha.to(inputs.device)
              loss = loss * self.alpha
-             
+        
+        # Apply mask to zero out contributions from invalid labels
+        loss = loss * valid_mask
+
+        # Reduction
         if self.reduction == "mean":
-            return loss.mean()
+            # Sum loss and divide by the number of valid elements
+            return loss.sum() / valid_mask.sum().clamp(min=1.0)
         elif self.reduction == "sum":
             return loss.sum()
+        
         return loss
 
 
 class WeightedCELoss(nn.Module):
     """
     Binary Cross Entropy with specific positive weights for imbalance.
+    Handles -100 in targets by masking them out.
     """
     def __init__(
         self,
@@ -202,22 +215,42 @@ class WeightedCELoss(nn.Module):
         self.reduction = reduction
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Create mask for valid labels
+        valid_mask = (targets != -100).float()
+
+        # Create safe targets for calculation
+        safe_targets = targets.clamp(min=0, max=1)
+
         weight = self.pos_weight
         if weight is not None and weight.device != inputs.device:
             self.pos_weight = weight.to(inputs.device)
             weight = self.pos_weight
-        return F.binary_cross_entropy_with_logits(
+        
+        # Compute element-wise loss with reduction='none'
+        loss = F.binary_cross_entropy_with_logits(
             inputs, 
-            targets, 
+            safe_targets, 
             pos_weight=weight, 
-            reduction=self.reduction
+            reduction="none"
         )
+
+        # Apply mask
+        loss = loss * valid_mask
+
+        # Reduction
+        if self.reduction == "mean":
+            return loss.sum() / valid_mask.sum().clamp(min=1.0)
+        elif self.reduction == "sum":
+            return loss.sum()
+        
+        return loss
 
 
 class Poly1FocalLoss(nn.Module):
     """
     Poly1 Focal Loss adapted for Multi-Label (Binary) Classification.
     Loss = FL(pt) + epsilon * (1 - pt)
+    Handles -100 in targets by masking them out.
     """
     def __init__(
         self,
@@ -239,10 +272,16 @@ class Poly1FocalLoss(nn.Module):
             self.register_buffer("alpha", alpha)
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Create mask for valid labels
+        valid_mask = (targets != -100).float()
+
+        # Create safe targets for calculation
+        safe_targets = targets.clamp(min=0, max=1)
+
         # Base binary focal loss
-        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+        bce_loss = F.binary_cross_entropy_with_logits(inputs, safe_targets, reduction="none")
         p = torch.sigmoid(inputs)
-        pt = p * targets + (1 - p) * (1 - targets)
+        pt = p * safe_targets + (1 - p) * (1 - safe_targets)
         focal_term = (1 - pt) ** self.gamma
         fl_loss = focal_term * bce_loss
         
@@ -256,15 +295,20 @@ class Poly1FocalLoss(nn.Module):
                 self.alpha = self.alpha.to(inputs.device)
             loss = loss * self.alpha
 
+        # Apply mask
+        loss = loss * valid_mask
+
+        # Reduction
         if self.reduction == "mean":
-            return loss.mean()
+            return loss.sum() / valid_mask.sum().clamp(min=1.0)
         elif self.reduction == "sum":
             return loss.sum()
+        
         return loss
 
 
 # -------------------------------------------------------------------
-#  Factory
+# Factory
 # -------------------------------------------------------------------
 
 
@@ -342,6 +386,7 @@ def make_loss_func(loss_name: str, loss_args: dict = None):
         if labels.dtype != torch.float:
             labels = labels.float()
             
+        # The loss classes now handle masking of -100 internally
         return loss_fct(logits, labels)
 
     return compute_loss

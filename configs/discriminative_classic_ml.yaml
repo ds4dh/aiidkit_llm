@@ -1,14 +1,16 @@
 # Run parameters
 data_path: /home/shares/ds4dh/aiidkit_project/data_new/processed/classic_ml
-results_dir: results_classic_ml_balanced_tda_all
-selected_model_type: xgboost  # logistic_regression, random_forest, xgboost
+results_dir: results_classic_ml
+model_types: [logistic_regression, random_forest, xgboost]
 prediction_tasks:
     infection_bacteria: {fups: [0,  30,  60,  90,  180, 365], horizons: [ 30,  60,  90]}
     infection_virus:    {fups: [0,  30,  60,  90,  180, 365], horizons: [ 30,  60,  90]}
     infection_fungi:    {fups: [0,  30,  60,  90,  180, 365], horizons: [ 30,  60,  90]}
     # infection:          {fups: [0,  30,  60,  90,  180, 365], horizons: [ 30,  60,  90]}
-    graft_loss:         {fups: [0, 180, 365, 730, 1095],      horizons: [180, 365, 730, 1095]}
-    death:              {fups: [0, 180, 365, 730, 1095],      horizons: [180, 365, 730, 1095]}
+    # graft_loss:         {fups: [0, 180, 365, 730, 1095],      horizons: [180, 365, 730, 1095]}
+    # death:              {fups: [0, 180, 365, 730, 1095],      horizons: [180, 365, 730, 1095]}
+    graft_loss:         {fups: [0, 365, 730, 1095, 1825],     horizons: [365, 1095, 1825, 3650]}
+    death:              {fups: [0, 365, 730, 1095, 1825],     horizons: [365, 1095, 1825, 3650]}
 
 # Columns to exclude
 ignore_columns:
@@ -26,7 +28,7 @@ models:
 
   # Linear baseline
   logistic_regression:
-    n_optuna_trials: 25
+    n_optuna_trials: 50
     optuna_params:
       C: ["float", 0.0001, 100.0, "log"]
       penalty: ["categorical", "l1", "l2"]
@@ -37,7 +39,7 @@ models:
 
   # Non-linear baseline
   random_forest:
-    n_optuna_trials: 25
+    n_optuna_trials: 50
     optuna_params:
       n_estimators: ["int", 100, 500]
       max_depth: ["int", 5, 30]
@@ -49,7 +51,7 @@ models:
 
   # State-of-the-art baseline with tabular data
   xgboost:
-    n_optuna_trials: 25
+    n_optuna_trials: 50
     optuna_params:
       learning_rate: ["float", 0.005, 0.2, "log"]
       n_estimators: ["int", 100, 500]

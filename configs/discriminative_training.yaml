@@ -1,6 +1,6 @@
 # Run configuration and task (data collator) definition
-hf_data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/teav
-result_dir: results_optuna_big  # base directory name for all results
+hf_data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v1/teav
+result_dir: results_optuna/infection_bacteria  # base directory name for all results
 data_collator:
   eav_mappings:
     entity_id: entity
@@ -9,24 +9,21 @@ data_collator:
   time_mapping:
     days_since_tpx: time
   mlm_label_keys:
-    - entity_id     # mlm task must predict 'entity_id' labels
-    - attribute_id  # mlm task must predict 'attribute_id' labels
-    - value_id      # mlm task must predict 'value_id' labels
+    - entity_id       # mlm task must predict 'entity_id' labels
+    - attribute_id    # mlm task must predict 'attribute_id' labels
+    - value_id        # mlm task must predict 'value_id' labels
   mlm_masking_rules:  # these numbers will set the result subdirectory name
     {"entity_id": 0.15, "attribute_id": 0.25, "value_id": 0.45}
 
 # Configuration for finetuning tasks to run
-train_data_augment: all  # "all", "none", "valid", whether other fups are added to training samples
-target_undersampling_ratio: 10.0  # maximum ratio of positive to negative samples during training
+train_data_augment: all  # "all", "none", "valid", which other fups are added to finetuning samples
+target_undersampling_ratio: 10.0  # maximum ratio of positive to negative samples during finetuning
 early_stopping_metric: roc_auc  # metric to use for early stopping (per label, then averaged)
 prediction_tasks:  # horizon elements can be lists (multi-label) or integers / singletons (binary)
-  # # infection_bacteria: {fups: [0, 30, 90], horizons: [[30, 60, 90, 275, 335, 365]]}  # Mélanie's version
-  infection_bacteria: {fups: [0,  30,  60,  90,  180, 365], horizons: [[ 30,  60,  90]]}
-  # infection_virus:    {fups: [0,  30,  60,  90,  180, 365], horizons: [[ 30,  60,  90]]}
-  # # infection_fungi:    {fups: [0,  30,  60,  90,  180, 365], horizons: [[ 30,  60,  90]]}
-  # # infection:          {fups: [0,  30,  60,  90,  180, 365], horizons: [[ 30,  60,  90]]}
-  # graft_loss:         {fups: [0, 180, 365, 730, 1095],      horizons: [[180, 365, 730, 1095]]}
-  # death:              {fups: [0, 180, 365, 730, 1095],      horizons: [[180, 365, 730, 1095]]}
+  infection_bacteria:   {fups: [0,  30,  60,  90,  180,  360], horizons: [[ 30,  60,  90,  180]]}
+  # infection_virus:      {fups: [0,  30,  60,  90,  180,  360], horizons: [[ 30,  60,  90,  180]]}
+  # graft_loss:           {fups: [0, 360, 720, 1080, 1800],     horizons: [[180, 360, 1080, 1800]]}
+  # death:                {fups: [0, 360, 720, 1080, 1800],     horizons: [[180, 360, 1080, 1800]]}
 
 # Arguments for optuna run (perform both pretraining and finetuning for different hyper-parameters)
 optuna:
@@ -72,11 +69,13 @@ finetuner:
   eval_steps: 100
   save_steps: 100
   save_total_limit: 1
+  eval_accumulation_steps: 100
   gradient_accumulation_steps: 1
   per_device_train_batch_size: 32
   per_device_eval_batch_size: 32
   learning_rate: 4.0e-5
   weight_decay: 0.01
+  loss_name: poly1  # ce, weighted_ce, focal, dice, poly1
   bf16: true
   report_to: wandb
   remove_unused_columns: false  # crucial for custom collators

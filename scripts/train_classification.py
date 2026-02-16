@@ -1,4 +1,3 @@
-import os
 import argparse
 import yaml
 import json
@@ -6,6 +5,7 @@ import sys
 import gc
 import torch
 import wandb
+import numpy as np
 from pathlib import Path
 from datasets import Dataset
 from transformers import Trainer, TrainingArguments, EarlyStoppingCallback
@@ -80,7 +80,7 @@ def main():
                         horizons=horizons,  # can be int of list of int for multi-label classification
                         fup_train=train_fups,
                         fup_valid=valid_fups,
-                        fup_test=valid_fups,  # same as validation
+                        fup_test=train_fups,  # same as training (but not same patients)
                         train_data_augment=train_data_augment,
                         run_id=finetune_run_id,
                         pretrained_dir=pretrained_dir,
@@ -111,29 +111,27 @@ def finetune_disciminative_model(
     Fine-tune one model on a specific infection prediction task
     """
     # Load data for classification task, using vocabulary from pretraining phase
-    time_mapping = CLI_CFG["data_collator"]["time_mapping"]
-    eav_mappings = CLI_CFG["data_collator"]["eav_mappings"]
     label_keys = [f"label_{task_key}_{h:04d}d" for h in horizons]
     dataset, _, vocab = load_hf_data_and_metadata(
         data_dir=Path(CLI_CFG["hf_data_dir"]),
         fup_train=fup_train, fup_valid=fup_valid, fup_test=fup_test,
         label_keys=label_keys,
         target_undersampling_ratio=CLI_CFG.get("target_undersampling_ratio", None),
-        time_mapping=time_mapping,
-        eav_mappings=eav_mappings,
+        time_mapping=CLI_CFG["data_collator"]["time_mapping"],
+        eav_mappings=CLI_CFG["data_collator"]["eav_mappings"],
     )
 
-    # Prepare training dataset
-    dataset = dataset.filter(
-        lambda x: all(x[k] != -100 for k in label_keys), desc="Keeping valid labels",
-        num_proc=SAFE_NUM_PROCS, load_from_cache_file=False,
-    )
-    train_dataset = dataset["train"].map(
-        lambda x: {"split": "train"}, desc="Tagging split",
-        num_proc=SAFE_NUM_PROCS, load_from_cache_file=False,
-    )
-    eval_datasets = prepare_dataset_fup_dict(dataset["validation"], "val", fup_valid)
-    test_datasets = prepare_dataset_fup_dict(dataset["test"], "test", fup_test)
+    # Prepare datasets
+    for split in dataset.keys():  # first, add split info
+        col_vals = [split] * len(dataset[split])
+        dataset[split] = dataset[split].add_column("split", col_vals)
+    for split in dataset.keys():  # then only, filter out invalid samples
+        label_matrix = np.stack([dataset[split][k] for k in label_keys], axis=1)
+        keep_mask = (label_matrix != -100).any(axis=1)
+        dataset[split] = dataset[split].select(np.where(keep_mask)[0])
+    train_dataset = dataset["train"]
+    eval_datasets = prepare_dataset_fup_dict(dataset["validation"], fup_valid)
+    test_datasets = prepare_dataset_fup_dict(dataset["test"], fup_test)
 
     # Auto-detect model sub-directory and best pre-trained model checkpoint
     pretrained_last_ckpt_dir = get_last_checkpoint(str(pretrained_dir))
@@ -176,8 +174,13 @@ def finetune_disciminative_model(
         early_stopping_metric=CLI_CFG["early_stopping_metric"],
     )
 
-    # Training arguments, with the correct output directory
+    # Setup loss function
     ft_cfg = CLI_CFG["finetuner"].copy()
+    loss_name = ft_cfg.pop("loss_name", "poly1")
+    loss_args = compute_loss_args(train_dataset, label_keys)
+    loss_func = make_loss_func(loss_name, loss_args)  
+
+    # Training arguments, with the correct output directory
     fmt_fn = lambda x: "-".join(f"{i:04d}" for i in sorted(([x] if isinstance(x, int) else x or [])))    
     fut_str = fmt_fn(fup_train) if train_data_augment == "none" else train_data_augment    # training: "fut(0090)" vs "fut(all)"
     fuv_str = fmt_fn(fup_valid)  # validation: "fuv(0090)" vs "fuv(0000-0030...)"
@@ -195,10 +198,6 @@ def finetune_disciminative_model(
         run_name = f"{run_id}_{run_subdir}"
         wandb.init(project=workspace, name=run_name, config=CLI_CFG)
 
-    # Setup loss function
-    loss_args = compute_loss_args(train_dataset, label_keys)
-    loss_func = make_loss_func('poly1', loss_args)  # ce, weighted_ce, focal, dice, poly1
-
     # Trainer (standard HuggingFace)
     trainer = PrefixAwareTrainer(
         model=model,
@@ -209,6 +208,7 @@ def finetune_disciminative_model(
         compute_loss_func=loss_func,
         compute_metrics=evaluator,
         callbacks=callbacks,
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
     )
 
     # Fine-tune the model and reset wandb for the next run
@@ -239,27 +239,17 @@ class PrefixAwareTrainer(Trainer):
         return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
 
 
-def prepare_dataset_fup_dict(
-    dataset: Dataset,
-    prefix_name: str,
-    fup_list: list[int],
-):
+def prepare_dataset_fup_dict(dataset: Dataset, fup_list: list[int]):
     """
-    Creates a dictionary of datasets for different follow-up periods
+    Creates a dictionary of datasets for different follow-up periods.
     """
-    out_dict = {"all": dataset.map(
-        lambda x: {"split": f"{prefix_name}_all"},
-        desc="Tagging split", num_proc=SAFE_NUM_PROCS,
-    )}
+    out_dict = {"all": dataset}
+    fup_array = np.array(dataset["fup"])
     for fup in fup_list:
-        subset = dataset.filter(lambda x: x["fup"] == fup, num_proc=SAFE_NUM_PROCS)
-        if len(subset) > 0:
-            out_dict[f"fup_{fup:04d}"] = subset.map(
-                lambda x: {"split": f"{prefix_name}_{fup}"},
-                desc="Tagging split", num_proc=SAFE_NUM_PROCS,
-            )
-        else:
-            print(f"Warning: No labeled samples found for follow-up {fup} in {prefix_name}.")
+        indices = np.where(fup_array == fup)[0]
+        if len(indices) > 0:
+            subset = dataset.select(indices)  # dataset view
+            out_dict[f"fup_{fup:04d}"] = subset
             
     return out_dict
 
@@ -307,6 +297,15 @@ def scan_all_fups(data_dir: Path) -> list[int]:
             except ValueError:
                 continue  # skip fup_None or malformed folders
     return sorted(fups)
+
+
+def preprocess_logits_for_metrics(logits, labels):
+    """
+    Minimizes memory usage by keeping only the logits needed for metrics.
+    """
+    if isinstance(logits, tuple):
+        return logits[0]  # depends on the model
+    return logits
 
 
 if __name__ == "__main__":

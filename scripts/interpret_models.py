@@ -23,13 +23,26 @@ from src.data.patient_dataset import load_hf_data_and_metadata
 from src.model.patient_embedder import PatientEmbeddingModelFactory, PatientDataCollatorForClassification
 from src.evaluation.evaluate_models import UMAP_HDBSCAN_Clusterer
 
-# TODO: ADD RANDOM NOISE (BINARY / CATEGORICAL / NUMERICAL) FEATRUE (OR SIMILAR IDEA) TO IDENTIFY WHAT IS SIGNIFICANT OR NOT
-
-# DEFAULT_BASE_DIR = "BACKUP - results_transformer_tda_all/e25-a25-v25"
-DEFAULT_BASE_DIR = "results_optuna_small/trial_038/e75-a15-v05"
-DEFAULT_TASK_KEY = "infection_bacteria"
 SAFE_NUM_PROC = 4
 CLI_CFG = {}
+DEFAULT_TASK_KEY = "graft_loss"
+TASK_CONFIG = {
+    "death": {
+        "base_dir": "backups/2026_01/BACKUP - results_optuna_death/trial_002/e15-a15-v15",  # !!! careful: unoptimized run!!!
+        "horizon": 1095,
+        "follow-up_periods": [180, 365, 730, 1095, 1460, 1825, 2180, 2540, 2900, 3260, 3650],
+    },
+    "graft_loss": {
+        "base_dir": "backups/2026_01/BACKUP - results_optuna_graft_loss/trial_000/e15-a35-v15",  # !!! careful: unoptimized run!!!
+        "horizon": 1095,
+        "follow-up_periods": [180, 365, 730, 1095, 1460, 1825, 2180, 2540, 2900, 3260, 3650],
+    },
+    "infection_bacteria": {
+        "base_dir": "backups/2026_01/BACKUP - results_optuna_infection_bacteria/trial_032/e05-a35-v35",
+        "horizon": 90,
+        "follow-up_periods": [90, 120, 150, 180, 210, 240, 270, 300, 330, 365],
+    },
+}
 
 # =================================
 # GLOBAL MAPPINGS AND CONFIGURATION
@@ -60,6 +73,7 @@ EVENT_ROLES = {
     # Events / procedures
     'Event rejection':          ['Biops proven rj', 'Clinically suspected rj'],
     'Event procedure':          ['Nephrectomy native', 'Nephrectomy allograft', 'Nephrectomy allograft and native'],
+    'Previous graft failure':   ['Previous GF'],
 
     # Infection type
     'Inf. type proven dis.':    ['Proven disease'],
@@ -89,52 +103,115 @@ EVENT_ROLES = {
     'Inf. site Blood':          ['Blood', 'Sepsis', 'Bacteremia', 'Catheter'],
 }
 
+# Clinical events / categories 
+CLINICAL_ROLES = {
+    # Primary kidney diseases
+    'Kidney dis. GN':                     ['GN'],
+    'Kidney dis. CKD':                    ['CKD'],
+    'Kidney dis. PCKD':                   ['PCKD'],
+    'Kidney dis. Congenital':             ['Congenital kidney'],
+    'Kidney dis. Nephritis':              ['Interstitial nephritis'],
+    'Kidney dis. Pyelo/Reflux':           ['Reflux/Pyelonephritis'],
+    'Kidney dis. Nephrosclerosis':        ['Nephrosclerosis'],
+    'Kidney dis. DM Nephropathy':         ['DM nephropathy'],
+    'Kidney dis. Hereditary':             ['Hereditary non_PCKD'],
+    'Kidney dis. ARF':                    ['ARF'],
+    'Kidney dis. Acute on Chronic':       ['Acute on chronic RF'],
+
+    # Comorbidities
+    'Comorb. DM Type 1':           ['DM type1'],
+    'Comorb. DM Type 2':           ['DM type2 treated'],
+    'Comorb. HTN':                 ['HTN'],
+    'Comorb. Lipids':              ['Hyperlipidemia'],
+    'Comorb. Osteoporosis':        ['Osteoporosis'],
+    'Comorb. PTDM':                ['PTDM'],
+    'Comorb. Heart (CMP)':         ['Dilated CMP'],
+    'Comorb. Metabolic':           ['Other metabolic'],
+    'Comorb. Alcohol':             ['Alcohol'],
+    'Comorb. Liver Injury':        ['Drug-induced liver injury'],
+
+    # Serology and donor
+    'Sero. D+/R-':                 ['D+/R-'],
+    'Sero. D-/R+':                 ['D-/R+'],
+    'Sero. D+/R+':                 ['D+/R+'],
+    'Sero. D-/R-':                 ['D-/R-'],
+    'Sero. D+/R?':                 ['D+/R?'],
+    'Sero. D-/R?':                 ['D-/R?'],
+    'Sero. D?/R+':                 ['D?/R+'],
+    'Sero. D?/R?':                 ['D?/R?'],
+    'Donor DBD':                   ['DBD'],
+    'Donor DCD':                   ['DCD'],
+    'Donor Living Related':        ['Living related'],
+    'Donor Living Unrelated':      ['Living unrelated'],
+
+    # Cancers
+    'Cancer Skin (Basal)':         ['Basalioma'],
+    'Cancer Skin (Spin)':          ['Spinalioma'],
+    'Cancer Skin (Melanoma)':      ['Melanoma'],
+    'Cancer Skin (Other)':         ['Other skin cancer'],
+    'Cancer Breast':               ['Breast cancer'],
+    'Cancer Lung':                 ['Lung cancer'],
+    'Cancer Prostate':             ['Prostate cancer'],
+    'Cancer Lymphoma (PTLD)':      ['PTLD'],
+    'Cancer Cervix/Uterus':        ['Cervix - Uterus - Adnex ca'],
+    'Cancer Colorectal':           ['Colorectal cancer'],
+    'Cancer Bladder':              ['Uro_bladder cancer'],
+    'Cancer Kidney':               ['Kidney cancer'],
+    'Cancer Myeloid':              ['Myeloid neoplasm'],
+    'Cancer Other':                ['Other neoplasia'],
+}
+
 # Numeric, ordinal, and unknown definitions
 NUMERIC_ROLES = {
-    "0 / False / No / M": ["0", "No", "False", "Negative", "Male", "M"], 
-    "1 / True / Yes / F": ["1", "Yes", "True", "Occurred", "Positive", "Female", "F"],
-    "2": ["2"], 
-    "3": ["3"],
+    '0 / False / No / M': ['0', 'No', 'False', 'Negative', 'Male', 'M'], 
+    '1 / True / Yes / F': ['1', 'Yes', 'True', 'Occurred', 'Positive', 'Female', 'F'],
+    '2': ['2'], 
+    '3': ['3'],
 }
 ORDINAL_ROLES = {
     level: level 
-    for level in ["Lowest", "Lower", "Low", "Middle", "High", "Higher", "Highest"]
+    for level in ['Lowest', 'Lower', 'Low', 'Middle', 'High', 'Higher', 'Highest']
 }
 UNKNOWN_ROLES = {
-    "Other/Unknown": [
-        "Unknown", "Missing", "Site not identified", "Undetermined", "Other", "[UNK]",
+    'Other/Unknown': [
+        'Unknown', '[UNK]', 'Condition unknown',
+        'Other', 'Other event or disease',
+        'Missing', 'Site not identified', 'Undetermined',
     ]
 }
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Interpret model predictions and embeddings on the test set.")
     parser.add_argument("--config", "-c", type=str, default="configs/discriminative_training.yaml", help="Path to the training config used.")
     parser.add_argument("--output_dir", "-o", type=str, default="results_interpretability", help="Folder to save plots and tables.")
-    parser.add_argument("--base_dir", "-b", type=str, default=DEFAULT_BASE_DIR, help="Path to the experiment folder.")
-    parser.add_argument("--plot_only", "-p", action="store_true", help="Skip computation, load existing CSVs and replot.")
     parser.add_argument("--task_key", type=str, default=DEFAULT_TASK_KEY, help="Task key.")
-    parser.add_argument("--horizon", type=int, default=90, help="Prediction horizon in days.")
     parser.add_argument("--captum_samples", type=int, default=500, help="Maximum sample per label analyzed by captum")
     parser.add_argument("--agg_method", type=str, choices=["mean", "sum"], default="mean", help="Aggregation method: 'mean' (conditional impact) or 'sum' (population burden).")
     parser.add_argument("--top_k", type=int, default=20, help="Maximum number of features plotted in the attribution plots.")
     parser.add_argument("--min_freq", type=int, default=50, help="Minimum number of patients a feature must appear in to be plotted.")
     parser.add_argument("--add_noise", action="store_true", help="Inject a random noise feature for baseline comparison.")    
+    parser.add_argument("--plot_only", "-p", action="store_true", help="Skip computation, load existing CSVs and replot.")
     return parser.parse_args()
 
 
 def find_best_checkpoint(base_dir: Path, task_key: str, horizon: int) -> Path:
     task_dir = base_dir / "finetuning" / task_key
     if not task_dir.exists(): raise FileNotFoundError(f"Task directory not found: {task_dir}")
-    horizon_str = f"{horizon:04d}"
     
-    candidates = [p for p in task_dir.iterdir() if p.is_dir() and horizon_str in p.name]
-    if not candidates: raise FileNotFoundError(f"No run found for horizon {horizon_str}")
+    h_str = f"{horizon:04d}"
+    pattern = re.compile(rf"hrz\(([^)]*\b{h_str}\b[^)]*)\)")
+    candidates = [p for p in task_dir.iterdir() if p.is_dir() and pattern.search(p.name)]
+    if not candidates: raise FileNotFoundError(f"No run found for horizon {h_str} inside hrz() in {task_dir}")
+    
     run_dir = candidates[0]
-    
-    checkpoint_dirs = sorted(list(run_dir.glob("checkpoint-*")), key=lambda p: int(p.name.split("-")[-1]))
+    checkpoint_dirs = sorted(
+        list(run_dir.glob("checkpoint-*")),
+        key=lambda p: int(p.name.split("-")[-1]),
+    )
     if not checkpoint_dirs: raise FileNotFoundError(f"No checkpoints found in {run_dir}")
     
-    return checkpoint_dirs[-1]
+    return checkpoint_dirs[0]  # first, because early stopping might have kept an overfitted checkpoint
 
 
 def extract_horizons_from_path(checkpoint_path: Path) -> list[int]:
@@ -417,8 +494,7 @@ def plot_contrastive_drivers(
 
 def plot_frequency_vs_impact(df, output_dir, label_name, min_freq=5):
     """
-    Volcano-style plot: Frequency (Log Scale) vs. Mean Impact.
-    Uses adjustText to prevent label overlap.
+    Produces a volcano-style plot: frequency (log scale) vs. mean impact
     """
     if df.empty: return
     
@@ -470,12 +546,13 @@ def plot_frequency_vs_impact(df, output_dir, label_name, min_freq=5):
 
     # Use adjust_text to fix overlaps and draw lines
     adjust_text(
-        texts,                     # arrowprops controls the line style
-        arrowprops=dict(arrowstyle='-', color='gray', lw=0.5),
-        expand_points=(1.2, 1.2),  # push text slightly further from dots
-        force_text=(0.1, 0.2)      # force text apart
+        texts,
+        arrowprops=dict(arrowstyle='-', color='gray', lw=0.5, shrinkA=5, shrinkB=5),
+        only_move={'text':'xy'}, autoalign='xy', lim=1000,
+        expand_points=(1.05, 1.2),  # do not push away too hard
+        force_text=(0.05, 0.1),     # do not let texts repel each other too hard
+        force_points=(0.05, 0.1),   # do not let dots repel text too hard
     )
-
     plt.xscale("log")
     plt.title(f"Feature frequency vs. severity: {label_name}", fontsize=14)
     plt.xlabel("Frequency (log scale)", fontsize=12)
@@ -509,8 +586,8 @@ def plot_feature_value_impact(df, output_dir, label_name, feature_list=None, top
 
     # Merge all definitions
     group_definitions = {
-        **NUMERIC_ROLES, **EVENT_ROLES, **MED_ROLES,
-        **ORDINAL_ROLES, **UNKNOWN_ROLES,
+        **EVENT_ROLES, **MED_ROLES, **CLINICAL_ROLES, 
+        **NUMERIC_ROLES, **ORDINAL_ROLES, **UNKNOWN_ROLES,
     }
     for o in ORDINAL_ROLES: group_definitions[o] = [o]
 
@@ -573,6 +650,7 @@ def plot_feature_value_impact(df, output_dir, label_name, feature_list=None, top
         if group in num_colors: return "Numeric/Bool"
         if group in MED_ROLES: return "Medication"
         if group in EVENT_ROLES: return "Categorical"
+        # if group in CLINICAL_ROLES: return "Clinical"
         return "Other"
     
     df_plot["Value_Type"] = df_plot["Value"].apply(get_value_type)
@@ -676,7 +754,7 @@ def run_captum_analysis(
     )
     df_neg["Cohort"] = "Low risk"
     
-    print(f"\n>>> Analyzing drivers (Aggregation: {agg_method.upper()}, Min Freq: {min_freq})...")
+    print(f"\n>>> Analyzing drivers (aggregation: {agg_method}, min freq: {min_freq})...")
 
     # Global frequency filtering (filter before ranking)
     all_features = pd.concat([df_pos["Feature"], df_neg["Feature"]])
@@ -704,11 +782,11 @@ def run_captum_analysis(
     )
     print(" -> Generating value impact strip chart (High Risk)...")
     plot_feature_value_impact(
-        df_pos, output_dir, f"{label_name}_high_risk", 
+        df_pos, output_dir, f"{label_name} - high risk", 
         feature_list=shared_features, min_freq=min_freq
     )
     print(" -> Generating volcano scatter plot...")
-    plot_frequency_vs_impact(df_pos, output_dir, f"{label_name}_high_risk", min_freq=min_freq)
+    plot_frequency_vs_impact(df_pos, output_dir, f"{label_name} - high risk", min_freq=min_freq)
 
 
 def compute_feature_enrichment(target_indices, background_indices, dataset, top_k=20):
@@ -795,33 +873,36 @@ def analyze_near_misses_by_risk(probs, labels, output_dir):
 
 
 def main():
+    # Load task configuration
     args = parse_args()
+    base_dir = TASK_CONFIG[args.task_key]["base_dir"]
+    hrz = TASK_CONFIG[args.task_key]["horizon"]
+    fups = TASK_CONFIG[args.task_key]["follow-up_periods"]
     
-    checkpoint_path = find_best_checkpoint(Path(args.base_dir), args.task_key, args.horizon)
+    # Setup input model and output directories
+    checkpoint_path = find_best_checkpoint(Path(base_dir), args.task_key, hrz)
     print(f"\n>>> Using Checkpoint: {checkpoint_path}")
     with open(args.config, 'r') as f: config = yaml.safe_load(f)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Setup keys for task of interest
     ckpt_hrzs = extract_horizons_from_path(checkpoint_path)
-    if args.horizon not in ckpt_hrzs:
-        raise ValueError(f"Requested horizon {args.horizon} not found in: {ckpt_hrzs}")
-    target_idx = ckpt_hrzs.index(args.horizon)
+    if hrz not in ckpt_hrzs:
+        raise ValueError(f"Requested horizon {hrz} not found in: {ckpt_hrzs}")
+    target_idx = ckpt_hrzs.index(hrz)
     ckpt_label_keys = [f"label_{args.task_key}_{h:04d}d" for h in ckpt_hrzs]
     label_key = ckpt_label_keys[target_idx]
-    print(f"\n>>> Target index: {target_idx} (horizon: {args.horizon}d, available: {ckpt_hrzs})")
+    print(f"\n>>> Target index: {target_idx} (horizon: {hrz}d, available: {ckpt_hrzs})")
 
+    # Load dataset
     print("\n>>> Loading dataset...")
     data_dir = Path(config["hf_data_dir"])
-    fups_considered = [90, 180, 365] 
-    print(f"Follow-up considered in the analysis: {fups_considered}")
-    
+    print(f"Follow-up considered in the analysis: {fups}")
     split_considered = "test"
     dataset, _, vocab = load_hf_data_and_metadata(
         data_dir=data_dir,
-        fup_train=fups_considered,
-        fup_valid=fups_considered,
-        fup_test=fups_considered,
+        fup_train=[365], fup_valid=[365], fup_test=fups,
         time_mapping=config["data_collator"]["time_mapping"],
         eav_mappings=config["data_collator"]["eav_mappings"],
         sanity_check_output_dir = "./results_interpretability/sanity_check",
@@ -832,23 +913,23 @@ def main():
     test_ds = test_ds.map(
         lambda x: {"split": split_considered}, num_proc=SAFE_NUM_PROC
     )
-    
+
+    # Load model and data collator for test-set inference
     emb_cfg = config["model"]["embedding_layer_config"]
     emb_cfg["vocab_size"] = len(vocab)
-    
     model = PatientEmbeddingModelFactory.from_pretrained(
         task="classification",
         pretrained_dir=str(checkpoint_path),
         embedding_layer_config=emb_cfg,
         model_args=config["model"]["model_args"]
     )
-    
     collator = PatientDataCollatorForClassification(
         **config["data_collator"], 
         label_keys=ckpt_label_keys,
         max_position_embeddings=model.config.max_position_embeddings
     )
 
+    # Run model inference and extract output probabilities
     print("\n>>> Running inference on test set...")
     interpreter = ModelInterpreter(model)
     loader = DataLoader(test_ds, batch_size=32, collate_fn=collator.torch_call)
@@ -856,42 +937,43 @@ def main():
     probs = expit(res["logits"][:, target_idx])
     target_labels = res["labels"][:, target_idx]
 
-    q_high = np.quantile(probs, 0.75)
-    q_low = np.quantile(probs, 0.25)
+    # Select positive and negative cohorts (according to model)
+    model_strength = 0.9  # 0.5 for considering all samples
+    q_high = np.quantile(probs, model_strength)
+    q_low = np.quantile(probs, 1.0 - model_strength)
     pos_idx = np.where(probs >= q_high)[0] 
     neg_idx = np.where(probs <= q_low)[0] 
     print(f"\nCohort selection (extreme quantiles):")
     print(f" -> High-risk threshold: >= {q_high:.4f} | {len(pos_idx)} samples")
     print(f" -> Low-risk threshold: <= {q_low:.4f} | {len(neg_idx)} samples")
-
     if len(pos_idx) > args.captum_samples:
         pos_idx = np.random.choice(pos_idx, args.captum_samples, replace=False)
     if len(neg_idx) > args.captum_samples:
         neg_idx = np.random.choice(neg_idx, args.captum_samples, replace=False)
 
+    # Run captum analysis (feature attribution using integrated gradients)
+    label_name = label_key.replace("label_", "").replace("_", " ").capitalize()
     if len(pos_idx) > 0 and len(neg_idx) > 0:
         print("\n>>> Running captum analysis...")
         run_captum_analysis(
             model=model, dataset=test_ds, collator=collator, output_dir=output_dir,
-            label_name="pred_infected", pos_indices=pos_idx, neg_indices=neg_idx,
+            label_name=label_name, pos_indices=pos_idx, neg_indices=neg_idx,
             vocab=vocab, device="cuda", target_idx=target_idx, entity_filter=None,
             add_noise=args.add_noise, top_k=args.top_k, plot_only=args.plot_only,
             agg_method=args.agg_method, min_freq=args.min_freq,
         )
 
-    # # Clustering analysis
+    # # Run clustering analysis
     # print("\n>>> Clustering with UMAP and HDBSCAN...")
     # clusterer = UMAP_HDBSCAN_Clusterer(n_optuna_trials=25)
     # _, fig = clusterer.perform_analysis(res["embeddings"], max_samples=5000)
     # if fig: fig.write_html(str(output_dir / "clusters_umap.html"))
-
     # _, cluster_ids = clusterer.fit_predict(res["embeddings"])
     # for cid in np.unique(cluster_ids):
     #     if cid == -1: continue
     #     idx = np.where(cluster_ids == cid)[0]
     #     bg_idx = np.where(cluster_ids != cid)[0]
-    #     rate = target_labels[idx].mean()
-    
+    #     rate = target_labels[idx].mean()    
     #     enrich = compute_feature_enrichment(idx, bg_idx, test_ds, top_k=10)
     #     print(f"\n[Cluster {cid}] Size: {len(idx)} | Pos Rate: {rate:.2%}")
     #     print(enrich[["Feature", "Odds_Ratio"]].to_string(index=False))

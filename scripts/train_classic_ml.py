@@ -64,62 +64,64 @@ def main():
     with open(args.config, 'r') as f:
         cfg = yaml.safe_load(f)
 
-    # Check model
-    model_type = cfg['selected_model_type']
-    if model_type not in cfg['models']:
-        raise ValueError(f"Model '{model_type}' not found in 'models' config section.")
-    model_config = cfg['models'][model_type]
-
-    # Check data
-    data_root = Path(cfg['data_path'])
-    print(f"Data Root: {data_root}")
-
-    # Iterate over tasks
-    train_data_augment = cfg.get("train_data_augment", "none")
-    for task_key, task_specs in cfg["prediction_tasks"].items():
+    # Run all models
+    model_types = cfg['model_types']
+    for model_type in model_types:
         
-        valid_fups = task_specs["fups"]
+        # Check model
+        if model_type not in cfg['models']:
+            raise ValueError(f"Model '{model_type}' not found in 'models' config section.")
+        model_config = cfg['models'][model_type]
 
-        # Determine training configuration (train vs valid follow-up periods)
-        if train_data_augment == "none":
-            # One run per follow-up period
-            run_configs = [([f], [f]) for f in valid_fups]
-        else:
-            # Single run with aggregated data
-            if train_data_augment == "valid":
-                train_fups = valid_fups
-            elif train_data_augment == "all":
-                train_fups = scan_all_fups(data_root)
+        # Check data
+        data_root = Path(cfg['data_path'])
+        print(f"Data Root: {data_root}")
+
+        # Iterate over tasks
+        train_data_augment = cfg.get("train_data_augment", "none")
+        for task_key, task_specs in cfg["prediction_tasks"].items():
+            
+            valid_fups = task_specs["fups"]
+
+            # Determine training configuration (train vs valid follow-up periods)
+            if train_data_augment == "none":
+                # One run per follow-up period
+                run_configs = [([f], [f]) for f in valid_fups]
             else:
-                raise ValueError(f"Unknown train_data_augment: {train_data_augment}")
-            
-            run_configs = [(train_fups, valid_fups)]
-
-        # Iterate over horizons
-        for horizon in task_specs["horizons"]:
-            
-            # Execute runs
-            for train_fups_list, valid_fups_list in run_configs:
+                # Single run with aggregated data
+                if train_data_augment == "valid":
+                    train_fups = valid_fups
+                elif train_data_augment == "all":
+                    train_fups = scan_all_fups(data_root)
+                else:
+                    raise ValueError(f"Unknown train_data_augment: {train_data_augment}")
                 
-                # Naming for display
-                t_str = "All" if train_data_augment == "all" else str(train_fups_list)
-                print(f"\nProcessing task: {task_key} | horizon: {horizon}d | train FUPs: {t_str}")
+                run_configs = [(train_fups, valid_fups)]
 
-                train_model_run(
-                    cfg, data_root,
-                    task_key, train_fups_list, valid_fups_list, horizon,
-                    model_type, model_config, train_data_augment
-                )
+            # Train a model for all combinations of horizons and follow-up periods
+            for horizon in task_specs["horizons"]:
+                for train_fups_list, valid_fups_list in run_configs:
+                    
+                    # Train model
+                    t_str = "All" if train_data_augment == "all" else str(train_fups_list)
+                    print(f"\nProcessing task: {task_key} | Model: {model_type}")
+                    print(f"Horizon: {horizon}d | Train FUPs: {t_str}")
+                    train_model_run(
+                        cfg=cfg, data_root=data_root, task_key=task_key,
+                        train_fups=train_fups_list, valid_fups=valid_fups_list,
+                        horizon=horizon, train_data_augment=train_data_augment,
+                        model_type=model_type, model_config=model_config,
+                    )
 
-        # Plotting results
-        print(f"\nGenerating plots for task: {task_key}...")
-        finetuning_dir = Path(cfg['results_dir']) / model_type
-        plot_task_results(
-            task_key=task_key,
-            task_specs=task_specs,
-            finetuning_dir=finetuning_dir,
-            train_data_augment=train_data_augment,
-        )
+            # Plotting results
+            print(f"\nGenerating plots for task: {task_key}...")
+            finetuning_dir = Path(cfg['results_dir']) / model_type
+            plot_task_results(
+                task_key=task_key,
+                task_specs=task_specs,
+                finetuning_dir=finetuning_dir,
+                train_data_augment=train_data_augment,
+            )
 
 
 def load_combined_data(
@@ -165,8 +167,15 @@ def load_combined_data(
 
 
 def train_model_run(
-    cfg, data_root, task_key, train_fups, valid_fups, horizon,
-    model_type, model_config, train_data_augment,
+    cfg: dict,
+    data_root: Path,
+    task_key: str,
+    train_fups: list[int],
+    valid_fups: list[int],
+    horizon: int,
+    train_data_augment: str,
+    model_type: str,
+    model_config: dict,
 ):
     """
     Trains one model using aggregated training data, evaluates on stratified test sets.
@@ -193,8 +202,8 @@ def train_model_run(
         print("Validation set empty. Skipping.")
         return
 
-    # Setup output directory    
-    # Logic: if "none", we list the specific FUP (e.g., 0090). If "valid"/"all", we use the string "valid"/"all" 
+    # Setup output directory
+    # Logic: if "none", list the FUPs (e.g., 0090); if "valid"/"all", use as is 
     hrz_str = f"{horizon:04d}"
     if train_data_augment == "none":
         fut_str = format_fup_string(train_fups) # e.g. "0090"
@@ -209,7 +218,7 @@ def train_model_run(
     trainer = OptunaTrainer(
         model_type=model_type,
         optuna_config=model_config.get('optuna_params', {}),
-        n_trials=model_config.get('n_optuna_trials', 10),
+        n_trials=model_config.get('n_optuna_trials', 50),
         output_dir=output_dir,
         target_ratio=cfg.get('target_undersampling_ratio', None),
     )

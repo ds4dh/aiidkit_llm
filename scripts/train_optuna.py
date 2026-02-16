@@ -106,12 +106,10 @@ def run_subprocess(script_path, overrides, env):
     ]
     
     # Suppress stdout for clean optuna progress bar, but print stderr if it fails
-    result = subprocess.run(
-        cmd, 
-        capture_output=True, 
-        text=True,
-        env=env,
-    )
+    if not DEBUG:
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    else:
+        result = subprocess.run(cmd, env=env)
     
     if result.returncode != 0:
         gpu_id = env.get("CUDA_VISIBLE_DEVICES", "Unknown")
@@ -186,7 +184,6 @@ def objective(trial: optuna.Trial):
         # Construct overrides dictionary (structure must match the YAML hierarchy)
         overrides = {
             "result_dir": str(trial_dir),
-            "train_data_augment": "all" if not DEBUG else "valid",
             "data_collator": {
                 "mlm_masking_rules": masking_rules,
             },
@@ -207,6 +204,7 @@ def objective(trial: optuna.Trial):
                 }
             }
         }
+        # if DEBUG: overrides["train_data_augment"] = "valid"  # to save time
 
         # Execution (pretraining, finetuning), passing trial_env to run_subprocess
         try:

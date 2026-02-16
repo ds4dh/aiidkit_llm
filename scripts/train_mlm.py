@@ -36,12 +36,7 @@ def main():
         time_mapping=time_mapping,
         eav_mappings=eav_mappings,
     )
-    dataset = {
-        k: v.map(
-            lambda x: {"split": k}, desc="Tagging split",
-            num_proc=8, load_from_cache_file=False,
-        ) for k, v in dataset.items()
-    }
+    dataset = {k: v.add_column("split", [k] * len(v)) for k, v in dataset.items()}
 
     # Initialize custom patient embedding model for masked language modelling
     CLI_CFG["model"]["task"] = "masked"

@@ -411,13 +411,20 @@ class BaseEmbeddingEvaluatorForClassification:
         names = self.label_names if self.label_names else [f"lbl{i}" for i in range(num_labels)]
         for i, name in enumerate(names[:num_labels]):
             
-            # Gather data
-            y_true = labels[:, i]
-            y_prob = probs[:, i]
-            y_cal  = probs_cal[:, i]
+            # Gather data (with or without an invalid label)
+            y_true_all = labels[:, i]
+            y_prob_all = probs[:, i]
+            y_cal_all  = probs_cal[:, i]
+            
+            # Filter out invalid labels ("-100" means invalid)
+            valid_mask = y_true_all != -100
+            if valid_mask.sum() == 0: continue
+            y_true = y_true_all[valid_mask]
+            y_prob = y_prob_all[valid_mask]
+            y_cal  = y_cal_all[valid_mask]
             
             # Compute metrics
-            if len(np.unique(y_true)) < 2: continue   # skip empty labels (e.g. all -100)
+            if len(np.unique(y_true)) < 2: continue   # skip constant labels
             sub_metrics = self._compute_single_label_metrics(y_true, y_prob, y_cal)
             metrics.update({f"{k}_{name}": v for k, v in sub_metrics.items()})
             
