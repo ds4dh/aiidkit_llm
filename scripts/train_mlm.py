@@ -30,7 +30,7 @@ def main():
     time_mapping = CLI_CFG["data_collator"]["time_mapping"]
     eav_mappings = CLI_CFG["data_collator"]["eav_mappings"]
     dataset, _, vocab = load_hf_data_and_metadata(
-        data_dir=Path(CLI_CFG["hf_data_dir"]),
+        data_dir=Path(CLI_CFG["data_dir"]) / CLI_CFG["data_split_type"],
         fup_train=None,  # look for folder 'fup_None'
         fup_valid=None,  # look for folder 'fup_None'
         time_mapping=time_mapping,
@@ -61,7 +61,8 @@ def main():
     mlm_masking_rules = CLI_CFG["data_collator"]["mlm_masking_rules"]
     run_id = "-".join([f"{k[0]}{int(v * 100):02d}" for k, v in mlm_masking_rules.items()])
     pt_cfg = CLI_CFG["pretrainer"].copy()
-    pt_cfg["output_dir"] = str(Path(CLI_CFG["result_dir"]) / run_id / "pretraining")
+    result_dir = Path(CLI_CFG["result_dir"]) / CLI_CFG["data_split_type"]
+    pt_cfg["output_dir"] = str(result_dir / run_id / "pretraining")
     if cli_args.silent: pt_cfg["report_to"] = "none"
     pt_args = TrainingArguments(**pt_cfg)
 

@@ -74,8 +74,8 @@ def main():
         model_config = cfg['models'][model_type]
 
         # Check data
-        data_root = Path(cfg['data_path'])
-        print(f"Data Root: {data_root}")
+        data_root = Path(cfg['data_dir']) / cfg['data_split_type']
+        print(f"Data root for split '{cfg['data_split_type']}': {data_root}")
 
         # Iterate over tasks
         train_data_augment = cfg.get("train_data_augment", "none")
@@ -107,15 +107,20 @@ def main():
                     print(f"\nProcessing task: {task_key} | Model: {model_type}")
                     print(f"Horizon: {horizon}d | Train FUPs: {t_str}")
                     train_model_run(
-                        cfg=cfg, data_root=data_root, task_key=task_key,
-                        train_fups=train_fups_list, valid_fups=valid_fups_list,
-                        horizon=horizon, train_data_augment=train_data_augment,
+                        cfg=cfg, data_root=data_root,
+                        task_key=task_key,
+                        train_fups=train_fups_list,
+                        valid_fups=valid_fups_list,
+                        test_fups=train_fups_list,  # same fups as for training set!
+                        horizon=horizon,
+                        train_data_augment=train_data_augment,
                         model_type=model_type, model_config=model_config,
                     )
 
             # Plotting results
             print(f"\nGenerating plots for task: {task_key}...")
-            finetuning_dir = Path(cfg['results_dir']) / model_type
+            result_dir = Path(cfg['result_dir']) / cfg['data_split_type']
+            finetuning_dir = result_dir / model_type
             plot_task_results(
                 task_key=task_key,
                 task_specs=task_specs,
@@ -172,6 +177,7 @@ def train_model_run(
     task_key: str,
     train_fups: list[int],
     valid_fups: list[int],
+    test_fups: list[int],
     horizon: int,
     train_data_augment: str,
     model_type: str,
@@ -211,16 +217,19 @@ def train_model_run(
         fut_str = train_data_augment # e.g. "valid" or "all"
     fuv_str = format_fup_string(valid_fups)
     task_subdir = f"hrz({hrz_str})_fut({fut_str})_fuv({fuv_str})"
-    output_dir = Path(cfg['results_dir']) / model_type / task_key / task_subdir
+    result_dir = Path(cfg['result_dir']) / cfg['data_split_type']
+    output_dir = result_dir / model_type / task_key / task_subdir
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Train
+    inv_tusr = cfg.get('target_undersampling_ratio')
+    if inv_tusr is not None: target_us_ratio = 1.0 / inv_tusr  # cf. transformers
     trainer = OptunaTrainer(
         model_type=model_type,
         optuna_config=model_config.get('optuna_params', {}),
         n_trials=model_config.get('n_optuna_trials', 50),
         output_dir=output_dir,
-        target_ratio=cfg.get('target_undersampling_ratio', None),
+        target_ratio=target_us_ratio,
     )
     trainer.optimize_and_train(X_train, y_train, X_val, y_val)
 
@@ -230,6 +239,7 @@ def train_model_run(
         label_names=[label_key], 
         early_stopping_metric="roc_auc"
     )
+    all_predictions = {}  # to aggregate labels and model predictions
 
     # Calibration (on aggregated validation set)
     print("Fitting calibration...")
@@ -243,24 +253,36 @@ def train_model_run(
         label_key, ignore_cols, enforced_features=features,
     )
     if X_test_all is not None:
+        prefix = "test_all"
         metrics_all = trainer.evaluate(
-            X_test_all, y_test_all, evaluator, prefix="test_all",
+            X_test_all, y_test_all, evaluator, prefix=prefix,
         )
         final_metrics.update(metrics_all)
+        
+        # Grab the cached label and prediction arrays
+        for key, array in evaluator.saved_labels_and_probs.items():
+            all_predictions[f"{prefix}_{key}"] = array
 
     # Test per follow-up period (stratified)
-    for fup in valid_fups:
+    for fup in test_fups:
         X_test_fup, y_test_fup, _ = load_combined_data(
             data_root, [fup], "test.parquet",
             label_key, ignore_cols, enforced_features=features,
         )
         if X_test_fup is not None and len(X_test_fup) > 0:
+            prefix = f"test_fup_{fup:04d}"
             metrics_fup = trainer.evaluate(
-                X_test_fup, y_test_fup, evaluator, prefix=f"test_fup_{fup:04d}"
+                X_test_fup, y_test_fup, evaluator, prefix=prefix
             )
             final_metrics.update(metrics_fup)
+            
+            # Grab the cached arrays
+            for key, array in evaluator.saved_labels_and_probs.items():
+                all_predictions[f"{prefix}_{key}"] = array
 
-    # Save results
+    # Save metric results, label and predictions
+    preds_path = output_dir / "test_predictions.npz"
+    np.savez_compressed(preds_path, **all_predictions)
     json_path = output_dir / "test_results.json"
     with open(json_path, "w") as f:
         json.dump(final_metrics, f, indent=4)
@@ -339,12 +361,11 @@ class OptunaTrainer:
                 X_train, y_train, self.model_type, params, self.target_ratio,
             )
             
-            # Fit on Train, Score on Val (Simple Hold-out optimization)
+            # Fit on train, score on validation (simple hold-out optimization)
             # For more robustness, replace this with cross_val_score on X_train
             pipeline.fit(X_train, y_train)
             if hasattr(pipeline, "predict_proba"):
                 probs = pipeline.predict_proba(X_val)[:, 1]
-                # Using ROC-AUC as objective
                 try:
                     score = roc_auc_score(y_val, probs)
                 except ValueError:
@@ -491,7 +512,7 @@ def build_model_pipeline(X_train, y_train, model_type, model_params, target_rati
 
     # Binary: most frequent impute -> passthrough (already 0/1)
     bin_transformer = Pipeline([
-        ('imputer', SimpleImputer(strategy='most_frequent'))
+        ('imputer', SimpleImputer(strategy='constant', fill_value=0))
     ])
 
     # Combine into preprocessor

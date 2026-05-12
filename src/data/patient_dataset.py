@@ -86,10 +86,6 @@ def load_hf_data_and_metadata(
             with open(metadata_path / "vocab.pkl", "wb") as f: 
                 pickle.dump(vocab, f)
 
-    # Sanity check, if required
-    if sanity_check_output_dir is not None:
-        plot_category_distributions(dataset, bin_intervals, output_dir=sanity_check_output_dir)
-
     # Preprocessing (bin values, map tokens to IDs, format time entries)
     dataset = DatasetDict({
         split: ds.map(
@@ -102,6 +98,13 @@ def load_hf_data_and_metadata(
         )
         for split, ds in dataset.items()
     })
+    
+    # Sanity check, if required
+    if sanity_check_output_dir is not None:
+        plot_category_distributions(
+            dataset, vocab=vocab, output_dir=sanity_check_output_dir,
+            entity_key="entity_id", attribute_key="attribute_id", value_key="value_id"
+        )
 
     # Final formatting and filtering
     all_cols = dataset["train"].column_names
@@ -269,7 +272,12 @@ def _load_and_tag(
         
     # Concatenation is now a fast memory copy operation
     return concatenate_datasets(datasets) if len(datasets) > 0 else Dataset.from_dict({})
-
+    # if len(datasets) > 0:
+    #     concatenated = concatenate_datasets(datasets)
+    #     return concatenated.flatten_indices()  # flatten to realign PyArrow chunks
+    # else:
+    #     return Dataset.from_dict({})
+    
 
 def undersample_dataset(
     dataset: Dataset,
@@ -336,59 +344,112 @@ def undersample_dataset(
 
 def plot_category_distributions(
     dataset: DatasetDict,
-    bin_intervals: dict[str, pd.IntervalIndex],
+    vocab: dict[str, int],
     output_dir: str,
-    attribute_key: str = "attribute",
-    value_key: str = "value_binned"
+    entity_key: str = "entity_id",
+    attribute_key: str = "attribute_id",
+    value_key: str = "value_id",
+    max_samples: int = 50000, 
+    max_categories_to_plot: int = 50
 ):
     """
-    Plots the distribution of values for binned attributes
+    Plots distributions for all categorical attributes (binned or natively categorical).
+    - Decodes Integer IDs back to Strings.
+    - Organizes plots into subfolders based on Entity.
+    - Vectorized for speed.
     """
     print(f"Running sanity check: plotting distributions to {output_dir}")
-    os.makedirs(output_dir, exist_ok=True)
-
-    # We only care about attributes that were actually binned (exist in bin_intervals)
-    binned_attrs = set(bin_intervals.keys())
     
-    # Initialize counters for the relevant attributes
-    counts = defaultdict(lambda: defaultdict(int))
+    # 1. Create a Reverse Vocab to decode IDs -> Strings
+    id2token = {v: k for k, v in vocab.items()}
     
-    # Aggregate counts from the training set
-    for sample in tqdm(dataset["train"], desc="Aggregating plot data"):
-        attrs = sample[attribute_key]
-        vals = sample[value_key]
+    # 2. Load data efficiently into Pandas
+    # We use the training set and subsample if necessary to save RAM
+    ds = dataset["train"]
+    if len(ds) > max_samples:
+        print(f"Subsampling {max_samples} patients for plotting efficiency...")
+        ds = ds.select(range(max_samples))
         
-        # Zip attributes and values to count pairs
-        for a, v in zip(attrs, vals):
-            if a in binned_attrs:
-                counts[a][v] += 1
+    # Load only necessary columns
+    # This comes as lists of lists (sequences), e.g. [[1, 1, ...], [2, 2, ...]]
+    df = ds.select_columns([entity_key, attribute_key, value_key]).to_pandas()
     
-    # Generate and save plots
-    for attr, val_counts in tqdm(counts.items(), desc="Generating plots"):
+    # 3. Explode: Flatten sequences into individual events (Long format)
+    print("Flattening sequences for aggregation...")
+    df = df.explode([entity_key, attribute_key, value_key])
+    
+    # Remove padding (assuming 0 is PAD in your vocab)
+    df = df[df[entity_key] != 0]
 
-        # Calculate total for proportions
-        total = sum(val_counts.values())
-        if total == 0:
+    # 4. Decode: Convert Integers back to Strings
+    print("Decoding tokens...")
+    # Use map. fillna handles cases where an ID might not be in vocab (shouldn't happen)
+    df["entity"] = df[entity_key].map(id2token).fillna("Unknown_Entity")
+    df["attribute"] = df[attribute_key].map(id2token).fillna("Unknown_Attribute")
+    df["value"] = df[value_key].map(id2token).fillna("Unknown_Value")
+
+    # 5. Group and Plot
+    # We group by (Entity, Attribute) to separate the charts
+    grouped = df.groupby(["entity", "attribute"])
+    
+    # Helper to enforce specific order for binned values (Lowest -> Highest)
+    bin_order_map = {label: i for i, label in enumerate(BIN_LABELS)}
+    
+    for (ent_name, attr_name), group_df in tqdm(grouped, desc="Generating plots"):
+        
+        # Count occurrences of each value
+        val_counts = group_df["value"].value_counts()
+        
+        # --- CARDINALITY CHECK ---
+        # If an attribute has > 50 unique values (like Transplant Age), 
+        # it is likely continuous/numerical. We skip it to keep plots readable.
+        if len(val_counts) > max_categories_to_plot:
             continue
+        if len(val_counts) < 2:
+            continue # Skip constant values
 
-        # Plot raw counts
-        data_y = [val_counts.get(label, 0) for label in BIN_LABELS]
+        # --- SORTING LOGIC ---
+        unique_vals = val_counts.index.tolist()
+        
+        # If the values look like our Bin Labels (Low, High...), sort by logical order
+        if any(v in bin_order_map for v in unique_vals):
+            # Filter to keep only valid bin labels and sort them
+            valid_bins = [v for v in unique_vals if v in bin_order_map]
+            order = sorted(valid_bins, key=lambda x: bin_order_map[x])
+        else:
+            # Otherwise, sort by frequency (most frequent first)
+            order = val_counts.index.tolist()
+
+        # --- SAVE PLOT ---
+        # 1. Create Subfolder for the Entity
+        safe_ent = "".join(c if c.isalnum() or c in (' ', '-', '_') else "_" for c in str(ent_name)).strip()
+        safe_attr = "".join(c if c.isalnum() or c in (' ', '-', '_') else "_" for c in str(attr_name)).strip()
+        
+        entity_dir = os.path.join(output_dir, safe_ent)
+        os.makedirs(entity_dir, exist_ok=True)
+        
+        # 2. Plot
         plt.figure(figsize=(10, 6))
-        sns.barplot(x=BIN_LABELS, y=data_y, palette="viridis")
+        sns.barplot(
+            x=val_counts.reindex(order).index, 
+            y=val_counts.reindex(order).values, 
+            palette="viridis",
+            order=order
+        )
         
-        plt.title(f"Distribution for: {attr}")
-        plt.xlabel("Category")
+        plt.title(f"{ent_name}: {attr_name}")
+        plt.xlabel("Value")
         plt.ylabel("Count")
-        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        plt.xticks(rotation=45, ha='right')
+        plt.grid(axis='y', linestyle='--', alpha=0.5)
+        plt.tight_layout()
         
-        # Sanitize filename
-        safe_name = "".join(c if c.isalnum() or c in (' ', '-', '_') else "_" for c in attr).strip()
-        plt.savefig(os.path.join(output_dir, f"{safe_name}.png"))
+        plt.savefig(os.path.join(entity_dir, f"{safe_attr}.png"))
         plt.close()
 
     print(f"Sanity check complete. Plots saved to {output_dir}")
-    
-    
+       
+
 def format_eav_to_tree(df: pd.DataFrame) -> list[str]:
     """
     Format a dataframe group into a list of tree-like strings

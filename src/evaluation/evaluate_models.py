@@ -8,6 +8,7 @@ warnings.simplefilter(action="ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=SyntaxWarning, module="hdbscan")
 
 from sklearn.calibration import calibration_curve
+from sklearn.linear_model import LogisticRegression
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import (
     silhouette_score, adjusted_mutual_info_score, roc_curve,
@@ -17,7 +18,7 @@ from sklearn.metrics import (
 )
 from transformers.trainer_utils import EvalPrediction
 from scipy.stats import hmean, gmean
-from scipy.special import expit
+from scipy.special import expit, logit
 
 import optuna
 from optuna.samplers import TPESampler
@@ -379,13 +380,16 @@ class BaseEmbeddingEvaluatorForClassification:
         max_clustered_samples: int = 2500,
         label_names: list[str] = None,
         early_stopping_metric: str = "roc_auc",
+        enforce_monotonicity: bool = False,
     ):
         self.do_clustering = do_clustering
         self.max_clustered_samples = max_clustered_samples
         self.label_names = label_names
         self.early_stopping_metric = early_stopping_metric
+        self.enforce_monotonicity = enforce_monotonicity
         self.current_prefix = "eval"
-        self.calibrators = None 
+        self.calibrators = None
+        self.saved_labels_and_probs = None
         if do_clustering:
             self.clusterer_module = UMAP_HDBSCAN_Clusterer(n_optuna_trials=n_optuna_trials)
 
@@ -404,6 +408,16 @@ class BaseEmbeddingEvaluatorForClassification:
         num_labels = labels.shape[1]
         probs = expit(logits)  # sigmoid is valid for both binary (1 col) and multi-label
         probs_cal = self._apply_calibration_strategy(labels, probs)
+        if self.enforce_monotonicity and num_labels > 1:
+            probs_cal = np.maximum.accumulate(probs_cal, axis=1)
+            
+        # Expose arrays for saving (useful for the final test)
+        self.saved_labels_and_probs = {
+            "labels": labels,
+            "probs": probs,
+            "probs_cal": probs_cal,
+            # "embeddings": embeddings,  # could be used for cluster analysis
+        }
 
         # Prepare metrics for logging by Huggingface's Trainer
         metrics = {}
@@ -436,8 +450,8 @@ class BaseEmbeddingEvaluatorForClassification:
         if valid_early_stopping_metric:
             valid_early_stopping_metric = np.array(valid_early_stopping_metric) + 1e-6
             # metrics["early_stopping_metric"] = np.mean(valid_early_stopping_metric)
-            # metrics["early_stopping_metric"] = hmean(valid_early_stopping_metric)
-            metrics["early_stopping_metric"] = gmean(valid_early_stopping_metric)
+            metrics["early_stopping_metric"] = hmean(valid_early_stopping_metric)
+            # metrics["early_stopping_metric"] = gmean(valid_early_stopping_metric)
         else:
             metrics["early_stopping_metric"] = 0.0  # fallback if nothing valid
 
@@ -453,16 +467,17 @@ class BaseEmbeddingEvaluatorForClassification:
                 self._log_multilabel_plots(labels, probs, probs_cal)
 
         return metrics
-
+    
     def _apply_calibration_strategy(self, labels, probs):
-        """Calibrate model output probabilities given outcome probabilities."""
+        """
+        Calibrate model output probabilities using Platt scaling (logistic regression)
+        """
         is_train = "test" not in self.current_prefix
         num_labels = labels.shape[1]
 
-        # Init list if needed
         if is_train and self.calibrators is None:
             self.calibrators = [
-                IsotonicRegression(out_of_bounds="clip", y_min=0, y_max=1) 
+                LogisticRegression(penalty=None, solver='lbfgs') 
                 for _ in range(num_labels)
             ]
         
@@ -471,14 +486,67 @@ class BaseEmbeddingEvaluatorForClassification:
 
         probs_cal = np.zeros_like(probs)
         for i in range(num_labels):
+            # Isolate only the valid labels (ignore -100)
+            valid_mask = labels[:, i] != -100
+            if valid_mask.sum() == 0:
+                probs_cal[:, i] = probs[:, i]
+                continue
+                
+            # Extract valid subsets
+            valid_labels = labels[valid_mask, i]
+            safe_probs = np.clip(probs[valid_mask, i], 1e-7, 1 - 1e-7)
+            logits_i = logit(safe_probs).reshape(-1, 1)
+
             try:
-                if is_train:
-                    self.calibrators[i].fit(probs[:, i], labels[:, i])
-                probs_cal[:, i] = self.calibrators[i].transform(probs[:, i])
-            except Exception:
-                probs_cal[:, i] = probs[:, i]  # fallback
+                # Fit only if in training mode and we have both positive and negative samples
+                if is_train and len(np.unique(valid_labels)) > 1:
+                    self.calibrators[i].fit(logits_i, valid_labels)
+                
+                # Predict safely 
+                if hasattr(self.calibrators[i], 'classes_'):
+                    pos_idx = np.where(self.calibrators[i].classes_ == 1)[0]
+                    if len(pos_idx) > 0:
+                        probs_cal[valid_mask, i] = self.calibrators[i].predict_proba(logits_i)[:, pos_idx[0]]
+                    else:
+                        probs_cal[valid_mask, i] = 0.0
+                else:
+                    # Model not fitted yet (e.g., first evaluation step had no valid positive labels)
+                    probs_cal[valid_mask, i] = probs[valid_mask, i]
+                    
+            except Exception as e:
+                # Fallback to raw probabilities if anything fails
+                probs_cal[valid_mask, i] = probs[valid_mask, i]
+                
+            # Keep raw probabilities for the -100 tokens (they get ignored in metrics anyway)
+            probs_cal[~valid_mask, i] = probs[~valid_mask, i]
         
         return np.clip(probs_cal, 0.0, 1.0)
+
+    # def _apply_calibration_strategy(self, labels, probs):
+    #     """Calibrate model output probabilities given outcome probabilities."""
+    #     is_train = "test" not in self.current_prefix
+    #     num_labels = labels.shape[1]
+
+    #     # Init list if needed
+    #     if is_train and self.calibrators is None:
+    #         self.calibrators = [
+    #             IsotonicRegression(out_of_bounds="clip", y_min=0, y_max=1) 
+    #             for _ in range(num_labels)
+    #         ]
+        
+    #     if self.calibrators is None:
+    #         return probs
+
+    #     probs_cal = np.zeros_like(probs)
+    #     for i in range(num_labels):
+    #         try:
+    #             if is_train:
+    #                 self.calibrators[i].fit(probs[:, i], labels[:, i])
+    #             probs_cal[:, i] = self.calibrators[i].transform(probs[:, i])
+    #         except Exception:
+    #             probs_cal[:, i] = probs[:, i]  # fallback
+        
+    #     return np.clip(probs_cal, 0.0, 1.0)
 
     def _compute_single_label_metrics(self, y_true, y_prob, y_cal):
         """

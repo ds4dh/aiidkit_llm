@@ -31,6 +31,7 @@ class PatientEmbeddingModelFactory:
         config_args: dict={},
         model_args: dict={},
         load_backbone_weights: bool=False,
+        enforce_monotonicity: bool=False,
     ):
         """
         Creates a new patient model by grafting a custom embedding layer onto a standard backbone
@@ -42,6 +43,7 @@ class PatientEmbeddingModelFactory:
 
         # Load model configuration from huggingface's directory
         config = AutoConfig.from_pretrained(model_id, **config_args, **model_args)
+        config.enforce_monotonicity = enforce_monotonicity
 
         # Initialize the backbone (pre-trained or random)
         model_cls = cls._get_model_class(task)
@@ -54,7 +56,7 @@ class PatientEmbeddingModelFactory:
             print(f"Initializing {model_id} backbone with random weights.")
             model = model_cls.from_config(config, **model_args)
 
-        # Initialize Custom Layer (Always random at creation)
+        # Initialize custom bayer (always random at creation)
         custom_embed = PatientEmbeddingLayer(
             embedding_dim=config.hidden_size, **embedding_layer_config,
         )
@@ -70,6 +72,7 @@ class PatientEmbeddingModelFactory:
         embedding_layer_config: dict,
         model_args: dict = {},
         reset_weights: bool = False,
+        enforce_monotonicity: bool = False,
         **kwargs,
     ):
         """
@@ -79,6 +82,7 @@ class PatientEmbeddingModelFactory:
         # Load Config from the local directory
         model_args.update(kwargs)  # in case some were given as top-level arguments
         config = AutoConfig.from_pretrained(pretrained_dir, **model_args)
+        config.enforce_monotonicity = enforce_monotonicity
 
         # Build the skeleton with random weights
         model_cls = cls._get_model_class(task)
@@ -128,8 +132,26 @@ class PatientEmbeddingModelFactory:
         def custom_forward(self, input_dict=None, inputs_embeds=None, **kwargs):
             inputs_embeds = self.patient_embedder(**input_dict)
             outputs = self.original_forward(inputs_embeds=inputs_embeds, **kwargs)
+            
+            # Enforce monotonic logits multi-label classification (discrete survival analysis)
+            is_monotonic = getattr(self.config, "enforce_monotonicity", False)
+            is_multilabel = getattr(self.config, "problem_type", None) == "multi_label_classification"
+            if is_monotonic and is_multilabel and hasattr(outputs, "logits"):
+                raw_logits = outputs.logits
+                if raw_logits.shape[-1] > 1:  # only if we have more than one horizon
+                    monotonic_logits = [raw_logits[:, 0]]
+                    for i in range(1, raw_logits.shape[-1]):
+                        
+                        # Force the next horizon's logit to be strictly greater than the previous
+                        next_logit = monotonic_logits[-1] + torch.nn.functional.softplus(raw_logits[:, i])
+                        monotonic_logits.append(next_logit)
+                    
+                    outputs.logits = torch.stack(monotonic_logits, dim=1)
+            
+            # Remove hidden states from output to save memory if not needed
             if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
                 outputs.hidden_states = (outputs.hidden_states[-1],)
+                
             return outputs
 
         # Apply monkey patch
@@ -175,12 +197,23 @@ class PatientEmbeddingLayer(nn.Module):
         self.use_direct_text_input = use_direct_text_input
         self.sentence_embedding_model = sentence_embedding_model
 
-        # Time embedding layer (always used)
+        # Time embedding layers (always used)
         self.time_embedding = TimeEmbedding(embedding_dim)
+        self.delta_time_embedding = TimeEmbedding(embedding_dim)
 
         # Train from scratch (using medical code vocabulary and embedding layer)
         if not use_direct_text_input:
             self.token_embedding = nn.Embedding(vocab_size, embedding_dim)
+            self.eav_projector = nn.Sequential(
+                nn.Linear(embedding_dim * len(self.eav_keys), embedding_dim),
+                nn.LayerNorm(embedding_dim),
+                nn.Dropout(0.1),
+            )
+            self.time_projector = nn.Sequential(
+                nn.Linear(embedding_dim * 3, embedding_dim),
+                nn.LayerNorm(embedding_dim),
+                nn.Dropout(0.1),
+            )
 
         # Use a pretrained sentence transformer to embed textual event descriptions
         else:
@@ -270,6 +303,22 @@ class PatientEmbeddingLayer(nn.Module):
 
         return eav_embeddings
 
+    def add_time_embeddings(
+        self,
+        x: torch.Tensor,
+        times: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Add both absolute and delta time embeddings to the input tensor
+        """
+        delta_times = times.clone()
+        delta_times[:, 1:] = times[:, 1:] - times[:, :-1]
+        delta_times[:, 0] = 0  # default delta for the very first event
+        t_abs = self.time_embedding(times)
+        t_delta = self.delta_time_embedding(delta_times)
+        
+        return self.time_projector(torch.cat([x, t_abs, t_delta], dim=-1))
+
     def forward(self, **kwargs) -> torch.Tensor:
         """
         Forward pass for the patient embedding layer.
@@ -278,12 +327,13 @@ class PatientEmbeddingLayer(nn.Module):
         if self.use_direct_text_input:
             x = self._get_sentence_embedding_model(kwargs)
         else:
-            x = sum(self.token_embedding(kwargs[key]) for key in self.eav_keys)
+            eav_embeds = [self.token_embedding(kwargs[key]) for key in self.eav_keys]
+            x = self.eav_projector(torch.cat(eav_embeds, dim=-1))  # x = sum(eav_embeds)
 
         # Add time embeddings to the base embeddings
         x = x.to(kwargs[self.time_key].device)
-        x = x + self.time_embedding(x, kwargs[self.time_key])
-            
+        x = self.add_time_embeddings(x, kwargs[self.time_key])  # x = x + self.time_embedding(x, kwargs[self.time_key])
+        
         return x
 
 
@@ -438,17 +488,31 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
     def _truncate_sequences(
         self,
         samples: list[dict[str, np.ndarray]],
+        head_budget: int = 128,  # more or less how many static or past items exist
     ) -> list[dict[str, np.ndarray]]:
         """
-        Truncate samples longer than the maximum allowed sequence length
+        Truncate samples longer than the maximum allowed sequence length.
+        - Training: Random continuous crop (data augmentation).
+        - Eval/Test: Middle truncation (keep the first `head_budget` static events 
+                     and the most recent tail events).
         """
         effective_max_len = self.max_position_embeddings - 2  # for bos and eos tokens
+        
         for i, sample in enumerate(samples):
             seq_len = next(iter(sample.values())).shape[0]
+            
             if seq_len > effective_max_len:
-                start_idx = random.randint(0, seq_len - effective_max_len)
-                end_idx = start_idx + effective_max_len
-                samples[i] = {key: val[start_idx:end_idx] for key, val in sample.items()}
+                if self.do_augmentation:  # random crop for training robustness
+                    start_idx = random.randint(0, seq_len - effective_max_len)
+                    end_idx = start_idx + effective_max_len
+                    samples[i] = {key: val[start_idx:end_idx] for key, val in sample.items()}
+                else:  # middle truncation: head (static data) + tail (recent data)
+                    tail_budget = effective_max_len - head_budget
+                    indices = np.concatenate([
+                        np.arange(head_budget), 
+                        np.arange(seq_len - tail_budget, seq_len)
+                    ])
+                    samples[i] = {key: val[indices] for key, val in sample.items()}
 
         return samples
 

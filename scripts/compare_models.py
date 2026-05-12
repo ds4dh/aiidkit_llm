@@ -1,554 +1,576 @@
-import argparse
-import json
 import re
+import numpy as np
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
-from typing import List, Dict, Any, Optional
+from typing import Dict
 from pathlib import Path
+from collections import defaultdict
+from sklearn.metrics import (
+    roc_auc_score, average_precision_score, brier_score_loss,
+    accuracy_score, balanced_accuracy_score, precision_score, 
+    recall_score, f1_score, precision_recall_curve
+)
 
-TRANSFORMER_DIRS = {
-    "infection_bacteria": "results_optuna_infection_bacteria/trial_032/e05-a35-v35",
-    # "infection_virus":    "results_optuna_infection_virus/trial_015/best_run",
-    # "death":              "results_optuna_death/trial_005/e20-a10",
-    # "graft_loss":         "results_optuna_graft_loss/trial_099/run_v2",
+# Configuration
+TRANSFORMER_BASE_DIRS = {
+    "infection_bacteria": Path("results_optuna/infection_bacteria/trial_033"),
+    "infection_virus": Path("results_optuna/infection_virus/trial_034"),
+    "death": Path("results_optuna/death/trial_040"),
+    "graft_loss": Path("results_optuna/graft_loss/trial_000"),
 }
-TASKS_TO_PLOT = list(TRANSFORMER_DIRS.keys())
+TRANSFORMER_PT_CONFIGS = {
+    "infection_bacteria": "e10-a10-v40",
+    "infection_virus": "e10-a05-v45",
+    "death": "e00-a20-v40",
+    "graft_loss": "e10-a25-v30",
+}
+CLASSIC_ML_BASE_DIR = Path("results_classic_ml")
+OUTPUT_DIR = Path("results_compared")
+SPLIT_TYPES = [
+    "random_split",
+    "temporal_split",
+    "center_split",
+]
+CLASSIC_ML_MODELS_TO_PLOT = [
+    "logistic_regression",
+    "random_forest",
+    "xgboost",
+]
+BEST_CLASSIC_ML_MODEL = "xgboost"
+TASKS = [
+    "infection_bacteria", 
+    "infection_virus",
+    "death",
+    "graft_loss",
+]
+
+# Clinical periods definition (horizon: [fups])
+def get_phase_windows(start, end, horizons, step=30):
+    return {h: w for h in horizons if (w := list(range(start, end + 1 - h, step)))}
+CLINICAL_PERIODS_INFECTIONS = {
+    "Perioperative\nphase (0-1 mo)": get_phase_windows(0, 30, [30, 60, 90]),
+    "Opportunistic\nphase (1-6 mo)": get_phase_windows(30, 180, [30, 60, 90]),
+    "Maintenance\nphase (6-12 mo)":  get_phase_windows(180, 360, [30, 60, 90]),
+    "Long-term\nphase (1-2 yr)":     get_phase_windows(360, 720, [30, 60, 90]),
+}
+CLINICAL_PERIODS_OUTCOMES = {
+    "Short-term\nphase (0-2 yr)":  get_phase_windows(0, 720, [360, 720, 1080, 1800]),
+    "Middle-term\nphase (2-5 yr)": get_phase_windows(720, 1800, [360, 720, 1080, 1800]),
+    "Long-term\nphase (5-10 yr)":  get_phase_windows(1800, 3600, [360, 720, 1080, 1800]),
+}
+CLINICAL_PERIOD_DICT = {
+    "infection_bacteria": CLINICAL_PERIODS_INFECTIONS,
+    "infection_virus": CLINICAL_PERIODS_INFECTIONS,
+    "death": CLINICAL_PERIODS_OUTCOMES,
+    "graft_loss": CLINICAL_PERIODS_OUTCOMES,
+}
+
+# Prognostic period definition (horizon: [fups])
+PROGNOSTIC_PERIODS_INFECTIONS = {
+    "Full length\n horizon (30 d)":  get_phase_windows(0, 3600, [30]),
+    "Full length\n horizon (60 d)":  get_phase_windows(0, 3600, [60]),
+    "Full length\n horizon (90 d)":  get_phase_windows(0, 3600, [90]),
+}
+PROGNOSTIC_PERIODS_OUTCOMES = {
+    "Full length\n horizon (30 d)":  get_phase_windows(0, 3600, [30]),
+    "Full length\n horizon (60 d)":  get_phase_windows(0, 3600, [60]),
+    "Full length\n horizon (90 d)":  get_phase_windows(0, 3600, [90]),
+}
+PROGNOSTIC_PERIOD_DICT = {
+    "infection_bacteria": PROGNOSTIC_PERIODS_INFECTIONS,
+    "infection_virus": PROGNOSTIC_PERIODS_INFECTIONS,
+    "death": PROGNOSTIC_PERIODS_OUTCOMES,
+    "graft_loss": PROGNOSTIC_PERIODS_OUTCOMES,
+}
+
+# What is evaluated
+# For threshold-fixed metrics, use "<metric_name>_t<level>", e.g., "f1_t10"
+# For recall-fixed metrics, use "<metric_name>_rec<level>", e.g., "f1_rec90"
+# For best-f1-score metrics, use "<metric_name>_best_f1", e.g., "f1_best_f1"
 METRICS_OF_INTEREST = {
-    "roc_auc": "ROC AUC (↑)",
-    # "pr_auc": "PR AUC (↑)",
-    "ece": "ECE (↓)",
-    # "brier": "Brier Score (↓)",
-    "nb_t10": "Net benefit - thresh. 50% (↑)",
-    "bal_acc_t10": "Balanced acc. - thresh. 50%  (↑)",
+    "roc_auc": "ROC AUC (→)",
+    "pr_auc": "PR AUC (→)",
+    "brier": "Brier score (←)",
+    "ece": "ECE (←)",
+    "bal_acc_t10": "Balanced acc. (→)",
+    # "recall_t10": "Recall (→)",
+    # "precision_t10": "Precision (→)",
+    "f1_t10": "F1-score (→)",
+    "nb_t10": "Net benefit (→)",
 }
-LOWER_IS_BETTER = ["brier", "ece"]
-COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
-DEFAULT_BASE_DIR_CLASSIC_ML = "results_classic_ml"
 
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Compare transformer vs classic ML baselines.")
-    parser.add_argument(
-        "--baselines_dir", "-b", type=str, default=DEFAULT_BASE_DIR_CLASSIC_ML,
-        help="Path to the classic ML results root (e.g., results_classic_ml)",
-    )
-    # Note: Transformer paths are now handled via the TRANSFORMER_DIRS dict at the top of the script
-    parser.add_argument(
-        "--output_dir", "-o", type=str, default="results_compared",
-        help="Directory to save tables and plots.",
-    )
-    parser.add_argument(
-        "--best_baseline", type=str, default="random_forest",  # "random_forest",
-        help="Name of the baseline model to use for direct plotting comparisons.",
-    )
-    return parser.parse_args()
+# For plotting
+COLORS = [
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", 
+    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"
+]
+AGGREGATION_SCHEME = [(float('inf'), 1)]
 
 
 def main():
-    args = parse_args()
-    output_path = Path(args.output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    baselines_path = Path(args.baselines_dir)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     
-    # Load zransformer data from multiple task-specific folders
-    print(">>> Loading transformer results...")
-    trans_records = []
+    print(">>> Loading raw prediction data across all splits...")
+    raw_data_pool = load_all_raw_predictions()
     
-    for task_name, dir_path in TRANSFORMER_DIRS.items():
-        if task_name not in TASKS_TO_PLOT:
-            continue
-            
-        t_path = Path(dir_path)
-        if not t_path.exists():
-            print(f"   [WARNING] Path for '{task_name}' not found: {t_path}")
-            continue
-            
-        print(f"   Loading '{task_name}' from: {t_path}")
-        # Force the model name to "Transformer" so they all group together in plots
-        task_records = load_results_from_dir(t_path, model_name_override="Transformer")
-        trans_records.extend(task_records)
-
-    df_trans = pd.DataFrame(trans_records)
-    
-    if not df_trans.empty:
-        df_trans = df_trans[df_trans["Task"].isin(TASKS_TO_PLOT)]
-
-    # Load classic ML data from single root folder
-    print(f">>> Loading classic ML baseline results from {baselines_path}...")
-    df_base = pd.DataFrame(load_results_from_dir(baselines_path))
-    
-    if df_trans.empty and df_base.empty:
-        print("No results found. Check your paths in the script configuration!")
+    if not raw_data_pool:
+        print("No results found. Check your paths in the configuration!")
         return
 
-    # --- Combine ---
-    full_df = pd.concat([df_trans, df_base], ignore_index=True)
-    
-    # Global filter for tasks
-    full_df = full_df[full_df["Task"].isin(TASKS_TO_PLOT)]
-    
-    if full_df.empty:
-        print("Data loaded but no matching tasks found. Check TASKS_TO_PLOT.")
-        return
+    print(">>> Computing metrics...")
+    granular_df = compute_granular_metrics(raw_data_pool)
+    period_df = compute_period_metrics(raw_data_pool)
 
-    # --- Generate performance summary and detailed tables ---
-    print("\n>>> Generating comparison tables...")
-    generate_overall_summary(full_df, output_path)
-    generate_table(full_df, output_path)
-    
-    # --- Generate plots ---
-    print("\n>>> Generating advantage scatterplots...")
-    plot_advantage_scatter(
-        full_df, 
-        baseline_name=args.best_baseline, 
-        transformer_name="Transformer",
-        output_dir=output_path
-    )
-    
-    print(">>> Generating delta heatmaps...")
-    plot_delta_heatmap(
-        full_df, 
-        baseline_name=args.best_baseline, 
-        transformer_name="Transformer",
-        output_dir=output_path
-    )
+    # Process each task in its own dedicated figure
+    for task in TASKS:
+        print(f"\n{'='*50}")
+        print(f">>> Processing Task: {task.upper()}")
+        print(f"{'='*50}")
+        
+        # Filter data for the current task
+        task_granular = granular_df[granular_df["Task"] == task].copy()
+        task_period = period_df[period_df["Task"] == task].copy()
+
+        if task_granular.empty or task_period.empty:
+            print(f"No data found for task '{task}'. Skipping.")
+            continue
+
+        print(f"  Generating delta heatmap for {task}...")
+        plot_delta_heatmap(
+            df=task_granular, 
+            baseline_name=BEST_CLASSIC_ML_MODEL, 
+            transformer_name="Transformer",
+            output_dir=OUTPUT_DIR,
+            task_name=task,
+        )
+
+        print(f"  Generating period performance bar charts for {task}...")
+        plot_period_performance_bars(
+            df=task_period,
+            task_name=task,
+            output_dir=OUTPUT_DIR,
+        )
+        
+        print(f"  Generating performance tables for {task}...")
+        generate_performance_summaries(
+            df=task_period, 
+            output_dir=OUTPUT_DIR, 
+            task_name=task,
+        )
     
     print("\nDone.")
 
 
-def parse_json_key(key: str) -> Optional[Dict[str, Any]]:
+def expected_calibration_error(y_true, y_prob, n_bins=10):
     """
-    Parses a results JSON key like: 'test_fup_0030_roc_auc_label_infection_bacteria_0090d'
-    Returns a dict with metadata or None if irrelevant.
+    Calculates the expected calibration error (ECE) across predefined bins
     """
-    # Regex to capture: fup, metric, task, horizon
-    # Pattern looks for: test_fup_{INT}_{METRIC_NAME}_label_{TASK}_{INT}d
-    
-    # Extract follow-up period
-    fup_match = re.search(r"test_fup_(\d+)_", key)
-    if not fup_match:
-        return None
-    fup = int(fup_match.group(1))
-    
-    # Extract horizon
-    hrz_match = re.search(r"_(\d+)d$", key)
-    if not hrz_match:
-        return None
-    horizon = int(hrz_match.group(1))
-    
-    # Extract task and metric (strip prefix/suffix to isolate "metric_label_task")
-    core = key[fup_match.end():hrz_match.start()] # e.g., "roc_auc_label_infection_bacteria"
-    if "_label_" not in core:
-        return None        
-    metric_raw, task_raw = core.split("_label_", 1)
-    
-    # Filter only metrics we care about
-    if metric_raw not in METRICS_OF_INTEREST:
-        return None
-        
-    return {
-        "fup": fup,
-        "horizon": horizon,
-        "task": task_raw,
-        "metric": metric_raw
+    bin_boundaries = np.linspace(0, 1, n_bins + 1)
+    bin_indices = np.digitize(y_prob, bin_boundaries[1:-1])
+    ece = 0.0
+    for i in range(n_bins):
+        in_bin = (bin_indices == i)
+        n_in_bin = np.sum(in_bin)
+        if n_in_bin > 0:
+            acc_in_bin = np.mean(y_true[in_bin])
+            conf_in_bin = np.mean(y_prob[in_bin])
+            ece += np.abs(acc_in_bin - conf_in_bin) * n_in_bin
+    return ece / len(y_true)
+
+
+def get_metrics_from_arrays(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    y_cal: np.ndarray,
+) -> dict:
+    """
+    Computes metrics dynamically based on the requested metric of interest
+    """
+    if len(np.unique(y_true)) < 2: 
+        return {}
+
+    results = {
+        "roc_auc": roc_auc_score(y_true, y_prob),
+        "pr_auc": average_precision_score(y_true, y_prob),
+        "brier": brier_score_loss(y_true, y_cal),
+        "ece": expected_calibration_error(y_true, y_cal),
     }
 
+    # Helper to calculate Net Benefit
+    def calc_net_benefit(preds, t):
+        tp = np.sum((preds == 1) & (y_true == 1))
+        fp = np.sum((preds == 1) & (y_true == 0))
+        n = len(y_true)
+        weight = t / (1 - t) if t < 1.0 else 0
+        return (tp / n) - (fp / n) * weight
 
-def load_results_from_dir(root_path: Path, model_name_override: str = None) -> List[Dict]:
-    """
-    Recursively finds test_results.json files and extracts metrics.
-    """
-    data_records = []
+    # Parse requested thresholds
+    requested_fixed_thresholds = set()
+    requested_recall_targets = set()
+    needs_best_f1 = False
     
-    # Find all test_results.json files
-    json_files = list(root_path.rglob("test_results.json"))
-    
-    # Only print scanning message if there are actually files, to reduce clutter in the loop
-    if json_files:
-        # print(f"Scanning {root_path}: Found {len(json_files)} result files.")
-        pass
-
-    for file_path in json_files:
-        try:
-            with open(file_path, 'r') as f:
-                results = json.load(f)
-        except Exception as e:
-            print(f"Error reading {file_path}: {e}")
-            continue
-
-        # Determine model name if not provided
-        if model_name_override:
-            model_name = model_name_override
+    for key in METRICS_OF_INTEREST.keys():
+        if "_best_f1" in key:
+            needs_best_f1 = True
         else:
-            # Heuristic: For baselines, the model name is usually 2 levels up from the file
-            # e.g., xgboost/infection_bacteria/hrz.../test_results.json
-            parts = file_path.parts
-            try:
-                # Find relative position. Assuming structure: root / model / task / subfolder / file
-                # You might need to adjust this index based on your exact folder depth
-                model_name = parts[-4] 
-            except IndexError:
-                model_name = "Unknown"
+            # Check for fixed thresholds (e.g., _t05)
+            match_t = re.search(r'_t(\d+)$', key)
+            if match_t:
+                requested_fixed_thresholds.add(match_t.group(1))
+            
+            # Check for target recall thresholds (e.g., _rec90)
+            match_rec = re.search(r'_rec(\d+)$', key)
+            if match_rec:
+                requested_recall_targets.add(match_rec.group(1))
 
-        for key, value in results.items():
-            meta = parse_json_key(key)
-            if meta:
-                data_records.append({
-                    "Model": model_name,
-                    "Task": meta["task"],
-                    "Horizon": meta["horizon"],
-                    "FUP": meta["fup"],
-                    "Metric": meta["metric"],
-                    "Value": value
-                })
+    # Compute PR curve just once if needed by Best F1 or Target Recall
+    if needs_best_f1 or requested_recall_targets:
+        precisions, recalls, thresholds = precision_recall_curve(y_true, y_prob)
+
+    # Compute F1-optimal threshold if requested
+    if needs_best_f1:
+        denominator = precisions + recalls
+        denominator[denominator == 0] = 1e-9
+        f1_scores = (2 * precisions * recalls) / denominator
+        f1_scores = f1_scores[:-1] 
+        
+        best_thresh = thresholds[np.argmax(f1_scores)] if len(f1_scores) > 0 else 0.5
+        preds_best = (y_prob >= best_thresh).astype(int)
+        
+        results.update({
+            "acc_best_f1": accuracy_score(y_true, preds_best),
+            "bal_acc_best_f1": balanced_accuracy_score(y_true, preds_best),
+            "precision_best_f1": precision_score(y_true, preds_best, zero_division=0),
+            "recall_best_f1": recall_score(y_true, preds_best, zero_division=0),
+            "f1_best_f1": f1_score(y_true, preds_best, zero_division=0),
+            "nb_best_f1": calc_net_benefit(preds_best, best_thresh)
+        })
+
+    # Compute dynamically for target recall thresholds
+    for rec_str in requested_recall_targets:
+        target_recall = int(rec_str) / 100.0
+        
+        valid_idx = np.where(recalls[:-1] >= target_recall)[0]
+        if len(valid_idx) > 0:
+            rec_thresh = thresholds[valid_idx[-1]]
+        else:
+            rec_thresh = 0.0 
+            
+        preds_rec = (y_prob >= rec_thresh).astype(int)
+        rec_suffix = f"rec{rec_str}"
+        
+        results.update({
+            f"acc_{rec_suffix}": accuracy_score(y_true, preds_rec),
+            f"bal_acc_{rec_suffix}": balanced_accuracy_score(y_true, preds_rec),
+            f"precision_{rec_suffix}": precision_score(y_true, preds_rec, zero_division=0),
+            f"recall_{rec_suffix}": recall_score(y_true, preds_rec, zero_division=0),
+            f"f1_{rec_suffix}": f1_score(y_true, preds_rec, zero_division=0),
+            f"nb_{rec_suffix}": calc_net_benefit(preds_rec, rec_thresh)
+        })
+
+    # Compute dynamically for fixed 'tXX' thresholds
+    for t_str in requested_fixed_thresholds:
+        t_float = int(t_str) / 100.0
+        preds_t = (y_prob >= t_float).astype(int)
+        t_suffix = f"t{t_str}"
+        
+        results.update({
+            f"acc_{t_suffix}": accuracy_score(y_true, preds_t),
+            f"bal_acc_{t_suffix}": balanced_accuracy_score(y_true, preds_t),
+            f"precision_{t_suffix}": precision_score(y_true, preds_t, zero_division=0),
+            f"recall_{t_suffix}": recall_score(y_true, preds_t, zero_division=0),
+            f"f1_{t_suffix}": f1_score(y_true, preds_t, zero_division=0),
+            f"nb_{t_suffix}": calc_net_benefit(preds_t, t_float)
+        })
+
+    return results
+
+
+def load_all_raw_predictions() -> Dict:
+    raw_pool = defaultdict(lambda: defaultdict(
+        lambda: defaultdict(lambda: defaultdict(dict))
+    ))
+    
+    for split in SPLIT_TYPES:
+        for task in TASKS:
+            # Transformer data
+            base_dir = TRANSFORMER_BASE_DIRS[task]
+            pt_config = TRANSFORMER_PT_CONFIGS[task]
+            t_path = base_dir / split / pt_config / "finetuning" / task
+            if t_path.exists():
+                _extract_npz_to_pool(t_path, "Transformer", split, task, raw_pool)
                 
-    return data_records
+            # Classic ML data
+            for ml_model in CLASSIC_ML_MODELS_TO_PLOT:
+                c_path = CLASSIC_ML_BASE_DIR / split / ml_model / task
+                if c_path.exists():
+                    _extract_npz_to_pool(c_path, ml_model, split, task, raw_pool)
+                    
+    return raw_pool
 
 
-def generate_table(df: pd.DataFrame, output_dir: Path):
+def _extract_npz_to_pool(task_dir: Path, model_name: str, split: str, task: str, pool: Dict):
+    for npz_file in task_dir.rglob("*.npz"):
+        match = re.search(r"hrz\(([\d-]+)\)", npz_file.parent.name)
+        if not match: continue
+        horizons = [int(h) for h in match.group(1).split("-")]
+        
+        try: data = np.load(npz_file)
+        except Exception: continue
+            
+        fup_keys = {int(re.match(r"^test_fup_(\d+)_", k).group(1)) for k in data.keys() if re.match(r"^test_fup_(\d+)_", k)}
+        for fup in fup_keys:
+            l_key, p_key, pc_key = f"test_fup_{fup:04d}_labels", f"test_fup_{fup:04d}_probs", f"test_fup_{fup:04d}_probs_cal"
+            if l_key not in data or p_key not in data: continue
+            
+            labels, probs = data[l_key], data[p_key]
+            probs_cal = data[pc_key] if pc_key in data else probs
+            
+            for col_idx, h in enumerate(horizons):
+                l_col = labels if labels.ndim == 1 else labels[:, col_idx]
+                p_col = probs if probs.ndim == 1 else probs[:, col_idx]
+                pc_col = probs_cal if probs_cal.ndim == 1 else probs_cal[:, col_idx]
+                    
+                pool[split][model_name][task][h][fup] = {"labels": l_col, "probs": p_col, "probs_cal": pc_col}
+
+
+def compute_granular_metrics(raw_pool: Dict) -> pd.DataFrame:
     """
-    Generates 4 separate rich comparison tables.
+    Calculates metrics individually for every FUP/horizon
     """
-    # Pivot data to wide format
-    pivot_df = df.pivot_table(
-        index=["Task", "Horizon", "FUP", "Metric"], 
-        columns="Model", 
-        values="Value"
-    )
+    records = []
+    for split, models in raw_pool.items():
+        for model, tasks in models.items():
+            for task, horizons in tasks.items():
+                for h, fups in horizons.items():
+                    for fup, arrays in fups.items():
+                        
+                        y_true, y_prob, y_cal = arrays["labels"], arrays["probs"], arrays["probs_cal"]
+                        mask = y_true != -100
+                        if not mask.any(): continue
+                        
+                        metrics = get_metrics_from_arrays(y_true[mask], y_prob[mask], y_cal[mask])
+                        for m_name, m_val in metrics.items():
+                            if m_name in METRICS_OF_INTEREST:
+                                records.append({
+                                    "Split": split, "Model": model, "Task": task, 
+                                    "Horizon": h, "FUP": fup, "Metric": m_name, "Value": m_val
+                                })
     
-    # Enforce column order: LogReg -> RF -> XGB -> Transformer
-    desired_order = ["logistic_regression", "random_forest", "xgboost", "Transformer"]
-    existing_cols = [c for c in desired_order if c in pivot_df.columns]
-    remaining_cols = [c for c in pivot_df.columns if c not in existing_cols]
-    final_cols = existing_cols + remaining_cols
-    
-    pivot_df = pivot_df[final_cols]
-
-    # Define Filters
-    # Helper to check if task is an infection task
-    is_infection = lambda x: x.startswith("infection")
-    
-    # ROC AUC - Infections
-    df_roc_inf = pivot_df[
-        (pivot_df.index.get_level_values("Metric") == "roc_auc") & 
-        (pivot_df.index.get_level_values("Task").map(is_infection))
-    ]
-    
-    # PR AUC - Infections
-    df_pr_inf = pivot_df[
-        (pivot_df.index.get_level_values("Metric") == "pr_auc") & 
-        (pivot_df.index.get_level_values("Task").map(is_infection))
-    ]
-    
-    # ROC AUC - Others
-    df_roc_oth = pivot_df[
-        (pivot_df.index.get_level_values("Metric") == "roc_auc") & 
-        (~pivot_df.index.get_level_values("Task").map(is_infection))
-    ]
-    
-    # PR AUC - Others
-    df_pr_oth = pivot_df[
-        (pivot_df.index.get_level_values("Metric") == "pr_auc") & 
-        (~pivot_df.index.get_level_values("Task").map(is_infection))
-    ]
-
-    # Generate and Save Tables
-    print(f"\n>>> Saving split tables to {output_dir}...")
-    
-    _save_formatted_table(df_roc_inf, output_dir / "table_roc_auc_infections.md", "ROC AUC (Infections)")
-    _save_formatted_table(df_pr_inf,  output_dir / "table_pr_auc_infections.md",  "PR AUC (Infections)")
-    _save_formatted_table(df_roc_oth, output_dir / "table_roc_auc_others.md",     "ROC AUC (Other Tasks)")
-    _save_formatted_table(df_pr_oth,  output_dir / "table_pr_auc_others.md",      "PR AUC (Other Tasks)")
+    return pd.DataFrame(records)
 
 
-def _save_formatted_table(df: pd.DataFrame, filepath: Path, title: str):
+def compute_period_metrics(raw_pool: Dict) -> pd.DataFrame:
     """
-    Helper to apply bold formatting to best values and save as Markdown.
+    Concatenates arrays based on clinical periods before calculating metrics
     """
-    if df.empty:
-        # print(f"   [Skipping] No data for {title}")
+    records = []
+    for split, models in raw_pool.items():
+        for model, tasks in models.items():
+            for task, horizons_data in tasks.items():
+                clinical_periods = CLINICAL_PERIOD_DICT[task]
+                for period_name, h_fup_map in clinical_periods.items():
+                    
+                    y_true_list, y_prob_list, y_cal_list = [], [], []
+                    for h, fups in h_fup_map.items():
+                        if h not in horizons_data: continue
+                        for fup in fups:
+                            if fup in horizons_data[h]:
+                                d = horizons_data[h][fup]
+                                y_true_list.append(d["labels"])
+                                y_prob_list.append(d["probs"])
+                                y_cal_list.append(d["probs_cal"])
+                            
+                    if not y_true_list: continue
+                    y_true = np.concatenate(y_true_list)
+                    y_prob = np.concatenate(y_prob_list)
+                    y_cal = np.concatenate(y_cal_list)
+                    
+                    mask = y_true != -100
+                    if not mask.any(): continue
+                    
+                    metrics = get_metrics_from_arrays(y_true[mask], y_prob[mask], y_cal[mask])
+                    for m_name, m_val in metrics.items():
+                        if m_name in METRICS_OF_INTEREST:
+                            records.append({
+                                "Split": split, "Model": model, "Task": task,
+                                "Period": period_name, "Metric": m_name, "Value": m_val
+                            })
+                            
+    return pd.DataFrame(records)
+
+
+def plot_delta_heatmap(df: pd.DataFrame, baseline_name: str, transformer_name: str, output_dir: Path, task_name: str):
+    df_comp = df[df["Model"].isin([baseline_name, transformer_name])].copy()
+    if df_comp.empty: return
+
+    pivot = df_comp.pivot_table(
+        index=["Split", "Task", "Horizon", "FUP", "Metric"], 
+        columns="Model", values="Value"
+    ).dropna().reset_index()
+    
+    if transformer_name not in pivot.columns or baseline_name not in pivot.columns:
         return
 
-    # Apply bold formatting
-    def highlight_best(row):
-        metric = row.name[3]  # index level 3 is metric
-        valid_vals = row.dropna()
-        if len(valid_vals) == 0: return row
-        
-        if metric in LOWER_IS_BETTER:
-            target_val = valid_vals.min()
-        else:
-            target_val = valid_vals.max()
-        
-        out = row.copy().astype(object)
-        for col in row.index:
-            val = row[col]
-            if pd.isna(val):
-                out[col] = "-"
-            else:
-                s_val = f"{val:.4f}"
-                if abs(val - target_val) < 1e-9:
-                    out[col] = f"**{s_val}**"
-                else:
-                    out[col] = s_val
-        return out
-
-    pretty_df = df.apply(highlight_best, axis=1)
-    
-    # Reset index to make Task/Horizon/FUP real columns
-    md_df = pretty_df.reset_index()
-    
-    # Clean up repetitive values for readability
-    md_df['Horizon'] = md_df['Horizon'].astype(str)
-    md_df.loc[md_df['Task'].duplicated(), 'Task'] = ''
-    
-    # Only clear Horizon if Task is also empty (same block)
-    mask_task_empty = md_df['Task'] == ''
-    md_df.loc[mask_task_empty & md_df['Horizon'].duplicated(), 'Horizon'] = ''
-
-    # Save to file
-    with open(filepath, "w") as f:
-        f.write(f"# {title}\n\n")
-        f.write(md_df.to_markdown(index=False))
-        
-    print(f"   [Saved] {filepath.name}")
-    
-
-def plot_advantage_scatter(
-    df: pd.DataFrame, 
-    baseline_name: str, 
-    transformer_name: str,
-    output_dir: Path
-):
-    """
-    Plots the advantage (Delta) of the Transformer over the Baseline.
-    Delta = Transformer - Baseline.
-    """
-    # Filter and Pivot
-    subset = df[(df["Model"].isin([baseline_name, transformer_name]))].copy()
-    if subset.empty:
-        print("No data found for plotting.")
-        return
-
-    # Pivot to get side-by-side columns
-    pivot = subset.pivot_table(
-        index=["Task", "Horizon", "FUP", "Metric"], 
-        columns="Model", 
-        values="Value"
-    ).reset_index()
-
-    if baseline_name not in pivot.columns or transformer_name not in pivot.columns:
-        print(f"Skipping plots: Models {baseline_name} or {transformer_name} not found in data.")
-        return
-
-    # Calculate Delta
     pivot["Delta"] = pivot[transformer_name] - pivot[baseline_name]
-    
-    # Prepare plotting attributes
-    # Convert Horizon to string for discrete categorization in Legend
-    pivot = pivot.sort_values("Horizon") # Ensure numeric sort first
-    pivot["Horizon_Str"] = pivot["Horizon"].astype(str) + "d"
-    
-    unique_horizons = pivot["Horizon_Str"].unique()
-    # Ensure palette matches the number of horizons
-    current_palette = COLORS[:len(unique_horizons)]
-
-    tasks = pivot["Task"].unique()
-    sns.set_theme(style="whitegrid")
-
-    for task in tasks:
-        task_data = pivot[pivot["Task"] == task]
-        metrics = task_data["Metric"].unique()
-
-        for metric in metrics:
-            metric_data = task_data[task_data["Metric"] == metric]
-            if metric_data.empty: continue
-            
-            # Z-order ensures dots are on top of lines
-            plt.figure(figsize=(8, 6))
-            pal = current_palette[:len(metric_data.value_counts("Horizon_Str"))]
-            ax = sns.scatterplot(
-                data=metric_data, x="FUP", y="Delta", hue="Horizon_Str",
-                style="Horizon_Str", palette=pal, s=120, alpha=0.9, zorder=2
-            )
-            
-            # Optional: Faint line connecting the dots to help track the horizon trend
-            sns.lineplot(
-                data=metric_data, x="FUP", y="Delta", hue="Horizon_Str",
-                palette=pal, legend=False, alpha=0.3, linewidth=1.5, ax=ax, zorder=1
-            )
-            
-            # Add Zero Line (Baseline Reference)
-            plt.axhline(0, color='gray', linestyle='--', linewidth=1.5, alpha=0.7)
-            
-            # Labels
-            readable_metric = METRICS_OF_INTEREST.get(metric, metric)
-            plt.title(f"Advantage vs {baseline_name}: {readable_metric}\nTask: {task}", fontsize=14, fontweight='bold')
-            plt.xlabel("Follow-up Period (Days)", fontsize=12)
-            plt.ylabel(f"Delta ({transformer_name} - {baseline_name})", fontsize=12)
-            
-            # Move legend outside if crowded, or keep inside best loc
-            plt.legend(title="Horizon", bbox_to_anchor=(1.02, 1), loc='upper left', borderaxespad=0)
-            
-            # Save
-            filename = f"scatter_advantage_{task}_{metric}.png"
-            plt.savefig(output_dir / filename, bbox_inches='tight', dpi=150)
-            plt.close()
-            
-    print(f"Scatter plots saved to {output_dir}")
-
-
-def plot_delta_heatmap(
-    df: pd.DataFrame, 
-    baseline_name: str, 
-    transformer_name: str, 
-    output_dir: Path
-):
-    """
-    Creates a figure with subplots showing Delta (Transformer - Baseline).
-    """
-    # Filter for relevant models
-    df = df[df["Model"].isin([baseline_name, transformer_name])].copy()
-    if df.empty:
-        print("No data found for heatmaps.")
-        return
-
-    # Pivot to calculate Deltas
-    full_pivot = df.pivot_table(
-        index=["Task", "Horizon", "FUP", "Metric"], 
-        columns="Model", 
-        values="Value"
+    metrics = list(METRICS_OF_INTEREST.keys())
+    fig, axes = plt.subplots(
+        len(metrics), len(SPLIT_TYPES), 
+        figsize=(8 * len(SPLIT_TYPES), 1.5 * len(metrics)),
+        squeeze=False,
     )
     
-    if baseline_name not in full_pivot.columns or transformer_name not in full_pivot.columns:
-        print("Baseline or Transformer model not found in data.")
-        return
-
-    full_pivot["Delta"] = full_pivot[transformer_name] - full_pivot[baseline_name]
-    
-    # Calculate global symmetric scale limits for consistent coloring
-    max_delta = full_pivot["Delta"].max()
-    min_delta = full_pivot["Delta"].min()
-    limit = max(abs(max_delta), abs(min_delta)) if not pd.isna(max_delta) else 1.0
-    limit = limit * 1.1 # Add buffer
-    vmin, vmax = -limit, limit
-    print(f"Heatmap scale set to: {vmin:.3f} to {vmax:.3f}")
-
-    # Define Column Logic
-    metrics_list = list(METRICS_OF_INTEREST.keys())
-    n_metrics = len(metrics_list)
-    is_infection = lambda t: t.startswith("infection")
-    col_setup = [
-        ("Infections", is_infection),
-        ("Other Tasks", lambda t: not is_infection(t))
-    ]
-    
-    # Create Figure: Height scales with number of metrics (approx 6 inches per row)
-    fig, axes = plt.subplots(n_metrics, 2, figsize=(20, 6 * n_metrics))
-    plt.subplots_adjust(hspace=0.4, wspace=0.3)
-    
+    title_suffix = task_name.replace('_', ' ').title()
     fig.suptitle(
-        f"Performance delta: {transformer_name} - {baseline_name}",
-        fontsize=20, fontweight='bold', y=0.98 if n_metrics > 2 else 0.95,
+        f"Performance Delta: {transformer_name} - {baseline_name} ({title_suffix})", 
+        fontsize=20, fontweight='bold'
     )
 
-    # Ensure axes is always a 2D array (n_rows, 2) even if n_metrics is 1
-    if n_metrics == 1:
-        axes = axes.reshape(1, -1)
-
-    # Iterate over Metrics (Rows)
-    plot_generated = False
-    for row_idx, metric_key in enumerate(metrics_list):
-        metric_name = METRICS_OF_INTEREST[metric_key]
+    for row_idx, metric in enumerate(metrics):
+        metric_data = pivot[pivot["Metric"] == metric].copy()
         
-        # Iterate over Task Groups (Columns)
-        for col_idx, (group_name, task_filter) in enumerate(col_setup):
+        if metric_data.empty: vmin, vmax = -0.1, 0.1 
+        else:
+            limit = metric_data["Delta"].abs().max() * 1.1 or 0.1
+            vmin, vmax = -limit, limit
+
+        for col_idx, split in enumerate(SPLIT_TYPES):
             ax = axes[row_idx, col_idx]
+            subset = metric_data[metric_data["Split"] == split].copy()
             
-            # Filter data for specific Metric AND specific Task Group
-            subset = df[(df["Metric"] == metric_key) & (df["Task"].map(task_filter))]
             if subset.empty:
-                ax.text(
-                    0.5, 0.5, f"No data for\n{metric_name}\n({group_name})",
-                    ha='center', va='center', fontsize=14, color='gray',
-                )
+                ax.text(0.5, 0.5, "No Data", ha='center', va='center', color='gray')
                 ax.set_axis_off()
                 continue
 
-            # Pivot for heatmap matrix
-            pivot = subset.pivot_table(index=["Task", "Horizon", "FUP"], columns="Model", values="Value")
-            if baseline_name not in pivot.columns or transformer_name not in pivot.columns:
-                 ax.text(0.5, 0.5, "Missing Model Data", ha='center', va='center')
-                 ax.set_axis_off()
-                 continue
-
-            pivot["Delta"] = pivot[transformer_name] - pivot[baseline_name]
-            matrix_df = pivot.reset_index()
+            subset["Y_Label"] = "Horizon " + subset["Horizon"].astype(str) + "d"
+            matrix = subset.pivot(index="Y_Label", columns="FUP", values="Delta").sort_index()
             
-            # Create Y-Axis Label: "Task_Name (90d)"
-            matrix_df["Y_Label"] = matrix_df["Task"] + " (" + matrix_df["Horizon"].astype(str) + "d)"
+            fups = sorted(matrix.columns)
+            y_labels = matrix.index.tolist()
             
-            final_matrix = matrix_df.pivot(index="Y_Label", columns="FUP", values="Delta")
-            final_matrix.sort_index(inplace=True)
+            widths = [next((s for limit, s in AGGREGATION_SCHEME if f < limit), 1) for f in fups]
+            x_edges = [0] + list(np.cumsum(widths))
+            y_edges = range(len(y_labels) + 1)
 
-            # Plot heatmap
-            sns.heatmap(
-                final_matrix, annot=True, fmt=".3f", cmap="RdBu", center=0, 
-                vmin=vmin, vmax=vmax, cbar_kws={'label': 'Delta'}, ax=ax
+            mesh = ax.pcolormesh(
+                x_edges, y_edges, matrix.values, 
+                cmap="RdBu", vmin=vmin, vmax=vmax, 
+                edgecolors='white', linewidth=0.5 
             )
             
-            ax.set_title(f"{metric_name} - {group_name}", fontsize=15, fontweight='bold')
-            ax.set_xlabel("Follow-up Period (Days)", fontsize=11)
-            ax.set_ylabel("Task (Horizon)", fontsize=11)
+            ax.set_yticks([y + 0.5 for y in range(len(y_labels))])
+            ax.set_yticklabels(y_labels, fontsize=11)
+            step = max(1, len(fups) // 10)
+            x_ticks_positions = [(x_edges[i] + x_edges[i+1])/2 for i in range(len(fups))]
+            ax.set_xticks(x_ticks_positions[::step])
+            ax.set_xticklabels(fups[::step], rotation=45, ha='right', fontsize=9)
+            ax.invert_yaxis()
             
-            plot_generated = True
+            if row_idx == 0: 
+                ax.set_title(split.replace('_', ' ').title(), fontsize=14, fontweight='bold')
+            if col_idx == 0: 
+                ax.set_ylabel(METRICS_OF_INTEREST[metric], fontsize=13, fontweight='bold')
+            
+            cbar = fig.colorbar(mesh, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label('Delta')
 
-    if plot_generated:
-        filename = "heatmap_subplots_delta.png"
-        output_file = output_dir / filename
-        plt.savefig(output_file, bbox_inches='tight', dpi=150)
-        plt.close()
-        print(f"Heatmap subplots saved to: {output_file}")
-    else:
-        print("No plots were generated (empty intersections).")
-        plt.close()
-        
-        
-def generate_overall_summary(df: pd.DataFrame, output_dir: Path):
-    """
-    Calculates aggregated performance (Mean +/- Std) for each model and metric.
-    """
-    print("\n>>> Generating Overall Performance Summary...")
+    # Apply tight layout to compress whitespace, leaving room for the top title
+    out_file = output_dir / f"delta_heatmap_{task_name}.png"
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    plt.savefig(out_file, bbox_inches='tight', dpi=150)
+    plt.close()
+    print(f"    [Plot Saved] {out_file.name}")
+
+
+def plot_period_performance_bars(
+    df: pd.DataFrame,
+    task_name: str,
+    period_type: str,
+    output_dir: Path,
+):
+    metrics = list(METRICS_OF_INTEREST.keys())
+    model_order = CLASSIC_ML_MODELS_TO_PLOT + ["Transformer"]
+    col_keys = [m for m in model_order if m in df["Model"].unique()]
     
-    grouped = df.groupby(["Metric", "Model"])["Value"].agg(["mean", "std"])
+    row_keys = metrics
+    if not row_keys or not col_keys: return
+
+    sns.set_theme(style="whitegrid")
+    fig, axes = plt.subplots(
+        len(row_keys), len(SPLIT_TYPES),
+        figsize=(6 * len(SPLIT_TYPES), 4.0 * len(row_keys)), 
+        sharex=True, sharey="row", squeeze=False,
+    )
+
+    for r, metric in enumerate(row_keys):
+        for c, split in enumerate(SPLIT_TYPES):
+            ax = axes[r, c]
+            subset = df[(df["Metric"] == metric) & (df["Split"] == split)]
+            
+            if subset.empty:
+                ax.set_visible(False)
+                continue
+
+            sns.barplot(
+                data=subset, x="Period", y="Value", hue="Model", 
+                hue_order=col_keys, palette=COLORS[:len(col_keys)], 
+                ax=ax, edgecolor='black', linewidth=0.6, alpha=0.9,
+            )
+
+            if r == 0:
+                ax.set_title(
+                    split.replace('_', ' ').title(),
+                    fontsize=14, fontweight='bold',
+                )
+            if c == 0:
+                y_label = f"{METRICS_OF_INTEREST[metric]}"
+                ax.set_ylabel(y_label, fontsize=11, fontweight='bold')
+            else:
+                ax.set_ylabel("")
+            
+            ax.set_xlabel("Clinical Period" if r == len(row_keys)-1 else "")
+            ax.tick_params(labelbottom=(r == len(row_keys)-1))
+            if ax.get_legend(): ax.get_legend().remove()
+
+    handles, labels = axes[0,0].get_legend_handles_labels()
+    title_suffix = task_name.replace('_', ' ').title()
+    fig.legend(
+        handles, labels, loc="lower center", frameon=False,
+        bbox_to_anchor=(0.5, 1.0), ncol=len(labels),
+        fontsize=13, title_fontsize=14, title=f"Model Architecture ({title_suffix})",
+    )
+
+    plt.tight_layout(rect=[0, 0, 1, 1.0])
+    out_file = output_dir / f"{period_type}_period_performance{task_name}.png"
+    plt.savefig(out_file, bbox_inches='tight', dpi=150)
+    plt.close()
+    print(f"    [Plot Saved] {out_file.name}")
+
+
+def generate_performance_summaries(df: pd.DataFrame, output_dir: Path, task_name: str):
+    grouped = df.groupby(["Period", "Metric", "Model"])["Value"].agg(["mean", "std"])
+    grouped["Formatted"] = grouped.apply(lambda r: f"{r['mean']:.3f} ± {r['std']:.3f}", axis=1)
     
-    def fmt(row):
-        return f"{row['mean']:.4f} ± {row['std']:.4f}"
+    pivot_table = grouped.reset_index().pivot(
+        index=["Period", "Metric"], columns="Model", values="Formatted"
+    ).reset_index()
     
-    grouped["Formatted"] = grouped.apply(fmt, axis=1)
+    order = CLASSIC_ML_MODELS_TO_PLOT + ["Transformer"]
+    cols = ["Period", "Metric"] + [m for m in order if m in pivot_table.columns]
+    pivot_table = pivot_table[[c for c in cols if c in pivot_table.columns]]
+
+    title_suffix = task_name.replace('_', ' ').title()
+    out_file = output_dir / f"period_summary_{task_name}.md"
     
-    summary_table = grouped.reset_index().pivot(index="Metric", columns="Model", values="Formatted")
-    
-    summary_table.index = summary_table.index.map(lambda x: METRICS_OF_INTEREST.get(x, x))
-    
-    desired_order = ["logistic_regression", "random_forest", "xgboost", "Transformer"]
-    existing_cols = [c for c in desired_order if c in summary_table.columns]
-    remaining_cols = [c for c in summary_table.columns if c not in existing_cols]
-    final_cols = existing_cols + remaining_cols
-    
-    summary_table = summary_table[final_cols]
-    
-    print(summary_table.to_markdown())
-    
-    out_file = output_dir / "overall_performance_summary.md"
     with open(out_file, "w") as f:
-        f.write("# Overall Performance Summary\n")
-        f.write("*Pooled across all Tasks, Horizons, and Follow-up Periods*\n\n")
-        f.write(summary_table.to_markdown())
+        f.write(f"# Performance Summary: {title_suffix}\n")
+        f.write("*Metrics computed by pooling predictions across specified clinical periods.*\n\n")
+        f.write(pivot_table.to_markdown(index=False))
         
-    print(f"Summary saved to {out_file}")
-    
+    print(f"    [Table Saved] {out_file.name}")
+
 
 if __name__ == "__main__":
     main()

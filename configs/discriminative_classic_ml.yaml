@@ -1,16 +1,13 @@
 # Run parameters
-data_path: /home/shares/ds4dh/aiidkit_project/data_new/processed/classic_ml
-results_dir: results_classic_ml
+data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v3.5/classic_ml
+data_split_type: temporal_split  # random_split, center_split, temporal_split
+result_dir: results_classic_ml
 model_types: [logistic_regression, random_forest, xgboost]
 prediction_tasks:
-    infection_bacteria: {fups: [0,  30,  60,  90,  180, 365], horizons: [ 30,  60,  90]}
-    infection_virus:    {fups: [0,  30,  60,  90,  180, 365], horizons: [ 30,  60,  90]}
-    infection_fungi:    {fups: [0,  30,  60,  90,  180, 365], horizons: [ 30,  60,  90]}
-    # infection:          {fups: [0,  30,  60,  90,  180, 365], horizons: [ 30,  60,  90]}
-    # graft_loss:         {fups: [0, 180, 365, 730, 1095],      horizons: [180, 365, 730, 1095]}
-    # death:              {fups: [0, 180, 365, 730, 1095],      horizons: [180, 365, 730, 1095]}
-    graft_loss:         {fups: [0, 365, 730, 1095, 1825],     horizons: [365, 1095, 1825, 3650]}
-    death:              {fups: [0, 365, 730, 1095, 1825],     horizons: [365, 1095, 1825, 3650]}
+  infection_bacteria:   {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
+  infection_virus:      {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
+  death:                {fups: [0, 360, 720, 1080, 1800], horizons: [360, 720, 1080, 1800]}
+  graft_loss:           {fups: [0, 360, 720, 1080, 1800], horizons: [360, 720, 1080, 1800]}
 
 # Columns to exclude
 ignore_columns:
@@ -23,7 +20,7 @@ ignore_columns:
 
 # Hyper parameters for all model types
 train_data_augment: all  # none, valid, all
-target_undersampling_ratio: 0.1  # same as for transformer pipeline (undersample if worse than this ratio)
+target_undersampling_ratio: 15.0  # same as for transformer pipeline (undersample if worse than this ratio)
 models:
 
   # Linear baseline

@@ -11,6 +11,7 @@ import queue
 from pathlib import Path
 from scipy.stats import gmean
 from optuna.samplers import TPESampler
+from optuna.storages import JournalStorage, JournalFileStorage
 
 # Retrieve configuration file (useful to differentiate simultaneous runs)
 parser = argparse.ArgumentParser(description="Perform hyper-parameter optimization for pretraining and finetuning.")
@@ -27,7 +28,6 @@ RESULTS_DIR = CLI_CFG["result_dir"]
 N_TRIALS = CLI_CFG["optuna"]["num_trials"] if not DEBUG else CLI_CFG["optuna"]["num_trials_debug"]
 DB_NAME = CLI_CFG["optuna"]["db_name"]
 STUDY_NAME = CLI_CFG["optuna"]["study_name"]
-SKIP_PRETRAINING_IF_CKPT_EXISTS = CLI_CFG["optuna"]["skip_pretraining_if_ckpt_exists"]
 METRIC_TO_OPTIMIZE = CLI_CFG["optuna"]["metric_to_optimize"]  # e.g., "val_all_roc_auc_label_infection_bacteria"
 COMMON_TASK_PREFIX = os.path.commonprefix(list(CLI_CFG["prediction_tasks"].keys()))
 if len(COMMON_TASK_PREFIX) > 0:
@@ -50,11 +50,12 @@ def main():
     """
     # Initialize optuna study
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    storage_url = f"sqlite:///{RESULTS_DIR}/{DB_NAME}"
+    log_file = os.path.join(RESULTS_DIR, f"{STUDY_NAME}_journal.log")
+    storage = JournalStorage(JournalFileStorage(log_file))
     sampler = TPESampler(seed=None)
     study = optuna.create_study(
         study_name=STUDY_NAME,
-        storage=storage_url,
+        storage=storage,
         direction="maximize",
         load_if_exists=True,
         sampler=sampler,
@@ -69,6 +70,7 @@ def main():
     
     print(f"Starting optimization with {N_TRIALS} trials.")
     print(f"Results will be stored in {DB_NAME}")
+    print(f"Number of GPUs available: {NUM_GPUS}")
     
     study.optimize(objective, n_trials=N_TRIALS, n_jobs=NUM_GPUS)
     
@@ -164,23 +166,21 @@ def objective(trial: optuna.Trial):
         trial_dir = Path(RESULTS_DIR) / f"trial_{trial.number:03d}"
 
         # Task hyperparameters (making sure not everything is zero)
-        mask_options = [0.0, 0.05, 0.15, 0.35, 0.75]
-        p_entity = trial.suggest_categorical("mask_entity", mask_options)
-        p_attr   = trial.suggest_categorical("mask_attribute", mask_options)
-        p_value  = trial.suggest_categorical("mask_value", mask_options)
+        p_entity = trial.suggest_float("mask_ent", 0.00, 0.25, step=0.05)
+        p_attr   = trial.suggest_float("mask_att", 0.00, 0.50, step=0.05)
+        p_value  = trial.suggest_float("mask_val", 0.05, 0.75, step=0.05)
         masking_rules = {"entity_id": p_entity, "attribute_id": p_attr, "value_id": p_value}
-        if p_entity == 0.0 and p_attr == 0.0 and p_value == 0.0: p_value = 0.15
-        
+
         # Learning hyperparameters
-        lr_pre = trial.suggest_float("lr_pre", 1e-5, 5e-4, log=True)
-        lr_fine = trial.suggest_float("lr_fine", 1e-5, 5e-4, log=True)
-        
+        lr_pre  = trial.suggest_float("lr_pre",  2e-5, 2e-4, log=True)
+        lr_fine = trial.suggest_float("lr_fine", 1e-5, 1e-4, log=True)
+
         # Model architecture / regularization
         # Could add layer number / embedding dimension parameters?
-        att_dropout = trial.suggest_categorical("att_dropout", [0.0, 0.05, 0.1])
-        mlp_dropout = trial.suggest_categorical("mlp_dropout", [0.0, 0.05, 0.1, 0.2])
-        cls_dropout = trial.suggest_categorical("cls_dropout", [0.0, 0.1, 0.25, 0.5])
-        
+        dropout_att = trial.suggest_float("dropout_att", 0.0, 0.2, step=0.05)
+        dropout_mlp = trial.suggest_float("dropout_mlp", 0.0, 0.2, step=0.05)
+        dropout_cls = trial.suggest_float("dropout_cls", 0.0, 0.5, step=0.10)
+
         # Construct overrides dictionary (structure must match the YAML hierarchy)
         overrides = {
             "result_dir": str(trial_dir),
@@ -190,27 +190,27 @@ def objective(trial: optuna.Trial):
             "pretrainer": {
                 "learning_rate": lr_pre,
                 "max_steps": 100000 if not DEBUG else 100,
+                "seed": trial.number,
             },
             "finetuner": {
+                # "loss_name": loss_name, -> fixed to ce, for optimally calibrated model
                 "learning_rate": lr_fine,
                 "max_steps": 10000 if not DEBUG else 100,
+                "seed": trial.number,  # each trial is run on an independent process
             },
             "model": {
                 "config_args": {
-                    "attention_dropout": att_dropout,
-                    "mlp_dropout": mlp_dropout,
-                    "classifier_dropout": cls_dropout,
-                    "embedding_dropout": 0.0,
-                }
+                    "dropout_att": dropout_att,
+                    "dropout_mlp": dropout_mlp,
+                    "dropout_cls": dropout_cls,
+                },
             }
         }
-        # if DEBUG: overrides["train_data_augment"] = "valid"  # to save time
 
         # Execution (pretraining, finetuning), passing trial_env to run_subprocess
         try:
-            if should_run_pretraining(trial_dir, masking_rules):
-                print(f"\n[Trial {trial.number}] GPU {gpu_id}: Running pretraining...")
-                run_subprocess("scripts/train_mlm.py", overrides, env=trial_env)
+            print(f"\n[Trial {trial.number}] GPU {gpu_id}: Running pretraining...")
+            run_subprocess("scripts/train_mlm.py", overrides, env=trial_env)
             
             print(f"[Trial {trial.number}] GPU {gpu_id}: Running finetuning...")
             run_subprocess("scripts/train_classification.py", overrides, env=trial_env)
@@ -221,7 +221,7 @@ def objective(trial: optuna.Trial):
 
         # Evaluation
         run_id = get_run_id(masking_rules)
-        full_run_path = trial_dir / run_id
+        full_run_path = trial_dir / CLI_CFG["data_split_type"] / run_id
         score = aggregate_metrics(full_run_path)
         
         # Cleanup
@@ -251,25 +251,6 @@ def objective(trial: optuna.Trial):
     
     finally:
         GPU_QUEUE.put(gpu_id)
-
-
-def should_run_pretraining(trial_dir: Path, masking_rules: dict) -> bool:
-    """
-    Determines if pretraining needs to run based on existing checkpoints.
-    """
-    if not SKIP_PRETRAINING_IF_CKPT_EXISTS: return True
-
-    run_id = get_run_id(masking_rules)
-    pretrain_output_dir = trial_dir / run_id / "pretraining"
-    has_config = (pretrain_output_dir / "config.json").exists()
-    has_weights = (pretrain_output_dir / "model.safetensors").exists()
-
-    if has_config and has_weights:
-        print(f"Found existing pretraining checkpoint at: {pretrain_output_dir}")
-        print(f"Skipping pretraining step.")
-        return False  # no pretraining run
-    
-    return True  # pretraining run
 
 
 def cleanup_checkpoints(run_path):

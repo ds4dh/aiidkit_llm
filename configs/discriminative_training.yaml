@@ -1,6 +1,7 @@
 # Run configuration and task (data collator) definition
-hf_data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v1/teav
-result_dir: results_optuna/infection_bacteria  # base directory name for all results
+data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v3.5/teav
+data_split_type: temporal_split  # random_split, center_split, temporal_split
+result_dir: results_optuna/temporal_split/graft_loss  # base directory name for all results
 data_collator:
   eav_mappings:
     entity_id: entity
@@ -9,33 +10,35 @@ data_collator:
   time_mapping:
     days_since_tpx: time
   mlm_label_keys:
-    - entity_id       # mlm task must predict 'entity_id' labels
-    - attribute_id    # mlm task must predict 'attribute_id' labels
-    - value_id        # mlm task must predict 'value_id' labels
-  mlm_masking_rules:  # these numbers will set the result subdirectory name
-    {"entity_id": 0.15, "attribute_id": 0.25, "value_id": 0.45}
+    - entity_id         # mlm task must predict 'entity_id' labels
+    - attribute_id      # mlm task must predict 'attribute_id' labels
+    - value_id          # mlm task must predict 'value_id' labels
+  mlm_masking_rules:    # these numbers will set the result subdirectory name
+    entity_id: 0.15     # probability of masking an entity sub-token
+    attribute_id: 0.25  # probability of masking an entity sub-token
+    value_id: 0.45      # probability of masking an entity sub-token
 
 # Configuration for finetuning tasks to run
-train_data_augment: all  # "all", "none", "valid", which other fups are added to finetuning samples
-target_undersampling_ratio: 10.0  # maximum ratio of positive to negative samples during finetuning
-early_stopping_metric: roc_auc  # metric to use for early stopping (per label, then averaged)
-prediction_tasks:  # horizon elements can be lists (multi-label) or integers / singletons (binary)
-  infection_bacteria:   {fups: [0,  30,  60,  90,  180,  360], horizons: [[ 30,  60,  90,  180]]}
-  # infection_virus:      {fups: [0,  30,  60,  90,  180,  360], horizons: [[ 30,  60,  90,  180]]}
-  # graft_loss:           {fups: [0, 360, 720, 1080, 1800],     horizons: [[180, 360, 1080, 1800]]}
-  # death:                {fups: [0, 360, 720, 1080, 1800],     horizons: [[180, 360, 1080, 1800]]}
+train_data_augment: all           # "all", "none", "valid", which other fups are added to finetuning samples
+target_undersampling_ratio: 15.0  # maximum ("worst") ratio of positive to negative samples during finetuning (null for not using under-sampling)
+early_stopping_metric: roc_auc    # metric to use for early stopping (per label, then averaged)
+prediction_tasks:                 # horizon elements can be lists (multi-label) or integers / singletons (binary)
+  # infection_bacteria: {fups: [0, 30, 60, 90, 180, 360], horizons: [[30, 60, 90]]}
+  # infection_virus:    {fups: [0, 30, 60, 90, 180, 360], horizons: [[30, 60, 90]]}
+  # death:              {fups: [0, 360, 720, 1080, 1800], horizons: [[360, 720, 1080, 1800]]}
+  graft_loss:         {fups: [0, 360, 720, 1080, 1800], horizons: [[360, 720, 1080, 1800]]}
 
 # Arguments for optuna run (perform both pretraining and finetuning for different hyper-parameters)
 optuna:
   metric_to_optimize: val_all_roc_auc  # if possible, will add prediction tasks common denominator
   num_trials: 50
   num_trials_debug: 2
-  skip_pretraining_if_ckpt_exists: true
   db_name: optuna_study.db
   study_name: pretraining_finetuning_hp_optimization
 
 # Arguments for HF's trainer for the pre-training phase
 pretrainer:
+  seed: 1234
   logging_steps: 10
   warmup_steps: 1000
   num_train_epochs: 100  # maximum number of epochs (loses to max_steps)
@@ -60,6 +63,8 @@ pretrainer:
 
 # Arguments for HF's trainer for the fine-tuning phase
 finetuner:
+  seed: 1234
+  ft_subdir: "finetuning"
   logging_steps: 10
   warmup_steps: 1000
   num_train_epochs: 10  # maximum number of epochs (loses to max_steps)
@@ -75,7 +80,8 @@ finetuner:
   per_device_eval_batch_size: 32
   learning_rate: 4.0e-5
   weight_decay: 0.01
-  loss_name: poly1  # ce, weighted_ce, focal, dice, poly1
+  loss_name: ce  # ce, weighted_ce, focal, poly1 -> ce optimizes calibration!
+  enforce_monotonicity: true  # if True, classifier probabilities increase with horizon
   bf16: true
   report_to: wandb
   remove_unused_columns: false  # crucial for custom collators
@@ -99,8 +105,8 @@ model:
   model_id: answerdotai/ModernBERT-base
   load_backbone_weights: false
   config_args:
-    # vocab_size: 1024  # will be set at bulid time (depending on the data vocabulary)
-    max_position_embeddings: 512  # original value in ModernBERT-base: 8192
+    # vocab_size: 1024  # set when dataset is build (depends on the data vocabulary)
+    max_position_embeddings: 1024  # original value in ModernBERT-base: 8192 // max t-EAV length: 1010
     output_hidden_states: true  # required for plotting embeddings
     classifier_pooling: mean  # to classify sequences during the fine-tuning phase
     pad_token_id: 0
@@ -108,6 +114,10 @@ model:
     cls_token_id: 2
     eos_token_id: 3
     sep_token_id: 3
+    dropout_embedding: 0.0
+    dropout_attention: 0.0
+    dropout_mlp: 0.0
+    dropout_classifier: 0.2
     # Comment below for default ModernBERT config (so far provided better results)
     # Careful! Layer types should match num_hidden_layers and end with full_attention!
     # num_hidden_layers: 4      #   4 //    8 //   12

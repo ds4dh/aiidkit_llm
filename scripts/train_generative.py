@@ -20,8 +20,8 @@ from src.evaluation.evaluate_models import (
     make_preprocess_logits_for_metrics_generative,
 )
 
-import src.constants as constants
-CSTS = constants.ConstantsNamespace()
+import src.utils as utils
+CSTS = utils.ConstantsNamespace()
 CLI_CFG: dict[str, dict] = {}
 parser = argparse.ArgumentParser(description="Fine-tune a generative LLM on patient narratives.")
 parser.add_argument("--config", "-c", type=str, default="configs/generative_training.yaml")

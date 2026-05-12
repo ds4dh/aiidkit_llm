@@ -21,17 +21,15 @@ class TimeEmbedding(nn.Module):
     def __init__(
         self,
         embedding_dim: int,
-        dropout: float=0.1,
         time_scale: int=10000,
     ):
         super().__init__()
         if embedding_dim % 2 != 0:
             raise ValueError("Embedding dimension must be even")
-        self.dropout = nn.Dropout(p=dropout)
         self.half_dim = embedding_dim // 2
         self.ratio = math.log(time_scale) / self.half_dim
 
-    def forward(self, x: torch.Tensor, times: torch.Tensor) -> torch.Tensor:
+    def forward(self, times: torch.Tensor) -> torch.Tensor:
         """
         Add time embedding to the input tensor, with dropout
 
@@ -43,7 +41,7 @@ class TimeEmbedding(nn.Module):
         times_scaled = times.unsqueeze(-1) * torch.exp(-self.ratio * freq_indices)
         time_embeddings = torch.cat([torch.sin(times_scaled), torch.cos(times_scaled)], dim=-1)
         
-        return self.dropout(x + time_embeddings)
+        return time_embeddings
 
 
 class PositionalEncoding(nn.Module):
@@ -312,9 +310,13 @@ class Poly1FocalLoss(nn.Module):
 # -------------------------------------------------------------------
 
 
-def compute_loss_args(dataset: DatasetDict, label_keys: list[str]) -> dict[str, Any]:
+def compute_loss_args(
+    dataset: DatasetDict,
+    label_keys: list[str],
+    max_weight: float = 10.0,
+) -> dict[str, Any]:
     """ 
-    Compute robust class weights for Multi-Label Poly1 Focal Loss.
+    Compute robust class weights for multi-label loss.
     """
     pos_counts = []
     neg_counts = []
@@ -332,11 +334,13 @@ def compute_loss_args(dataset: DatasetDict, label_keys: list[str]) -> dict[str, 
     for k, p, n in zip(label_keys, pos_counts, neg_counts):
         print(f"  {k}: {p}/{n} (ratio: {n/max(p,1):.1f})")
 
-    # Compute weights
-    # - standard BCE uses neg/pos (linear). 
-    # - focal loss / poly1 works best with sqrt(neg/pos).
+    # Compute weights (with capping to prevent gradient explosions)
+    # - standard BCE uses neg/pos (linear).
+    # - focal loss / poly1 works best with sqrt(neg/pos)
     raw_ratios = [n / max(p, 1) for n, p in zip(neg_counts, pos_counts)]
     dampened_weights = [np.sqrt(r) for r in raw_ratios]
+    dampened_weights = [min(w, max_weight) for w in dampened_weights]
+    raw_ratios = [min(r, max_weight ** 2) for r in raw_ratios]
 
     return {
         # Used by focal loss / poly1 (dampened to avoid exploding gradients)
@@ -360,7 +364,9 @@ def make_loss_func(loss_name: str, loss_args: dict = None):
 
     # Select the class (but don't instantiate it yet)
     if loss_name == "ce":
-        loss_cls = nn.BCEWithLogitsLoss
+        # loss_cls = nn.BCEWithLogitsLoss
+        loss_cls = WeightedCELoss
+        loss_args["class_weights"] = None  # equivalent to classic CE loss
     elif loss_name == "weighted_ce":
         loss_cls = WeightedCELoss
     elif loss_name == "focal":

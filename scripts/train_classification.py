@@ -10,6 +10,7 @@ from pathlib import Path
 from datasets import Dataset
 from transformers import Trainer, TrainingArguments, EarlyStoppingCallback
 from transformers.trainer_utils import get_last_checkpoint
+from transformers.trainer_callback import PrinterCallback
 from peft import LoraConfig, get_peft_model
 from src.utils import apply_config_overrides
 from src.data.patient_dataset import load_hf_data_and_metadata
@@ -42,8 +43,10 @@ def main():
     mlm_masking_rules = CLI_CFG["data_collator"]["mlm_masking_rules"]
     pretrain_run_id = "-".join([f"{k[0]}{int(v * 100):02d}" for k, v in mlm_masking_rules.items()])
     finetune_run_id = pretrain_run_id if not cli_args.reset_weights else "no_pretrain"
-    pretrained_dir = Path(CLI_CFG["result_dir"]) / pretrain_run_id / "pretraining"
-    finetuning_dir = Path(CLI_CFG["result_dir"]) / finetune_run_id / "finetuning"
+    result_dir = Path(CLI_CFG["result_dir"]) / CLI_CFG["data_split_type"]
+    pretrained_dir = result_dir / pretrain_run_id / "pretraining"
+    finetuning_subdir = CLI_CFG["finetuner"].pop("ft_subdir", "finetuning")
+    finetuning_dir = result_dir / finetune_run_id / finetuning_subdir
 
     # Iterate over prediction tasks
     for task_key, task_specs in CLI_CFG["prediction_tasks"].items():
@@ -60,7 +63,7 @@ def main():
                     if train_data_augment == "valid":
                         train_fups = valid_fups  # all of interest
                     elif train_data_augment == "all":
-                        data_dir = Path(CLI_CFG["hf_data_dir"])
+                        data_dir = Path(CLI_CFG["data_dir"]) / CLI_CFG["data_split_type"]
                         train_fups = scan_all_fups(data_dir)  # all available
                     run_configs = [(train_fups, valid_fups)]
 
@@ -113,7 +116,7 @@ def finetune_disciminative_model(
     # Load data for classification task, using vocabulary from pretraining phase
     label_keys = [f"label_{task_key}_{h:04d}d" for h in horizons]
     dataset, _, vocab = load_hf_data_and_metadata(
-        data_dir=Path(CLI_CFG["hf_data_dir"]),
+        data_dir=Path(CLI_CFG["data_dir"]) / CLI_CFG["data_split_type"],
         fup_train=fup_train, fup_valid=fup_valid, fup_test=fup_test,
         label_keys=label_keys,
         target_undersampling_ratio=CLI_CFG.get("target_undersampling_ratio", None),
@@ -139,9 +142,11 @@ def finetune_disciminative_model(
         sys.exit(f"Error: No checkpoint found in {pretrained_dir}")
 
     # Set up model configuration
+    enforce_monotonicity = CLI_CFG["finetuner"].pop("enforce_monotonicity")
     CLI_CFG["model"]["pretrained_dir"] = pretrained_last_ckpt_dir
     CLI_CFG["model"]["embedding_layer_config"]["vocab_size"] = len(vocab)
     CLI_CFG["model"]["reset_weights"] = cli_args.reset_weights
+    CLI_CFG["model"]["enforce_monotonicity"] = enforce_monotonicity
     CLI_CFG["model"]["task"] = "classification"
     CLI_CFG["model"]["model_args"]["num_labels"] = len(label_keys)
     CLI_CFG["model"]["model_args"]["problem_type"] = "multi_label_classification"  # if len(label_keys) > 1 else "binary_classification"
@@ -171,6 +176,7 @@ def finetune_disciminative_model(
     evaluator = CustomEvaluator(
         do_clustering=False,
         label_names=label_keys,
+        enforce_monotonicity=enforce_monotonicity,
         early_stopping_metric=CLI_CFG["early_stopping_metric"],
     )
 
@@ -210,6 +216,7 @@ def finetune_disciminative_model(
         callbacks=callbacks,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
     )
+    trainer.remove_callback(PrinterCallback)
 
     # Fine-tune the model and reset wandb for the next run
     trainer.train()  # best model saved automatically
@@ -263,22 +270,37 @@ def test_model(
     """
     Aggregates evaluation on all subsplits of the test set and save to output file
     """
-    final_metrics = {}
+    final_metrics = {}  # to save the metrics
+    all_predictions = {}  # to save labels and model output probabilities
+    output_dir = Path(output_path).parent
 
     # Fit calibration on validation dataset
     print("\nFitting calibration on validation set...")
     val_metrics = trainer.evaluate(eval_datasets["all"], metric_key_prefix="val_all")
     final_metrics.update(val_metrics)
 
-    # Evaluate on test sets
+    # Evaluate on test set (all samples)
     test_all = test_datasets.pop("all")
     results_all = trainer.evaluate(test_all, metric_key_prefix="test_all")
     final_metrics.update(results_all)
+    
+    # Also storing labels and model output probabilities
+    for key, array in trainer.compute_metrics.saved_labels_and_probs.items():
+        all_predictions[f"test_all_{key}"] = array
+
+    # Evaluate on test subsets (per FUP)
     for fup_key, fup_test_dataset in test_datasets.items():
-        results = trainer.evaluate(fup_test_dataset, metric_key_prefix=f"test_{fup_key}")
+        prefix = f"test_{fup_key}"
+        results = trainer.evaluate(fup_test_dataset, metric_key_prefix=prefix)
         final_metrics.update(results)
 
-    # Save to disk for later plotting
+        # Storing FUP-specific labels and model output probabilities with prefix
+        for key, array in trainer.compute_metrics.saved_labels_and_probs.items():
+            all_predictions[f"{prefix}_{key}"] = array
+
+    # Save metric results, label and predictions
+    preds_path = output_dir / "test_probs.npz"
+    np.savez_compressed(preds_path, **all_predictions)
     with open(output_path, "w") as f:
         json.dump(final_metrics, f, indent=4)
 
