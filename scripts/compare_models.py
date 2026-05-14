@@ -13,18 +13,51 @@ from sklearn.metrics import (
 )
 
 # Configuration
-TRANSFORMER_BASE_DIRS = {
-    "infection_bacteria": Path("results_optuna/infection_bacteria/trial_033"),
-    "infection_virus": Path("results_optuna/infection_virus/trial_034"),
-    "death": Path("results_optuna/death/trial_040"),
-    "graft_loss": Path("results_optuna/graft_loss/trial_000"),
+RESULTS_DIR = Path("results_optuna")
+
+# Nested dictionaries to allow different best trials/configs per split type
+BEST_TRIALS = {
+    "random_split": {
+        "infection_bacteria": "trial_032",
+        "infection_virus": "trial_029",
+        "death": "trial_004",
+        "graft_loss": "trial_037",
+    },
+    "temporal_split": {
+        "infection_bacteria": "trial_007",
+        "infection_virus": "trial_021",
+        "death": "trial_018",
+        "graft_loss": "trial_034",
+    },
+    "center_split": {
+        "infection_bacteria": "trial_029",
+        "infection_virus": "trial_021",
+        "death": "trial_001",
+        "graft_loss": "trial_005",
+    }
 }
+
 TRANSFORMER_PT_CONFIGS = {
-    "infection_bacteria": "e10-a10-v40",
-    "infection_virus": "e10-a05-v45",
-    "death": "e00-a20-v40",
-    "graft_loss": "e10-a25-v30",
+    "random_split": {
+        "infection_bacteria": "e20-a00-v60",
+        "infection_virus": "e15-a10-v55",
+        "death": "e20-a45-v55",
+        "graft_loss": "e15-a20-v40",
+    },
+    "temporal_split": {
+        "infection_bacteria": "e10-a00-v60",
+        "infection_virus": "e05-a00-v50",
+        "death": "e00-a35-v75",
+        "graft_loss": "e15-a40-v15",
+    },
+    "center_split": {
+        "infection_bacteria": "e20-a10-v55",
+        "infection_virus": "e10-a20-v05",
+        "death": "e10-a05-v70",
+        "graft_loss": "e15-a40-v65",
+    }
 }
+
 CLASSIC_ML_BASE_DIR = Path("results_classic_ml")
 OUTPUT_DIR = Path("results_compared")
 SPLIT_TYPES = [
@@ -48,16 +81,17 @@ TASKS = [
 # Clinical periods definition (horizon: [fups])
 def get_phase_windows(start, end, horizons, step=30):
     return {h: w for h in horizons if (w := list(range(start, end + 1 - h, step)))}
+
 CLINICAL_PERIODS_INFECTIONS = {
-    "Perioperative\nphase (0-1 mo)": get_phase_windows(0, 30, [30, 60, 90]),
-    "Opportunistic\nphase (1-6 mo)": get_phase_windows(30, 180, [30, 60, 90]),
-    "Maintenance\nphase (6-12 mo)":  get_phase_windows(180, 360, [30, 60, 90]),
-    "Long-term\nphase (1-2 yr)":     get_phase_windows(360, 720, [30, 60, 90]),
+    "Perioperative\nphase (0-1 mo)": get_phase_windows(0, 30, [30]),
+    "Opportunistic\nphase (1-6 mo)": get_phase_windows(30, 180, [30]),
+    "Maintenance\nphase (6-12 mo)":  get_phase_windows(180, 360, [30]),
+    "Long-term\nphase (1-2 yr)":     get_phase_windows(360, 720, [30]),
 }
 CLINICAL_PERIODS_OUTCOMES = {
-    "Short-term\nphase (0-2 yr)":  get_phase_windows(0, 720, [360, 720, 1080, 1800]),
-    "Middle-term\nphase (2-5 yr)": get_phase_windows(720, 1800, [360, 720, 1080, 1800]),
-    "Long-term\nphase (5-10 yr)":  get_phase_windows(1800, 3600, [360, 720, 1080, 1800]),
+    "Short-term\nphase (0-2 yr)":  get_phase_windows(0, 720, [360]),
+    "Middle-term\nphase (2-5 yr)": get_phase_windows(720, 1800, [360]),
+    "Long-term\nphase (5-10 yr)":  get_phase_windows(1800, 3600, [360]),
 }
 CLINICAL_PERIOD_DICT = {
     "infection_bacteria": CLINICAL_PERIODS_INFECTIONS,
@@ -73,9 +107,10 @@ PROGNOSTIC_PERIODS_INFECTIONS = {
     "Full length\n horizon (90 d)":  get_phase_windows(0, 3600, [90]),
 }
 PROGNOSTIC_PERIODS_OUTCOMES = {
-    "Full length\n horizon (30 d)":  get_phase_windows(0, 3600, [30]),
-    "Full length\n horizon (60 d)":  get_phase_windows(0, 3600, [60]),
-    "Full length\n horizon (90 d)":  get_phase_windows(0, 3600, [90]),
+    "Full length\n horizon (360 d)":  get_phase_windows(0, 3600, [360]),
+    "Full length\n horizon (720 d)":  get_phase_windows(0, 3600, [720]),
+    "Full length\n horizon (1080 d)":  get_phase_windows(0, 3600, [1080]),
+    "Full length\n horizon (1800 d)":  get_phase_windows(0, 3600, [1800]),
 }
 PROGNOSTIC_PERIOD_DICT = {
     "infection_bacteria": PROGNOSTIC_PERIODS_INFECTIONS,
@@ -91,7 +126,7 @@ PROGNOSTIC_PERIOD_DICT = {
 METRICS_OF_INTEREST = {
     "roc_auc": "ROC AUC (→)",
     "pr_auc": "PR AUC (→)",
-    "brier": "Brier score (←)",
+    # "brier": "Brier score (←)",
     "ece": "ECE (←)",
     "bal_acc_t10": "Balanced acc. (→)",
     # "recall_t10": "Recall (→)",
@@ -149,6 +184,7 @@ def main():
         plot_period_performance_bars(
             df=task_period,
             task_name=task,
+            period_type="clinical",
             output_dir=OUTPUT_DIR,
         )
         
@@ -163,9 +199,6 @@ def main():
 
 
 def expected_calibration_error(y_true, y_prob, n_bins=10):
-    """
-    Calculates the expected calibration error (ECE) across predefined bins
-    """
     bin_boundaries = np.linspace(0, 1, n_bins + 1)
     bin_indices = np.digitize(y_prob, bin_boundaries[1:-1])
     ece = 0.0
@@ -197,7 +230,6 @@ def get_metrics_from_arrays(
         "ece": expected_calibration_error(y_true, y_cal),
     }
 
-    # Helper to calculate Net Benefit
     def calc_net_benefit(preds, t):
         tp = np.sum((preds == 1) & (y_true == 1))
         fp = np.sum((preds == 1) & (y_true == 0))
@@ -219,16 +251,13 @@ def get_metrics_from_arrays(
             if match_t:
                 requested_fixed_thresholds.add(match_t.group(1))
             
-            # Check for target recall thresholds (e.g., _rec90)
             match_rec = re.search(r'_rec(\d+)$', key)
             if match_rec:
                 requested_recall_targets.add(match_rec.group(1))
 
-    # Compute PR curve just once if needed by Best F1 or Target Recall
     if needs_best_f1 or requested_recall_targets:
         precisions, recalls, thresholds = precision_recall_curve(y_true, y_prob)
 
-    # Compute F1-optimal threshold if requested
     if needs_best_f1:
         denominator = precisions + recalls
         denominator[denominator == 0] = 1e-9
@@ -247,7 +276,6 @@ def get_metrics_from_arrays(
             "nb_best_f1": calc_net_benefit(preds_best, best_thresh)
         })
 
-    # Compute dynamically for target recall thresholds
     for rec_str in requested_recall_targets:
         target_recall = int(rec_str) / 100.0
         
@@ -269,7 +297,6 @@ def get_metrics_from_arrays(
             f"nb_{rec_suffix}": calc_net_benefit(preds_rec, rec_thresh)
         })
 
-    # Compute dynamically for fixed 'tXX' thresholds
     for t_str in requested_fixed_thresholds:
         t_float = int(t_str) / 100.0
         preds_t = (y_prob >= t_float).astype(int)
@@ -294,10 +321,14 @@ def load_all_raw_predictions() -> Dict:
     
     for split in SPLIT_TYPES:
         for task in TASKS:
-            # Transformer data
-            base_dir = TRANSFORMER_BASE_DIRS[task]
-            pt_config = TRANSFORMER_PT_CONFIGS[task]
-            t_path = base_dir / split / pt_config / "finetuning" / task
+            # Transformer data (Updated mapping logic based on script 2)
+            trial_name = BEST_TRIALS[split][task]
+            pt_config = TRANSFORMER_PT_CONFIGS[split][task]
+            
+            # Base directory built to match: RESULTS_DIR / split / task / trial / split / pt_config
+            base_dir = RESULTS_DIR / split / task / trial_name / split / pt_config
+            t_path = base_dir / "finetuning" / task
+            
             if t_path.exists():
                 _extract_npz_to_pool(t_path, "Transformer", split, task, raw_pool)
                 
@@ -336,9 +367,6 @@ def _extract_npz_to_pool(task_dir: Path, model_name: str, split: str, task: str,
 
 
 def compute_granular_metrics(raw_pool: Dict) -> pd.DataFrame:
-    """
-    Calculates metrics individually for every FUP/horizon
-    """
     records = []
     for split, models in raw_pool.items():
         for model, tasks in models.items():
@@ -362,9 +390,6 @@ def compute_granular_metrics(raw_pool: Dict) -> pd.DataFrame:
 
 
 def compute_period_metrics(raw_pool: Dict) -> pd.DataFrame:
-    """
-    Concatenates arrays based on clinical periods before calculating metrics
-    """
     records = []
     for split, models in raw_pool.items():
         for model, tasks in models.items():
@@ -476,7 +501,6 @@ def plot_delta_heatmap(df: pd.DataFrame, baseline_name: str, transformer_name: s
             cbar = fig.colorbar(mesh, ax=ax, fraction=0.046, pad=0.04)
             cbar.set_label('Delta')
 
-    # Apply tight layout to compress whitespace, leaving room for the top title
     out_file = output_dir / f"delta_heatmap_{task_name}.png"
     plt.tight_layout(rect=[0, 0, 1, 0.98])
     plt.savefig(out_file, bbox_inches='tight', dpi=150)

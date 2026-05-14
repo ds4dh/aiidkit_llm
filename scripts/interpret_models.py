@@ -1,4 +1,3 @@
-import re
 import argparse
 import yaml
 import torch
@@ -20,6 +19,9 @@ from captum.attr import LayerIntegratedGradients
 
 from src.data.patient_dataset import load_hf_data_and_metadata
 from src.model.patient_embedder import PatientEmbeddingModelFactory, PatientDataCollatorForClassification
+from src.evaluation.evaluate_models import ModelInterpreter
+from scripts.script_utils import find_best_checkpoint, extract_horizons_from_path
+
 
 CLI_CFG = {}
 SAFE_NUM_PROC = 4
@@ -209,72 +211,6 @@ def parse_args():
     parser.add_argument("--min_freq", type=int, default=20, help="Minimum number of patients a feature must appear in to be plotted.")
 
     return parser.parse_args()
-
-
-def find_best_checkpoint(base_dir: Path, task_key: str, horizon: int) -> Path:
-    task_dir = base_dir / "finetuning" / task_key
-    if not task_dir.exists(): raise FileNotFoundError(f"Task directory not found: {task_dir}")
-    
-    h_str = f"{horizon:04d}"
-    pattern = re.compile(rf"hrz\(([^)]*\b{h_str}\b[^)]*)\)")
-    candidates = [p for p in task_dir.iterdir() if p.is_dir() and pattern.search(p.name)]
-    if not candidates: raise FileNotFoundError(f"No run found for horizon {h_str} inside hrz() in {task_dir}")
-    
-    run_dir = candidates[0]
-    checkpoint_dirs = sorted(
-        list(run_dir.glob("checkpoint-*")),
-        key=lambda p: int(p.name.split("-")[-1]),
-    )
-    if not checkpoint_dirs: raise FileNotFoundError(f"No checkpoints found in {run_dir}")
-    
-    return checkpoint_dirs[0]
-
-
-def extract_horizons_from_path(checkpoint_path: Path) -> list[int]:
-    run_dir = checkpoint_path
-    while "hrz(" not in run_dir.name and run_dir.parent != run_dir:
-        run_dir = run_dir.parent
-    
-    match = re.search(r"hrz\(([\d-]+)\)", run_dir.name)
-    if not match:
-        raise ValueError(f"Could not extract horizons from path: {run_dir.name}")
-    
-    return [int(h) for h in match.group(1).split("-")] 
-
-
-class ModelInterpreter:
-    def __init__(self, model, device="cuda"):
-        self.model = model
-        self.model.eval()
-        self.model.to(device)
-        self.device = device
-
-    def get_embeddings_and_predictions(self, dataloader):
-        embeddings_list, logits_list, labels_list = [], [], []
-        with torch.no_grad():
-            for batch in tqdm(dataloader):
-                input_dict = {k: v.to(self.device) for k, v in batch["input_dict"].items()}
-    
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    outputs = self.model(input_dict=input_dict, output_hidden_states=True) 
-                
-                logits = outputs.logits
-                last_hidden = outputs.hidden_states[-1] 
-                mask = batch["attention_mask"].to(self.device).unsqueeze(-1)
-                
-                sum_embeddings = (last_hidden * mask).sum(dim=1)
-                sum_mask = mask.sum(dim=1).clamp(min=1e-9)
-                pooled = sum_embeddings / sum_mask
-                
-                embeddings_list.append(pooled.float().cpu().numpy())
-                logits_list.append(logits.float().cpu().numpy())
-                labels_list.append(batch["labels"].cpu().numpy())
-        
-        return {
-            "embeddings": np.vstack(embeddings_list),
-            "logits": np.vstack(logits_list),
-            "labels": np.vstack(labels_list),
-        }
 
 
 class ForwardWrapperForCaptum(torch.nn.Module):
@@ -522,6 +458,7 @@ def plot_frequency_vs_impact(df, output_dir, label_name, min_freq=50):
     plt.savefig(output_dir / f"drivers_volcano_{label_name}.png", dpi=300)
     plt.close()
 
+
 def plot_feature_value_impact(df, output_dir, label_name, fup_max, max_delta=None, top_k=20, min_freq=50):
     """
     Generates a SHAP-like strip plot with aligned per-row legends on the left.
@@ -580,12 +517,12 @@ def plot_feature_value_impact(df, output_dir, label_name, fup_max, max_delta=Non
 
     # --- COLOR PALETTE GENERATION ---
     
-    # 1. Ordinal Palette (Viridis is good, but Plasma is higher contrast against white)
+    # Ordinal palette (Viridis is good, but Plasma is higher contrast against white)
     # We keep Viridis as requested, but ensure it uses the full range.
     vir_cmap = plt.get_cmap("viridis", len(ORDINAL_LEVELS_LIST))
     ord_colors = {lvl: mcolors.to_hex(vir_cmap(i)) for i, lvl in enumerate(ORDINAL_LEVELS_LIST)}
     
-    # 2. Numeric/Boolean Palette (Explicit High Contrast)
+    # Numeric/Boolean Palette (Explicit High Contrast)
     # Map specifically to match your Bar Chart logic (Blue=0/False, Red=1/True)
     # We define specific colors for the Numeric Role Keys found in GLOBAL MAPPINGS
     num_manual_map = {

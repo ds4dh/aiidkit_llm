@@ -27,6 +27,7 @@ import umap
 import hdbscan
 import gc
 import io
+from tqdm import tqdm
 from contextlib import redirect_stdout
 import plotly.graph_objects as go
 from plotly.colors import qualitative
@@ -690,36 +691,32 @@ class BaseEmbeddingEvaluatorForClassification:
                 line=dict(dash='dash', color='gray'), showlegend=False
             ))
             
-            for i, name in enumerate(label_names):
-                # Skip if label is constant (cannot compute ROC)
-                if len(np.unique(labels[:, i])) < 2: continue
-                
-                fpr, tpr, _ = roc_curve(labels[:, i], probs[:, i])
-                auc = roc_auc_score(labels[:, i], probs[:, i])
-                fig_roc.add_trace(go.Scatter(
-                    x=fpr, y=tpr, mode='lines', 
-                    name=f"{name} (AUC={auc:.2f})", opacity=0.8
-                ))
-            
-            fig_roc.update_layout(
-                title=f"Multi-Label ROC ({prefix})", 
-                xaxis_title="False Positive Rate", 
-                yaxis_title="True Positive Rate", 
-                width=700, height=500
-            )
-            
             # Combined calibration curve (reliability diagram)
             fig_cal = go.Figure()
             fig_cal.add_trace(go.Scatter(
                 x=[0, 1], y=[0, 1], mode='lines', 
                 line=dict(dash='dash', color='gray'), showlegend=False
             ))
-            
             for i, name in enumerate(label_names):
-                if len(np.unique(labels[:, i])) < 2: continue
-
-                # Compute calibration curve (observed vs predicted)
-                prob_true, prob_pred = calibration_curve(labels[:, i], probs_cal[:, i], n_bins=10)
+                
+                # Masking logic for metrics computation
+                valid_mask = labels[:, i] != -100
+                if valid_mask.sum() == 0: continue
+                valid_labels = labels[valid_mask, i]
+                valid_probs = probs[valid_mask, i]
+                valid_probs_cal = probs_cal[valid_mask, i]
+                if len(np.unique(valid_labels)) < 2: continue
+                
+                # ROC Curve
+                fpr, tpr, _ = roc_curve(valid_labels, valid_probs)
+                auc = roc_auc_score(valid_labels, valid_probs)
+                fig_roc.add_trace(go.Scatter(
+                    x=fpr, y=tpr, mode='lines', 
+                    name=f"{name} (AUC={auc:.2f})", opacity=0.8
+                ))
+            
+                # Calibration curve
+                prob_true, prob_pred = calibration_curve(valid_labels, valid_probs_cal, n_bins=10)
                 fig_cal.add_trace(go.Scatter(
                     x=prob_pred, y=prob_true, mode='lines+markers', 
                     name=f"{name}", opacity=0.8
@@ -868,6 +865,51 @@ class GenerativeEmbeddingEvaluatorForClassification(BaseEmbeddingEvaluatorForCla
         labels = (actual_token_ids == self.pos_token_id).astype(int)
 
         return logits, labels, embeddings
+
+
+class ModelInterpreter:
+    """Extracts embeddings and logits from the model for a given dataloader."""
+    def __init__(self, model, device="cuda"):
+        self.model = model
+        self.model.eval()
+        self.model.to(device)
+        self.device = device
+
+    def get_embeddings_and_predictions(self, dataloader, extract_logits=True):
+        """
+        extract_logits: Set to False for pre-trained models (MLM) where sequence lengths 
+                        vary by batch, causing np.vstack to crash.
+        """
+        embeddings_list, logits_list, labels_list = [], [], []
+        with torch.no_grad():
+            for batch in tqdm(dataloader, desc="Extracting embeddings"):
+                input_dict = {k: v.to(self.device) for k, v in batch["input_dict"].items()}
+    
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    outputs = self.model(input_dict=input_dict, output_hidden_states=True) 
+                
+                last_hidden = outputs.hidden_states[-1] 
+                mask = batch["attention_mask"].to(self.device).unsqueeze(-1)
+                
+                sum_embeddings = (last_hidden * mask).sum(dim=1)
+                sum_mask = mask.sum(dim=1).clamp(min=1e-9)
+                pooled = sum_embeddings / sum_mask
+                
+                embeddings_list.append(pooled.float().cpu().numpy())
+                labels_list.append(batch["labels"].cpu().numpy())
+                
+                if extract_logits:
+                    logits_list.append(outputs.logits.float().cpu().numpy())
+        
+        res = {
+            "embeddings": np.vstack(embeddings_list),
+            "labels": np.vstack(labels_list),
+        }
+        
+        if extract_logits:
+            res["logits"] = np.vstack(logits_list)
+            
+        return res
 
 
 def preprocess_logits_for_mlm_metrics(logits, labels):

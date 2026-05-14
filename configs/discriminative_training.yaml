@@ -1,7 +1,7 @@
 # Run configuration and task (data collator) definition
 data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v3.5/teav
-data_split_type: temporal_split  # random_split, center_split, temporal_split
-result_dir: results_optuna/temporal_split/graft_loss  # base directory name for all results
+data_split_type: random_split  # random_split, center_split, temporal_split
+result_dir: results_final  # base directory name for all results
 data_collator:
   eav_mappings:
     entity_id: entity
@@ -14,18 +14,18 @@ data_collator:
     - attribute_id      # mlm task must predict 'attribute_id' labels
     - value_id          # mlm task must predict 'value_id' labels
   mlm_masking_rules:    # these numbers will set the result subdirectory name
-    entity_id: 0.15     # probability of masking an entity sub-token
-    attribute_id: 0.25  # probability of masking an entity sub-token
-    value_id: 0.45      # probability of masking an entity sub-token
+    entity_id: 0.10     # probability of masking an entity sub-token
+    attribute_id: 0.20  # probability of masking an entity sub-token
+    value_id: 0.60      # probability of masking an entity sub-token
 
 # Configuration for finetuning tasks to run
 train_data_augment: all           # "all", "none", "valid", which other fups are added to finetuning samples
 target_undersampling_ratio: 15.0  # maximum ("worst") ratio of positive to negative samples during finetuning (null for not using under-sampling)
 early_stopping_metric: roc_auc    # metric to use for early stopping (per label, then averaged)
 prediction_tasks:                 # horizon elements can be lists (multi-label) or integers / singletons (binary)
-  # infection_bacteria: {fups: [0, 30, 60, 90, 180, 360], horizons: [[30, 60, 90]]}
-  # infection_virus:    {fups: [0, 30, 60, 90, 180, 360], horizons: [[30, 60, 90]]}
-  # death:              {fups: [0, 360, 720, 1080, 1800], horizons: [[360, 720, 1080, 1800]]}
+  infection_bacteria: {fups: [0, 30, 60, 90, 180, 360], horizons: [[30, 60, 90]]}
+  infection_virus:    {fups: [0, 30, 60, 90, 180, 360], horizons: [[30, 60, 90]]}
+  death:              {fups: [0, 360, 720, 1080, 1800], horizons: [[360, 720, 1080, 1800]]}
   graft_loss:         {fups: [0, 360, 720, 1080, 1800], horizons: [[360, 720, 1080, 1800]]}
 
 # Arguments for optuna run (perform both pretraining and finetuning for different hyper-parameters)
@@ -78,7 +78,7 @@ finetuner:
   gradient_accumulation_steps: 1
   per_device_train_batch_size: 32
   per_device_eval_batch_size: 32
-  learning_rate: 4.0e-5
+  learning_rate: 5.0e-5
   weight_decay: 0.01
   loss_name: ce  # ce, weighted_ce, focal, poly1 -> ce optimizes calibration!
   enforce_monotonicity: true  # if True, classifier probabilities increase with horizon
@@ -114,10 +114,10 @@ model:
     cls_token_id: 2
     eos_token_id: 3
     sep_token_id: 3
-    dropout_embedding: 0.0
-    dropout_attention: 0.0
-    dropout_mlp: 0.0
-    dropout_classifier: 0.2
+    dropout_embedding: 0.1
+    dropout_attention: 0.1
+    dropout_mlp: 0.1
+    dropout_classifier: 0.1
     # Comment below for default ModernBERT config (so far provided better results)
     # Careful! Layer types should match num_hidden_layers and end with full_attention!
     # num_hidden_layers: 4      #   4 //    8 //   12

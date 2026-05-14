@@ -688,8 +688,11 @@ class PatientDataCollatorForClassification(PatientDataCollatorForMaskedLanguageM
         """
         batch_labels = []
         for s in samples:
-            patient_labels = [s.pop(k) for k in self.label_keys]
-            batch_labels.append(patient_labels)
+            try:
+                patient_labels = [s.pop(k) for k in self.label_keys]
+                batch_labels.append(patient_labels)
+            except:
+                import ipdb; ipdb.set_trace()
 
         # Preprocess the input samples
         self.do_augmentation = (samples[0]["split"] == "train")

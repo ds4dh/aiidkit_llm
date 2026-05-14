@@ -21,6 +21,8 @@ from src.evaluation.plot_results import plot_task_results
 from src.evaluation.evaluate_models import (
     DiscriminativeEmbeddingEvaluatorForClassification as CustomEvaluator,
 )
+from scripts.script_utils import scan_all_fups, prepare_dataset_fup_dict
+
 
 CLI_CFG: dict[str, dict] = {}
 SAFE_NUM_PROCS = 4  # max(1, len(os.sched_getaffinity(0)) - 2)
@@ -49,6 +51,7 @@ def main():
     finetuning_dir = result_dir / finetune_run_id / finetuning_subdir
 
     # Iterate over prediction tasks
+    enforce_monotonicity = CLI_CFG["finetuner"].pop("enforce_monotonicity")
     for task_key, task_specs in CLI_CFG["prediction_tasks"].items():
         if not cli_args.plot_only:
             
@@ -85,6 +88,7 @@ def main():
                         fup_valid=valid_fups,
                         fup_test=train_fups,  # same as training (but not same patients)
                         train_data_augment=train_data_augment,
+                        enforce_monotonicity=enforce_monotonicity,
                         run_id=finetune_run_id,
                         pretrained_dir=pretrained_dir,
                         finetuning_dir=finetuning_dir,
@@ -106,6 +110,7 @@ def finetune_disciminative_model(
     fup_train: list[int],
     fup_test: list[int],
     train_data_augment: str,
+    enforce_monotonicity: bool,
     run_id: str = "default_run",
     pretrained_dir: Path = None,
     finetuning_dir: Path = None,
@@ -142,7 +147,6 @@ def finetune_disciminative_model(
         sys.exit(f"Error: No checkpoint found in {pretrained_dir}")
 
     # Set up model configuration
-    enforce_monotonicity = CLI_CFG["finetuner"].pop("enforce_monotonicity")
     CLI_CFG["model"]["pretrained_dir"] = pretrained_last_ckpt_dir
     CLI_CFG["model"]["embedding_layer_config"]["vocab_size"] = len(vocab)
     CLI_CFG["model"]["reset_weights"] = cli_args.reset_weights
@@ -246,21 +250,6 @@ class PrefixAwareTrainer(Trainer):
         return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
 
 
-def prepare_dataset_fup_dict(dataset: Dataset, fup_list: list[int]):
-    """
-    Creates a dictionary of datasets for different follow-up periods.
-    """
-    out_dict = {"all": dataset}
-    fup_array = np.array(dataset["fup"])
-    for fup in fup_list:
-        indices = np.where(fup_array == fup)[0]
-        if len(indices) > 0:
-            subset = dataset.select(indices)  # dataset view
-            out_dict[f"fup_{fup:04d}"] = subset
-            
-    return out_dict
-
-
 def test_model(
     trainer: Trainer,
     eval_datasets: dict[str, Dataset],
@@ -303,22 +292,6 @@ def test_model(
     np.savez_compressed(preds_path, **all_predictions)
     with open(output_path, "w") as f:
         json.dump(final_metrics, f, indent=4)
-
-
-def scan_all_fups(data_dir: Path) -> list[int]:
-    """
-    Find all available follow-up folders (fup_XXXX) in the data directory
-    """
-    fups = []
-    for path in data_dir.iterdir():
-        if path.is_dir() and path.name.startswith("fup_"):
-            try:
-                # Extract integer from "fup_0090" -> 90
-                val = int(path.name.split("_")[-1])
-                fups.append(val)
-            except ValueError:
-                continue  # skip fup_None or malformed folders
-    return sorted(fups)
 
 
 def preprocess_logits_for_metrics(logits, labels):

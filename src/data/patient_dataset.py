@@ -1,5 +1,7 @@
 import os
 import pickle
+import hashlib
+import json
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -9,14 +11,52 @@ from pathlib import Path
 from filelock import FileLock
 from tqdm import tqdm
 from collections import defaultdict
-from datasets import (
-    Dataset, DatasetDict,
-    load_from_disk, concatenate_datasets, disable_caching,
-)
+from datasets import Dataset, DatasetDict, load_from_disk, concatenate_datasets
 
-disable_caching()
-SAFE_NUM_PROCS = 4  # max(1, len(os.sched_getaffinity(0)) - 2)
+SAFE_NUM_PROCS = 1  # 4  # max(1, len(os.sched_getaffinity(0)) - 2)
+MAP_BATCH_SIZE = 256
 BIN_LABELS = ["Lowest", "Lower", "Low", "Middle", "High", "Higher", "Highest"]
+
+
+def _fup_key(fup):
+    if fup is None:
+        return None
+    if isinstance(fup, list):
+        return list(fup)
+    return [fup]
+
+
+def _make_processed_cache_path(
+    root_path: Path,
+    fup_train,
+    fup_valid,
+    fup_test,
+    label_keys,
+    target_undersampling_ratio,
+    time_mapping,
+    eav_mappings,
+    is_pretraining: bool,
+):
+    cache_config = {
+        "mode": "pretraining" if is_pretraining else "finetuning",
+        "fup_train": _fup_key(fup_train),
+        "fup_valid": _fup_key(fup_valid),
+        "fup_test": _fup_key(fup_test),
+        "label_keys": sorted(label_keys) if label_keys else [],
+        "target_undersampling_ratio": target_undersampling_ratio,
+        "time_mapping": time_mapping,
+        "eav_mappings": eav_mappings,
+        "bin_labels": BIN_LABELS,
+    }
+
+    cache_json = json.dumps(cache_config, sort_keys=True, separators=(",", ":"))
+    cache_hash = hashlib.sha1(cache_json.encode("utf-8")).hexdigest()[:16]
+
+    prefix = "pt" if is_pretraining else "ft"
+    cache_dir = root_path / "processed_cache" / "datasets" / f"{prefix}_{cache_hash}"
+    meta_path = cache_dir / "config.json"
+
+    return cache_dir, cache_json, meta_path
 
 
 def load_hf_data_and_metadata(
@@ -27,20 +67,19 @@ def load_hf_data_and_metadata(
     fup_test: int | list[int] | None = None,
     target_undersampling_ratio: float | None = None,
     label_keys: str | list[str] | None = None,
-    time_mapping: dict[str, str]={"days_since_tpx": "time"},
-    eav_mappings: dict[str, str]={
+    time_mapping: dict[str, str] = {"days_since_tpx": "time"},
+    eav_mappings: dict[str, str] = {
         "entity_id": "entity",
         "attribute_id": "attribute",
         "value_id": "value_binned",
     },
 ) -> tuple[DatasetDict, dict[str, pd.IntervalIndex], dict[str, int]]:
-    """ Build data, using a consumer/creator pattern
-        - if `metadata_cache_key` not provided (pretraining), compute and save metadata
-        - if `metadata_cache_key` provided (finetuning), load metadata from cache
+    """
+    Build data and metadata, with persistent processed-dataset caching.
     """
     # Safety checks
     if isinstance(label_keys, str):
-        label_keys = [label_keys]     
+        label_keys = [label_keys]
     if target_undersampling_ratio is not None and not label_keys:
         raise ValueError("Cannot perform undersampling without valid 'label_keys'.")
 
@@ -51,11 +90,27 @@ def load_hf_data_and_metadata(
     vocab = None
     bin_intervals = None
 
-    # Load data
-    print(f"Loading raw data from disk...")
+    # Build processed-cache paths
+    processed_cache_path, cache_json, cache_meta_path = _make_processed_cache_path(
+        root_path=root_path,
+        fup_train=fup_train,
+        fup_valid=fup_valid,
+        fup_test=fup_test,
+        label_keys=label_keys,
+        target_undersampling_ratio=target_undersampling_ratio,
+        time_mapping=time_mapping,
+        eav_mappings=eav_mappings,
+        is_pretraining=is_pretraining,
+    )
+
+    # Load raw data
+    print("Loading raw data from disk...")
     dataset = DatasetDict({
         "train": _load_and_tag(
-            root_path, fup_train, "train", label_keys=label_keys,
+            root_path,
+            fup_train,
+            "train",
+            label_keys=label_keys,
             target_undersampling_ratio=target_undersampling_ratio,
         ),
         "validation": _load_and_tag(root_path, fup_valid, "validation"),
@@ -66,7 +121,9 @@ def load_hf_data_and_metadata(
     if not is_pretraining:
         print(f"Finetuning mode. Loading pretraining metadata from {metadata_path}")
         if not metadata_path.exists():
-            raise FileNotFoundError(f"Metadata not found at {metadata_path}. Run pre-training first.")
+            raise FileNotFoundError(
+                f"Metadata not found at {metadata_path}. Run pre-training first."
+            )
         with open(metadata_path / "vocab.pkl", "rb") as f:
             vocab = pickle.load(f)
         with open(metadata_path / "bin_intervals.pkl", "rb") as f:
@@ -75,47 +132,188 @@ def load_hf_data_and_metadata(
         print("Pretraining mode. Computing statistics and vocabulary...")
         scanned_data = concatenate_datasets([dataset["train"], dataset["validation"]])
         bin_intervals, vocab = scan_and_compute_metadata(scanned_data)
-        
-        # Save metadata
+
         print(f"Saving new pre-training metadata to: {metadata_path}")
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
-        with FileLock(metadata_path.parent / "pretraining_metadata.lock"):
+        metadata_lock_path = metadata_path.parent / "pretraining_metadata.lock"
+        with FileLock(str(metadata_lock_path)):
             metadata_path.mkdir(parents=True, exist_ok=True)
-            with open(metadata_path / "bin_intervals.pkl", "wb") as f: 
+            with open(metadata_path / "bin_intervals.pkl", "wb") as f:
                 pickle.dump(bin_intervals, f)
-            with open(metadata_path / "vocab.pkl", "wb") as f: 
+            with open(metadata_path / "vocab.pkl", "wb") as f:
                 pickle.dump(vocab, f)
 
-    # Preprocessing (bin values, map tokens to IDs, format time entries)
-    dataset = DatasetDict({
-        split: ds.map(
-            preprocess_batch, batched=True, batch_size=1000, desc=f"Preprocessing {split} set",
-            num_proc=SAFE_NUM_PROCS, load_from_cache_file=False, keep_in_memory=True,
-            fn_kwargs={
-                "vocab": vocab, "bin_intervals": bin_intervals, "bin_labels": BIN_LABELS,
-                "time_mapping": time_mapping, "eav_mappings": eav_mappings,
-            },
-        )
-        for split, ds in dataset.items()
-    })
-    
+    # Load processed dataset from cache, or build and save it
+    if processed_cache_path.exists():
+        print(f"Loading processed dataset from cache: {processed_cache_path}")
+        dataset = load_from_disk(str(processed_cache_path))
+    else:
+        print(f"Processed cache miss. Building dataset at: {processed_cache_path}")
+
+        dataset = DatasetDict({
+            split: ds.map(
+                preprocess_batch,
+                batched=True,
+                batch_size=MAP_BATCH_SIZE,
+                desc=f"Preprocessing {split} set",
+                num_proc=SAFE_NUM_PROCS,
+                load_from_cache_file=True,
+                keep_in_memory=False,
+                fn_kwargs={
+                    "vocab": vocab,
+                    "bin_intervals": bin_intervals,
+                    "bin_labels": BIN_LABELS,
+                    "time_mapping": time_mapping,
+                    "eav_mappings": eav_mappings,
+                },
+            )
+            for split, ds in dataset.items()
+        })
+
+        processed_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = processed_cache_path.parent / f"{processed_cache_path.name}.lock"
+
+        with FileLock(str(lock_path)):
+            if processed_cache_path.exists():
+                print(f"Another process created the cache meanwhile. Reloading: {processed_cache_path}")
+                dataset = load_from_disk(str(processed_cache_path))
+            else:
+                dataset.save_to_disk(str(processed_cache_path))
+                cache_meta_path.write_text(cache_json)
+                print(f"Saved processed dataset cache to: {processed_cache_path}")
+                print(f"Saved cache metadata to: {cache_meta_path}")
+
     # Sanity check, if required
     if sanity_check_output_dir is not None:
         plot_category_distributions(
-            dataset, vocab=vocab, output_dir=sanity_check_output_dir,
-            entity_key="entity_id", attribute_key="attribute_id", value_key="value_id"
+            dataset,
+            vocab=vocab,
+            output_dir=sanity_check_output_dir,
+            entity_key="entity_id",
+            attribute_key="attribute_id",
+            value_key="value_id",
         )
 
     # Final formatting and filtering
     all_cols = dataset["train"].column_names
     label_cols = [c for c in all_cols if c.startswith("label_")]
     time_key = list(time_mapping.keys())[0]
-    teav_cols = list(eav_mappings.keys()) + [time_key] 
+    teav_cols = list(eav_mappings.keys()) + [time_key]
     cols_to_keep = [*teav_cols, *label_cols, "patientid", "fup"]
     available_cols = [c for c in cols_to_keep if c in all_cols]
     dataset.set_format(type="numpy", columns=available_cols)
 
     return dataset, bin_intervals, vocab
+
+
+# def load_hf_data_and_metadata(
+#     data_dir: str,
+#     sanity_check_output_dir: str | None = None,
+#     fup_train: int | list[int] | None = None,
+#     fup_valid: int | list[int] | None = None,
+#     fup_test: int | list[int] | None = None,
+#     target_undersampling_ratio: float | None = None,
+#     label_keys: str | list[str] | None = None,
+#     time_mapping: dict[str, str]={"days_since_tpx": "time"},
+#     eav_mappings: dict[str, str]={
+#         "entity_id": "entity",
+#         "attribute_id": "attribute",
+#         "value_id": "value_binned",
+#     },
+# ) -> tuple[DatasetDict, dict[str, pd.IntervalIndex], dict[str, int]]:
+#     """ Build data, using a consumer/creator pattern
+#         - if `metadata_cache_key` not provided (pretraining), compute and save metadata
+#         - if `metadata_cache_key` provided (finetuning), load metadata from cache
+#     """
+#     # Safety checks
+#     if isinstance(label_keys, str):
+#         label_keys = [label_keys]     
+#     if target_undersampling_ratio is not None and not label_keys:
+#         raise ValueError("Cannot perform undersampling without valid 'label_keys'.")
+
+#     # Initialization
+#     root_path = Path(data_dir)
+#     metadata_path = root_path / "processed_cache" / "pretraining_metadata"
+#     is_pretraining = (fup_train is None)
+#     vocab = None
+#     bin_intervals = None
+
+#     # Load data
+#     print(f"Loading raw data from disk...")
+#     dataset = DatasetDict({
+#         "train": _load_and_tag(
+#             root_path, fup_train, "train", label_keys=label_keys,
+#             target_undersampling_ratio=target_undersampling_ratio,
+#         ),
+#         "validation": _load_and_tag(root_path, fup_valid, "validation"),
+#         "test": _load_and_tag(root_path, fup_test, "test"),
+#     })
+
+#     # Metadata: load or compute
+#     if not is_pretraining:
+#         print(f"Finetuning mode. Loading pretraining metadata from {metadata_path}")
+#         if not metadata_path.exists():
+#             raise FileNotFoundError(f"Metadata not found at {metadata_path}. Run pre-training first.")
+#         with open(metadata_path / "vocab.pkl", "rb") as f:
+#             vocab = pickle.load(f)
+#         with open(metadata_path / "bin_intervals.pkl", "rb") as f:
+#             bin_intervals = pickle.load(f)
+#     else:
+#         print("Pretraining mode. Computing statistics and vocabulary...")
+#         scanned_data = concatenate_datasets([dataset["train"], dataset["validation"]])
+#         bin_intervals, vocab = scan_and_compute_metadata(scanned_data)
+        
+#         # Save metadata
+#         print(f"Saving new pre-training metadata to: {metadata_path}")
+#         metadata_path.parent.mkdir(parents=True, exist_ok=True)
+#         with FileLock(metadata_path.parent / "pretraining_metadata.lock"):
+#             metadata_path.mkdir(parents=True, exist_ok=True)
+#             with open(metadata_path / "bin_intervals.pkl", "wb") as f: 
+#                 pickle.dump(bin_intervals, f)
+#             with open(metadata_path / "vocab.pkl", "wb") as f: 
+#                 pickle.dump(vocab, f)
+
+#     # Preprocessing (bin values, map tokens to IDs, format time entries)
+#     # dataset = DatasetDict({
+#     #     split: ds.map(
+#     #         preprocess_batch, batched=True, batch_size=1000, desc=f"Preprocessing {split} set",
+#     #         num_proc=SAFE_NUM_PROCS, load_from_cache_file=False, keep_in_memory=True,
+#     #         fn_kwargs={
+#     #             "vocab": vocab, "bin_intervals": bin_intervals, "bin_labels": BIN_LABELS,
+#     #             "time_mapping": time_mapping, "eav_mappings": eav_mappings,
+#     #         },
+#     #     )
+#     #     for split, ds in dataset.items()
+#     # })
+#     dataset = DatasetDict({
+#         split: ds.map(
+#             preprocess_batch, batched=True, batch_size=MAP_BATCH_SIZE, num_proc=SAFE_NUM_PROCS,
+#             desc=f"Preprocessing {split} set", load_from_cache_file=True, keep_in_memory=False,
+#             fn_kwargs={
+#                 "vocab": vocab, "bin_intervals": bin_intervals, "bin_labels": BIN_LABELS,
+#                 "time_mapping": time_mapping, "eav_mappings": eav_mappings,
+#             },
+#         )
+#         for split, ds in dataset.items()
+#     })
+    
+#     # Sanity check, if required
+#     if sanity_check_output_dir is not None:
+#         plot_category_distributions(
+#             dataset, vocab=vocab, output_dir=sanity_check_output_dir,
+#             entity_key="entity_id", attribute_key="attribute_id", value_key="value_id"
+#         )
+
+#     # Final formatting and filtering
+#     all_cols = dataset["train"].column_names
+#     label_cols = [c for c in all_cols if c.startswith("label_")]
+#     time_key = list(time_mapping.keys())[0]
+#     teav_cols = list(eav_mappings.keys()) + [time_key] 
+#     cols_to_keep = [*teav_cols, *label_cols, "patientid", "fup"]
+#     available_cols = [c for c in cols_to_keep if c in all_cols]
+#     dataset.set_format(type="numpy", columns=available_cols)
+
+#     return dataset, bin_intervals, vocab
 
 
 def preprocess_batch(batch, vocab, bin_intervals, time_mapping, eav_mappings, bin_labels):
@@ -263,7 +461,7 @@ def _load_and_tag(
         # Soft undersampling, usually only for training data
         if target_undersampling_ratio is not None:
             ds = undersample_dataset(ds, label_keys, target_undersampling_ratio)
-            ds = ds.flatten_indices(keep_in_memory=True)
+            ds = ds.flatten_indices()  # (keep_in_memory=True)
         
         # Tag samples with fup-integer (use -1 for None)
         fup_val = fup if fup is not None else -1
@@ -339,7 +537,7 @@ def undersample_dataset(
     final_indices = np.concatenate([selected_majority, minority_indices])
     rng.shuffle(final_indices)
     
-    return dataset.select(final_indices, keep_in_memory=True)
+    return dataset.select(final_indices)  # (..., keep_in_memory=True)
 
 
 def plot_category_distributions(
