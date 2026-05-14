@@ -66,13 +66,3 @@ python scripts/interpret_models.py
 python scripts/compare_models.py
 python scripts/stratify_models.py
 ```
-
-## Scripts overview
-
-* `scripts/train_mlm.py`: Pre-trains the patient sequence model using MLM on EAV events.
-* `scripts/train_classification.py`: Fine-tunes the pretrained model for multi-label or binary clinical prediction tasks with continuous follow-up evaluations.
-* `scripts/train_optuna.py`: Orchestrates hyperparameter optimization using Optuna, distributing trials across multiple GPUs.
-* `scripts/train_classic_ml.py`: Builds pipelines and trains classic ML baselines with automated feature selection and imputation.
-* `scripts/train_generative.py`: Fine-tunes generative LLMs on text-formatted patient narratives (using TRL).
-* `scripts/interpret_models.py`: Runs interpretability analysis to map model predictions back to specific clinical events.
-* `scripts/compare_models.py` & `src/evaluation/plot_results.py`: Aggregates evaluation metrics (ROC AUC, PR AUC, Net Benefit, Brier) and generates comparative visual reports.
