@@ -1,4 +1,5 @@
 import re
+import json
 import numpy as np
 from pathlib import Path
 from datasets import Dataset
@@ -71,3 +72,70 @@ def extract_horizons_from_path(checkpoint_path: Path) -> list[int]:
         raise ValueError(f"Could not extract horizons from path: {run_dir.name}")
     
     return [int(h) for h in match.group(1).split("-")] 
+
+
+def get_best_optuna_run(
+    results_dir: Path,
+    split_type: str,
+    task_key: str,
+) -> tuple[str, str]:
+    """
+    Parses the Optuna journal log to automatically find the best 
+    completed trial folder and its pretraining configuration string.
+    Works even if the optimization study was interrupted.
+    """
+    task_dir = results_dir / split_type / task_key
+    log_files = list(task_dir.glob("*journal.log"))
+    
+    if not log_files:
+        raise FileNotFoundError(f"Missing log file in {task_dir}")
+        
+    trial_scores = {}
+    trial_params = {}
+    
+    # Read the log file line by line
+    with open(log_files[0], "r") as f:
+        for line in f:
+            try:
+                entry = json.loads(line.strip())
+                op_code = entry.get("op_code")
+                trial_id = entry.get("trial_id")
+                
+                if trial_id is None:
+                    continue
+                    
+                # Initialize nested dict if new trial
+                if trial_id not in trial_params:
+                    trial_params[trial_id] = {}
+
+                # op_code 5: A parameter was set for this trial
+                if op_code == 5:
+                    param_name = entry.get("param_name")
+                    if param_name in ["mask_ent", "mask_att", "mask_val"]:
+                        trial_params[trial_id][param_name] = entry.get("param_value_internal", 0.0)
+                        
+                # op_code 6: Trial finished (state 1 = COMPLETE)
+                elif op_code == 6 and entry.get("state") == 1:
+                    val = entry.get("values", [-float("inf")])[0]
+                    if val is not None:
+                        trial_scores[trial_id] = val
+                        
+            except json.JSONDecodeError:
+                continue
+
+    if not trial_scores:
+        raise ValueError(f"No completed trials found in {log_files[0]}")
+
+    # Find the trial ID with the highest recorded score
+    best_trial_id = max(trial_scores, key=trial_scores.get)
+    best_params = trial_params.get(best_trial_id, {})
+
+    # Extract the masking parameters and format the config string
+    # Using round() to handle floating point imprecision (e.g. 0.15000000002 -> 15)
+    e_val = int(round(best_params.get("mask_ent", 0.0) * 100))
+    a_val = int(round(best_params.get("mask_att", 0.0) * 100))
+    v_val = int(round(best_params.get("mask_val", 0.0) * 100))
+    
+    pt_config = f"e{e_val:02d}-a{a_val:02d}-v{v_val:02d}"
+    
+    return f"trial_{best_trial_id:03d}", pt_config

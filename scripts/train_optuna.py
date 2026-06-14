@@ -177,9 +177,9 @@ def objective(trial: optuna.Trial):
 
         # Model architecture / regularization
         # Could add layer number / embedding dimension parameters?
-        dropout_att = trial.suggest_float("dropout_att", 0.0, 0.2, step=0.05)
-        dropout_mlp = trial.suggest_float("dropout_mlp", 0.0, 0.2, step=0.05)
-        dropout_cls = trial.suggest_float("dropout_cls", 0.0, 0.5, step=0.10)
+        # dropout_att = trial.suggest_float("dropout_att", 0.0, 0.2, step=0.05)
+        # dropout_mlp = trial.suggest_float("dropout_mlp", 0.0, 0.2, step=0.05)
+        # dropout_cls = trial.suggest_float("dropout_cls", 0.0, 0.5, step=0.10)
 
         # Construct overrides dictionary (structure must match the YAML hierarchy)
         overrides = {
@@ -198,13 +198,13 @@ def objective(trial: optuna.Trial):
                 "max_steps": 10000 if not DEBUG else 100,
                 "seed": trial.number,  # each trial is run on an independent process
             },
-            "model": {
-                "config_args": {
-                    "dropout_att": dropout_att,
-                    "dropout_mlp": dropout_mlp,
-                    "dropout_cls": dropout_cls,
-                },
-            }
+            # "model": {
+            #     "config_args": {
+            #         "dropout_att": dropout_att,
+            #         "dropout_mlp": dropout_mlp,
+            #         "dropout_cls": dropout_cls,
+            #     },
+            # }
         }
 
         # Execution (pretraining, finetuning), passing trial_env to run_subprocess

@@ -33,6 +33,7 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 def parse_args():
     parser = argparse.ArgumentParser(description="Train baseline ML models.")
     parser.add_argument("--config", "-c", type=str, default="configs/discriminative_classic_ml.yaml")
+    parser.add_argument("--fixed_hp", "-f", action="store_true", help="Skip Optuna hyperparameter search.")
     return parser.parse_args()
 
 
@@ -114,7 +115,9 @@ def main():
                         test_fups=train_fups_list,  # same fups as for training set!
                         horizon=horizon,
                         train_data_augment=train_data_augment,
-                        model_type=model_type, model_config=model_config,
+                        use_optuna=(not args.fixed_hp),
+                        model_type=model_type,
+                        model_config=model_config,
                     )
 
             # Plotting results
@@ -180,6 +183,7 @@ def train_model_run(
     test_fups: list[int],
     horizon: int,
     train_data_augment: str,
+    use_optuna: bool,
     model_type: str,
     model_config: dict,
 ):
@@ -224,15 +228,27 @@ def train_model_run(
     # Train
     inv_tusr = cfg.get('target_undersampling_ratio')
     if inv_tusr is not None: target_us_ratio = 1.0 / inv_tusr  # cf. transformers
-    trainer = OptunaTrainer(
-        model_type=model_type,
-        optuna_config=model_config.get('optuna_params', {}),
-        n_trials=model_config.get('n_optuna_trials', 50),
-        output_dir=output_dir,
-        target_ratio=target_us_ratio,
-    )
-    trainer.optimize_and_train(X_train, y_train, X_val, y_val)
-
+    if use_optuna:
+        trainer = OptunaTrainer(
+            model_type=model_type,
+            optuna_config=model_config.get('optuna_params', {}),
+            n_trials=model_config.get('n_optuna_trials', 50),
+            output_dir=output_dir,
+            target_ratio=target_us_ratio,
+        )
+        trainer.optimize_and_train(X_train, y_train, X_val, y_val)
+    else:
+        # Extract fixed values (like n_jobs: -1) and merge with chosen fixed_params
+        base_params = {k: v for k, v in model_config.get('optuna_params', {}).items() if not isinstance(v, list)}
+        final_params = {**base_params, **model_config.get('fixed_params', {})}
+        trainer = BaselineTrainer(
+            model_type=model_type,
+            model_params=final_params,
+            output_dir=output_dir,
+            target_ratio=target_us_ratio,
+        )
+        trainer.train(X_train, y_train)
+    
     # Evaluate
     evaluator = CustomEvaluator(
         do_clustering=False, 

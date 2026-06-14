@@ -1,7 +1,7 @@
 # Run configuration and task (data collator) definition
-data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v3.5/teav
-data_split_type: random_split  # random_split, center_split, temporal_split
-result_dir: results_final  # base directory name for all results
+data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6/teav
+data_split_type: temporal_split  # random_split, center_split, temporal_split
+result_dir: results_single_run  # base directory name for all results
 data_collator:
   eav_mappings:
     entity_id: entity
@@ -14,8 +14,8 @@ data_collator:
     - attribute_id      # mlm task must predict 'attribute_id' labels
     - value_id          # mlm task must predict 'value_id' labels
   mlm_masking_rules:    # these numbers will set the result subdirectory name
-    entity_id: 0.10     # probability of masking an entity sub-token
-    attribute_id: 0.20  # probability of masking an entity sub-token
+    entity_id: 0.00     # probability of masking an entity sub-token
+    attribute_id: 0.15  # probability of masking an entity sub-token
     value_id: 0.60      # probability of masking an entity sub-token
 
 # Configuration for finetuning tasks to run
@@ -78,7 +78,7 @@ finetuner:
   gradient_accumulation_steps: 1
   per_device_train_batch_size: 32
   per_device_eval_batch_size: 32
-  learning_rate: 5.0e-5
+  learning_rate: 4.0e-5
   weight_decay: 0.01
   loss_name: ce  # ce, weighted_ce, focal, poly1 -> ce optimizes calibration!
   enforce_monotonicity: true  # if True, classifier probabilities increase with horizon
@@ -114,7 +114,7 @@ model:
     cls_token_id: 2
     eos_token_id: 3
     sep_token_id: 3
-    dropout_embedding: 0.1
+    dropout_embedding: 0.0
     dropout_attention: 0.1
     dropout_mlp: 0.1
     dropout_classifier: 0.1

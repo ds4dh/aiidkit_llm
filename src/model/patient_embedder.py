@@ -222,6 +222,10 @@ class PatientEmbeddingLayer(nn.Module):
             for param in self.sentence_model.parameters():
                 param.requires_grad = False
             self.event_embedding_cache = {}
+        
+        # Explicit hooks for Captum attribution analysis (no impact on model)
+        self.value_embedding_hook = nn.Identity()
+        self.aggregated_embedding_hook = nn.Identity()
 
     def _construct_eav_event_sentence(
         self,
@@ -326,9 +330,15 @@ class PatientEmbeddingLayer(nn.Module):
         # Compute base embeddings
         if self.use_direct_text_input:
             x = self._get_sentence_embedding_model(kwargs)
+            x = self.aggregated_embedding_hook(x)  # for captum analysi
         else:
             eav_embeds = [self.token_embedding(kwargs[key]) for key in self.eav_keys]
+            if "value_id" in self.eav_keys:  # for captum analysis
+                val_idx = self.eav_keys.index("value_id")
+                eav_embeds[val_idx] = self.value_embedding_hook(eav_embeds[val_idx])
+                
             x = self.eav_projector(torch.cat(eav_embeds, dim=-1))  # x = sum(eav_embeds)
+            x = self.aggregated_embedding_hook(x)  # for captum analysis
 
         # Add time embeddings to the base embeddings
         x = x.to(kwargs[self.time_key].device)

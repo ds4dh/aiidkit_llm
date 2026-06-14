@@ -1,7 +1,7 @@
 # Run parameters
-data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v3.5/classic_ml
+data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6/classic_ml
 data_split_type: temporal_split  # random_split, center_split, temporal_split
-result_dir: results_classic_ml
+result_dir: results_classic_ml_final
 model_types: [logistic_regression, random_forest, xgboost]
 prediction_tasks:
   infection_bacteria:   {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
@@ -9,7 +9,7 @@ prediction_tasks:
   death:                {fups: [0, 360, 720, 1080, 1800], horizons: [360, 720, 1080, 1800]}
   graft_loss:           {fups: [0, 360, 720, 1080, 1800], horizons: [360, 720, 1080, 1800]}
 
-# Columns to exclude
+# Columns to exclude from input features
 ignore_columns:
   - "patientkey"
   - "patientid"
@@ -33,6 +33,10 @@ models:
       solver: "liblinear"
       max_iter: 1000
       n_jobs: -1
+    fixed_params:
+      C: 1.0
+      penalty: "l2"
+      feature_fraction: 100
 
   # Non-linear baseline
   random_forest:
@@ -45,6 +49,13 @@ models:
       max_features: ["categorical", "sqrt", "log2"]
       feature_fraction: ["int", 25, 100]
       n_jobs: -1
+    fixed_params:
+      n_estimators: 200
+      max_depth: 15
+      min_samples_split: 5
+      min_samples_leaf: 2
+      max_features: "sqrt"
+      feature_fraction: 100
 
   # State-of-the-art baseline with tabular data
   xgboost:
@@ -60,3 +71,12 @@ models:
       feature_fraction: ["int", 25, 100]
       n_jobs: -1
       eval_metric: "logloss"
+    fixed_params:
+      learning_rate: 0.05
+      n_estimators: 200
+      max_depth: 5
+      subsample: 0.8
+      colsample_bytree: 0.8
+      min_child_weight: 3
+      gamma: 0.1
+      feature_fraction: 100
