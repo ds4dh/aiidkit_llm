@@ -257,39 +257,51 @@ def test_model(
     output_path: str,
 ):
     """
-    Aggregates evaluation on all subsplits of the test set and save to output file
+    Aggregates evaluation on all subsplits of both the validation and test sets
+    and outputs separate prediction matrices for metric threshold tuning.
     """
-    final_metrics = {}  # to save the metrics
-    all_predictions = {}  # to save labels and model output probabilities
+    final_metrics = {}
+    all_test_predictions = {}
+    all_val_predictions = {}
     output_dir = Path(output_path).parent
 
-    # Fit calibration on validation dataset
-    print("\nFitting calibration on validation set...")
-    val_metrics = trainer.evaluate(eval_datasets["all"], metric_key_prefix="val_all")
-    final_metrics.update(val_metrics)
+    # Evaluate using validation set for later threshold tuning maps
+    print("\n>>> Collecting validation split predictions for threshold tuning...")
+    val_all = eval_datasets.pop("all")
+    results_val_all = trainer.evaluate(val_all, metric_key_prefix="val_all")
+    final_metrics.update(results_val_all)
+    
+    for key, array in trainer.compute_metrics.saved_labels_and_probs.items():
+        all_val_predictions[f"validation_all_{key}"] = array
 
-    # Evaluate on test set (all samples)
+    for fup_key, fup_val_dataset in eval_datasets.items():
+        prefix = f"validation_{fup_key}"
+        results_val = trainer.evaluate(fup_val_dataset, metric_key_prefix=prefix)
+        final_metrics.update(results_val)
+        for key, array in trainer.compute_metrics.saved_labels_and_probs.items():
+            all_val_predictions[f"{prefix}_{key}"] = array
+
+    # Evaluate using testing set, for final evaluation benchmarks
+    print("\n>>> Collecting test split predictions...")
     test_all = test_datasets.pop("all")
     results_all = trainer.evaluate(test_all, metric_key_prefix="test_all")
     final_metrics.update(results_all)
     
-    # Also storing labels and model output probabilities
     for key, array in trainer.compute_metrics.saved_labels_and_probs.items():
-        all_predictions[f"test_all_{key}"] = array
+        all_test_predictions[f"test_all_{key}"] = array
 
-    # Evaluate on test subsets (per FUP)
     for fup_key, fup_test_dataset in test_datasets.items():
         prefix = f"test_{fup_key}"
-        results = trainer.evaluate(fup_test_dataset, metric_key_prefix=prefix)
-        final_metrics.update(results)
-
-        # Storing FUP-specific labels and model output probabilities with prefix
+        results_test = trainer.evaluate(fup_test_dataset, metric_key_prefix=prefix)
+        final_metrics.update(results_test)
         for key, array in trainer.compute_metrics.saved_labels_and_probs.items():
-            all_predictions[f"{prefix}_{key}"] = array
+            all_test_predictions[f"{prefix}_{key}"] = array
 
-    # Save metric results, label and predictions
-    preds_path = output_dir / "test_probs.npz"
-    np.savez_compressed(preds_path, **all_predictions)
+    # Compress and write to disk
+    val_preds_path = output_dir / "val_probs.npz"
+    test_preds_path = output_dir / "test_probs.npz"
+    np.savez_compressed(val_preds_path, **all_val_predictions)
+    np.savez_compressed(test_preds_path, **all_test_predictions)
     with open(output_path, "w") as f:
         json.dump(final_metrics, f, indent=4)
 

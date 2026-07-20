@@ -1,0 +1,251 @@
+days_since_tpx,entity,attribute,value_binned
+-119,Patient lab,LDL cholesterol (mmol/l),Middle
+-1,Patient lab,eGFR (mL/min/1.73m²),Lowest
+-1,Patient serology,HBsAb,1
+-1,History,Category,Metabolic/Kidney
+-1,History,Diagnosis,Chronic kidney disease
+-1,Patient serology,HBcAb,0
+-1,Patient serology,HCV,0
+-1,Medication,Start (immunosuppression),Tacrolimus
+-1,Patient serology,VZV,1
+-1,Medication,Start (immunosuppression),Glucocorticoid
+-1,Patient lab,LDL cholesterol (mmol/l),Highest
+-1,Medication,Stop (induction),Basiliximab
+-1,Patient serology,HIV,0
+-1,History,Diagnosis,Other cardio-pulmonary disease
+-1,Medication,Start (immunosuppression),Mycophenolic Acid
+-1,Patient lab,Total cholesterol (mmol/l),High
+-1,History,Category,Metabolic/Kidney
+-1,Patient lab,HDL cholesterol (mmol/l),Lowest
+-1,Patient serology,HBsAb,1
+-1,Patient serology,EBV,1
+-1,History,Diagnosis,Hypertension
+-1,Virology,Detection,HBV
+-1,Medication,Start (other),Beta-blocker
+-1,Patient lab,Total cholesterol (mmol/l),Lowest
+-1,Transplant info,Waitlist start,Kidney
+-1,Patient serology,EBV,1
+-1,Patient serology,HSV,1
+-1,History,Diagnosis,Thromboembolic disease
+-1,Medication,Start (immunosuppression),Glucocorticoid
+-1,Patient lab,LDL cholesterol (mmol/l),Higher
+-1,Patient serology,CMV,0
+-1,History,Diagnosis,Nephrosclerosis
+-1,Infection,Type,Unknown
+-1,Immunology,Anti-HLA (No HLA-DSA),Yes
+-1,History,Diagnosis,Non-transplant surgery
+-1,History,Category,Metabolic/Kidney
+-1,Infection,Category,Unknown
+-1,Patient serology,EBV,1
+-1,Patient serology,HBsAb,1
+-1,Patient serology,Toxoplasmosis,1
+-1,History,Category,Metabolic/Kidney
+-1,History,Category,Metabolic/Kidney
+-1,Patient serology,HSV,1
+-1,Patient lab,Glucose (mmol/l),Lower
+-1,Medication,Start (immunosuppression),Tacrolimus
+0,Patient info,Etiology,PCKD
+0,Patient info,Blood group,0
+0,Patient info,Sex,Male
+0,Patient info,Sex,Male
+0,Patient info,Previous transplant count (any organ),0
+0,Patient info,Pre-transplant immuno-suppressed,Yes
+0,Patient info,Pre-transplant immuno-suppressed,No
+0,Patient info,Age at transplant (years),Lowest
+0,Donor info,Valvular disease,0
+0,Donor info,Smoker,0
+0,Donor info,Age at transplant (years),Low
+0,Donor info,Blood group,AB
+0,Donor info,History of CAD,0
+0,Donor info,History of CAD,0
+0,Donor info,Smoker,0
+0,Donor info,Identical twin,0
+0,Donor info,Type,Living related
+0,Donor info,Blood group,0
+0,Donor info,Identical twin,0
+0,Mismatch info,Mismatch HLA-DRB35,1
+0,Mismatch info,Mismatch HLA-DRB1,1
+0,Mismatch info,Mismatch HLA sum (minimum),Lowest
+0,Mismatch info,Mismatch HLA-DRB1,1
+0,Mismatch info,Mismatch HLA-B,1
+0,Serology info,HIV,D-/R-
+0,Serology info,CMV,D+/R+
+0,Serology info,HIV,D-/R-
+0,Serology info,Toxoplasmosis,D+/R-
+0,Serology info,CMV,D-/R-
+0,Serology info,Toxoplasmosis,D+/R+
+0,Serology info,EBV,D+/R+
+0,Patient serology,EBV,1
+0,Serology info,HBsAb,D+/R+
+0,Serology info,HBsAb,D-/R+
+0,Transplant info,Virtual crossmatch,0
+0,Transplant info,urgentlisting,0
+0,Transplant info,Hosp. stay duration so far (days),Lowest
+0,Transplant info,Previous transplant count (kidney),0
+0,Transplant info,Transplant event,Kidney
+0,Transplant info,Waitlist removal,Kidney
+0,Transplant info,Cold ischemia time (hours),Low
+0,Transplant info,Transplantation year,Lowest
+0,Transplant info,Previous transfusion,0
+0,Transplant info,Hosp. stay duration so far (days),Lowest
+0,Transplant info,Procedure provider,Insel
+0,Transplant info,Re-transplant,First
+0,Transplant info,Delayed graft function,0
+0,Transplant info,Total Organ Count,1
+0,Transplant info,Listing Organ Type,Kidney
+13,Medication,Start (infection prophylaxis),Quinolone
+56,Medication,Start (other),Other drugs
+57,Medication,Start (other),Calcium channel blocker
+58,Medication,Stop (other),Oral antidiabetic drug
+90,Medication,Start (immunosuppression),Glucocorticoid
+91,Medication,Start (immunosuppression),Mycophenolate Mofetil
+98,Medication,Start (immunosuppression),Mycophenolic Acid
+100,Medication,Start (induction),Basiliximab
+121,Medication,Start (immunosuppression),Mycophenolic Acid
+122,Medication,Start (induction),Basiliximab
+204,Medication,Start (infection prophylaxis),Atovaquone
+205,Medication,Start (other),Calcium channel blocker
+210,Medication,Stop (other),Other drugs
+211,Medication,Stop (infection prophylaxis),Valganciclovir
+213,Medication,Start (infection prophylaxis),Valaciclovir
+252,Immunology,Crossmatch B (CDC),Negative
+365,Medication,Start (immunosuppression),Mycophenolic Acid
+365,Medication,Stop (other),Other drugs
+365,Medication,Start (immunosuppression),Cyclosporine
+365,Immunology,Crossmatch B (CDC),Negative
+365,Immunology,Crossmatch T (CDC),Negative
+365,Medication,Start (other),Anticoagulation therapy
+365,Medication,Start (induction),Basiliximab
+365,Medication,Start (infection prophylaxis),Quinolone
+365,Medication,Stop (infection prophylaxis),Valganciclovir
+365,Immunology,Crossmatch T (CDC),Negative
+365,Medication,Stop (other),Anticoagulation therapy
+365,Infection,Type,Unknown
+365,Infection,Site,RT
+365,Infection,Type,Proven disease
+365,Infection,Site,Blood
+365,Infection,Category,Unknown
+365,Infection,Pathogen,E. coli
+365,Infection,Site,RT
+365,Infection,Clinically significant,False
+365,Infection,Clinically significant,False
+365,Infection,Category,Bacteria
+365,Infection,Type,Proven disease
+365,Infection,Pathogen,Enterobacter
+365,Infection,Resistance - ESBL,No
+365,Infection,Type,Colonization
+365,Infection,Site,Urinary tract
+365,Infection,Clinically significant,False
+365,Infection,Pathogen,BKV
+365,Infection,Pathogen,Klebsiella sp
+365,Infection,Type,Proven disease
+365,Infection,Pathogen,Other viruses
+365,Infection,Clinically significant,False
+365,Infection,Category,Unknown
+365,Infection,Site,Urinary tract
+365,Infection,Resistance - ESBL,No
+365,Infection,Category,Virus
+365,Infection,Type,Proven disease
+365,Infection,Site,RT
+365,Infection,Pathogen,Influenza
+365,Infection,Pathogen,BKV
+365,Infection,Pathogen,VZV
+365,Infection,Category,Bacteria
+365,Infection,Pathogen,Streptococcus  sp
+365,Infection,Pathogen,Other bacteria
+365,Infection,Clinically significant,False
+365,Infection,Category,Bacteria
+365,Infection,Clinically significant,False
+365,Infection,Site,Urinary tract
+365,Infection,Category,Virus
+365,Infection,Site,Blood
+365,Patient vitals,Patient height (cm),Higher
+365,Patient lab,Glucose (mmol/l),Lower
+365,Patient lab,eGFR (mL/min/1.73m²),Highest
+365,Patient vitals,Patient diastolic BP (mmHg),Higher
+365,Patient lab,Creatinine (µmol/l),Middle
+365,Patient lab,HDL cholesterol (mmol/l),Higher
+365,Patient vitals,Patient height (cm),Middle
+365,Patient lab,Creatinine (µmol/l),High
+365,Patient lab,Glucose (mmol/l),Highest
+365,Patient vitals,Patient diastolic BP (mmHg),Lowest
+365,Patient lab,Total cholesterol (mmol/l),High
+365,Patient vitals,Transplant age (years),Lower
+365,Patient lab,Creatinine (µmol/l),Low
+365,Patient lab,eGFR (mL/min/1.73m²),Middle
+365,Patient vitals,Patient age (years),Lowest
+365,Patient vitals,Patient height (cm),Lowest
+365,Patient vitals,Patient height (cm),Low
+365,Patient vitals,Patient BMI (kg/m²),Low
+365,Patient vitals,Transplant age (years),Highest
+365,Patient vitals,Patient age (years),Lowest
+365,Patient vitals,Patient age (years),Lowest
+365,Patient vitals,Patient systolic BP (mmHg),Middle
+365,Patient lab,eGFR (mL/min/1.73m²),Lower
+365,Patient vitals,Patient age (years),Lowest
+365,Patient lab,LDL cholesterol (mmol/l),Lower
+365,Organ lab,Proteinuria (mg/mmol),Highest
+365,Patient vitals,Patient BMI (kg/m²),Low
+365,Patient lab,Glucose (mmol/l),Higher
+365,Organ lab,Proteinuria (mg/mmol),Lowest
+365,Patient vitals,Patient age (years),Lowest
+365,Organ lab,Proteinuria (mg/mmol),Lowest
+365,Patient vitals,Patient age (years),Lowest
+365,Patient vitals,Patient systolic BP (mmHg),Lowest
+365,Patient vitals,Patient diastolic BP (mmHg),Lowest
+365,Patient vitals,Transplant age (years),Highest
+365,Patient lab,eGFR (mL/min/1.73m²),Middle
+365,Patient lab,eGFR (mL/min/1.73m²),Higher
+365,Patient lab,Glycated hemoglobin (HbA1c) (%),High
+365,Patient vitals,Patient weight (kg),Higher
+365,Patient lab,Glycated hemoglobin (HbA1c) (%),Middle
+365,Patient vitals,Patient height (cm),Middle
+365,Patient vitals,Transplant age (years),Low
+365,Patient vitals,Patient systolic BP (mmHg),Highest
+365,Patient lab,eGFR (mL/min/1.73m²),Lower
+365,Organ lab,Proteinuria (mg/mmol),Middle
+365,Patient vitals,Patient systolic BP (mmHg),Higher
+365,Patient vitals,Patient BMI (kg/m²),Higher
+365,Patient vitals,Transplant age (years),Higher
+365,Organ lab,Proteinuria (mg/mmol),Middle
+365,Organ lab,Proteinuria (mg/mmol),High
+365,Patient lab,Glucose (mmol/l),Highest
+365,Patient lab,Glycated hemoglobin (HbA1c) (%),Lower
+365,Patient vitals,Patient height (cm),Low
+365,Organ lab,Proteinuria (mg/mmol),Lower
+365,Patient lab,Creatinine (µmol/l),Highest
+365,Patient vitals,Patient BMI (kg/m²),High
+365,Patient lab,Glucose (mmol/l),Highest
+365,Patient lab,LDL cholesterol (mmol/l),Higher
+365,Patient vitals,Patient age (years),Lowest
+365,Patient vitals,Transplant age (years),Middle
+365,Patient vitals,Transplant age (years),Lower
+365,Patient vitals,Patient weight (kg),Middle
+365,Patient lab,Total cholesterol (mmol/l),Lowest
+365,Patient lab,Creatinine (µmol/l),Lowest
+365,Patient lab,Total cholesterol (mmol/l),Highest
+365,Patient vitals,Transplant age (years),Highest
+365,Patient lab,eGFR (mL/min/1.73m²),Middle
+365,Patient vitals,Transplant age (years),Lower
+365,Patient vitals,Patient age (years),Lowest
+365,Patient lab,Glycated hemoglobin (HbA1c) (%),Higher
+365,Patient vitals,Patient weight (kg),Low
+365,Patient lab,Total cholesterol (mmol/l),Higher
+365,Patient vitals,Patient height (cm),Low
+365,Patient lab,LDL cholesterol (mmol/l),Middle
+365,Patient lab,Total cholesterol (mmol/l),Middle
+365,Patient lab,Glycated hemoglobin (HbA1c) (%),Higher
+365,Patient vitals,Patient weight (kg),Middle
+365,Organ lab,Proteinuria (mg/mmol),Low
+365,History,Diagnosis,Hypertension
+365,Comorbidity,Diagnosis,Other metabolic disease
+365,Virology,Viral load (copies/ml),Higher
+365,Biopsy,Type,PP biops
+365,Organ event,Diagnosis,CNI nephrotoxicity
+365,Biopsy,Banff - mm,2
+365,Biopsy,Banff - cv,0
+365,History,Category,Cardiovascular
+365,Malignancy,Status,Incident
+365,Comorbidity,Category,Metabolic/Kidney
+365,Biopsy,Rejection diagnosis,No
+365,Biopsy,Banff - c4d,0

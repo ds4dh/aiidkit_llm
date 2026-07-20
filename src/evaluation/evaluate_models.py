@@ -109,8 +109,8 @@ class UMAP_HDBSCAN_Clusterer:
         num_samples = len(pooled_embeddings)
         best_params = {
             "n_components": 15,
-            "min_cluster_size": max(2, int(num_samples / 100)),
-            "min_samples": max(2, int(num_samples / 100)),
+            "min_cluster_size": max(2, int(num_samples / 10)),
+            "min_samples": max(2, int(num_samples / 20)),
         }
 
         # Parameters identified using
@@ -888,7 +888,7 @@ class ModelInterpreter:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     outputs = self.model(input_dict=input_dict, output_hidden_states=True) 
                 
-                last_hidden = outputs.hidden_states[-1] 
+                last_hidden = outputs.hidden_states[-1]
                 mask = batch["attention_mask"].to(self.device).unsqueeze(-1)
                 
                 sum_embeddings = (last_hidden * mask).sum(dim=1)

@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.transforms as transforms
 import seaborn as sns
+import hashlib
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -15,7 +16,7 @@ from tqdm.auto import tqdm
 from adjustText import adjust_text
 from scipy.stats import fisher_exact
 from torch.utils.data import DataLoader, Subset
-from captum.attr import IntegratedGradients, LayerIntegratedGradients
+from captum.attr import LayerIntegratedGradients
 from matplotlib.patches import PathPatch
 from matplotlib.markers import MarkerStyle
 from matplotlib.offsetbox import AnchoredOffsetbox, HPacker, VPacker, TextArea, DrawingArea
@@ -37,40 +38,51 @@ GENERATE_SANITIZE_PLOTS = False
 # Run configuration
 RESULTS_DIR = Path("results_final")
 TRANSFORMER_BASE_DIR = RESULTS_DIR / "transformer"
-OUTPUT_DIR = RESULTS_DIR / Path("analysis/interpretability")
+OUTPUT_DIR_BASE_NAME = RESULTS_DIR / Path("analysis/interpretability")
 DATA_DIR = Path("/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6/teav")
 CONFIG_PATH = Path("configs/discriminative_training.yaml")
 FROM_OPTUNA = "optuna" in TRANSFORMER_BASE_DIR.name
 DATA_SPLIT_TYPE = "temporal_split"
-PLOT_ONLY = False
+PLOT_ONLY = True  # run downstream plots directly from cache
+MAX_LEGEND_VALUES_TO_SHOW = 5  # threshold capping distinct legend item limits
 
 # Captum configuration
-TOP_K = 20
+TOP_K = 15
 MIN_FREQ = 20
-MAX_DELTA = 0.05
+MAX_DELTA = 0.10  # 0.05
 AGG_METHOD = "mean"
 NUM_CAPTUM_SAMPLES = 1000
-ATTRIBUTIONS_TO_VALUES_ONLY = True  # captum sees value token input embeddings only
+NUM_CAPTUM_STEPS = 100
+
+# -------------------------------------------------------------------------------------------------------
+# THEORETICAL INTERPRETABILITY FRAMEWORK CONSTANTS
+# -------------------------------------------------------------------------------------------------------
+# True  -> value_embedding_hook      -> Completeness w.r.t the value sub-pathway (Best for SHAP beeswarm)
+# False -> aggregated_embedding_hook -> Completeness across full token sequence (Best for overall burden)
+# -------------------------------------------------------------------------------------------------------
+ATTRIBUTIONS_TO_VALUES_ONLY = True
+USE_TIME_NEUTRAL_BASELINE = True
+OUTPUT_DIR = f"{OUTPUT_DIR_BASE_NAME}_{NUM_CAPTUM_STEPS}-steps_{int(100 * MAX_DELTA):03d}-delta_{ATTRIBUTIONS_TO_VALUES_ONLY}-values"
 
 # Task configuration
 TASK_CONFIG = {
-    "bacteria_perioperative": {  # 0 -> 1 month post-tpx
+    "bacteria_perioperative": {  
         "task": "infection_bacteria", 
         "horizon": 30, "fup_min": 0, "fup_max": 0, "fup_step": 30,
     },
-    "bacteria_opportunistic": {  # 1 -> 6 months post-tpx
+    "bacteria_opportunistic": {  
         "task": "infection_bacteria",
         "horizon": 30, "fup_min": 30, "fup_max": 150, "fup_step": 30,
     },
-    "bacteria_maintenance": {  # 6 -> 12 months post-tpx
+    "bacteria_maintenance": {  
         "task": "infection_bacteria",
         "horizon": 30, "fup_min": 180, "fup_max": 330, "fup_step": 30,
     },
-    "bacteria_long_term": {  # 12 -> 24 months post-tpx
+    "bacteria_long_term": {  
         "task": "infection_bacteria",
         "horizon": 30, "fup_min": 360, "fup_max": 690, "fup_step": 30,
     },
-    "bacteria_very_long_term": {  # 24 -> 60 months post-tpx
+    "bacteria_very_long_term": {  
         "task": "infection_bacteria",
         "horizon": 30, "fup_min": 720, "fup_max": 1770, "fup_step": 30,
     },
@@ -136,9 +148,9 @@ INFECTION_ROLES = {
 CLINICAL_ROLES = {
     'Rejection event':              ['Biops proven rj', 'Clinically suspected rj', 'Clinical', 'Subclinical', 'SAR', 'CAN'],
     'Transplant procedure':         ['Kidney tpx', 'Heart tpx', 'Lung tpx', 'HSCT allo', 'HSCT auto', 'Kidney - Pancreas', 'Kidney - Liver', 'Kidney - Lung', 'Kidney - Heart', 'Kidney - Islets', 'Islets'],
-    'Surgery':                      ['Nephrectomy native', 'Nephrectomy allograft', 'Nephrectomy allograft and native', 'Non-Tx surgery', 'Tpx-related re-surgery', 'Events/Surgery', 'Non-transplant surgery'], # <-- Included directly
+    'Surgery':                      ['Nephrectomy native', 'Nephrectomy allograft', 'Nephrectomy allograft and native', 'Non-Tx surgery', 'Tpx-related re-surgery', 'Events/Surgery', 'Non-transplant surgery'], 
     'Pregnancy/birth':              ['Birth', 'Pregnancy', 'Abortion/miscarriage'],
-    'Emergency/critical event':     ['MOF', 'Agranulocytosis', 'GI haemorrhage', 'Bone fracture', 'Hemorrhagy', 'Thromboembolic disease'], # <-- Included directly
+    'Emergency/critical event':     ['MOF', 'Agranulocytosis', 'GI haemorrhage', 'Bone fracture', 'Hemorrhagy', 'Thromboembolic disease'], 
     'Complication surgical/uro':    ['Lymphocele', 'Biliary leak', 'Biliary stenosis', 'Urine leak', 'Obstruction', 'Prosthetic'],
     'Previous graft failure':       ['Previous GF', 'Previous graft failure'],
     'Kidney dis. GN/nephritis':     ['GN', 'Interstitial nephritis', 'Reflux/Pyelonephritis', 'Graft pyelonephritis'],
@@ -190,14 +202,24 @@ NUMERIC_ROLES = {
 ORDINAL_LEVELS_LIST = ['Below', 'Lowest', 'Lower', 'Low', 'Middle', 'High', 'Higher', 'Highest', 'Measurable']
 ORDINAL_ROLES = {'Ordinal level': ORDINAL_LEVELS_LIST}
 
-# Unknowns
+# Unknowns 
 UNKNOWN_ROLES = {
-    'Other/Unknown': [
+    'Other / Unknown': [
         'Unknown', '[UNK]', 'Condition unknown',
         'Other', 'Other event or disease',
-        'Missing', 'Site not identified', 'Undetermined'
+        'Missing', 'Site not identified', 'Undetermined',
+        'Other / Remaining', 'Other / Unknown'
     ]
 }
+
+_UNKNOWN_VALUE_STRINGS = set(UNKNOWN_ROLES['Other / Unknown'])
+
+
+def _score_label() -> str:
+    """Helper to return description based on the theoretical layer evaluation setting."""
+    if ATTRIBUTIONS_TO_VALUES_ONLY:
+        return "Value-level attribution (Δ Probability)"
+    return "Token-level attribution (Δ Probability)"
 
 
 def main():
@@ -336,7 +358,23 @@ class ForwardWrapperForCaptum(torch.nn.Module):
         }
         attention_mask = (entity_id != self.pad_id).long()            
         outputs = self.model(input_dict=input_dict, attention_mask=attention_mask)
-        return outputs.logits
+        return torch.sigmoid(outputs.logits)
+
+
+def _build_baseline(ent, attr, val, days, pad_id=0, bos_id=2, time_neutral=False):
+    current_pad = pad_id if time_neutral else 0
+
+    baseline_ent = torch.full_like(ent, current_pad)
+    baseline_attr = torch.full_like(attr, current_pad)
+    baseline_val = torch.full_like(val, current_pad)
+    
+    baseline_ent[:, 0] = bos_id
+    baseline_attr[:, 0] = bos_id
+    baseline_val[:, 0] = bos_id
+    
+    baseline_days = days.clone() if time_neutral else torch.zeros_like(days)
+    
+    return baseline_ent, baseline_attr, baseline_val, baseline_days
 
 
 def extract_attributions(
@@ -353,16 +391,15 @@ def extract_attributions(
     id2word = {v: k for k, v in vocab.items()} if isinstance(vocab, dict) else vocab
     wrapper = ForwardWrapperForCaptum(model).to(device)
     
-    # Select the target hook module based on the global configuration flag
     if ATTRIBUTIONS_TO_VALUES_ONLY:
         target_layer = model.patient_embedder.value_embedding_hook
     else:
         target_layer = model.patient_embedder.aggregated_embedding_hook
     
-    # Layer integrated gradient module itself
     lig = LayerIntegratedGradients(wrapper, target_layer)
     
     collected_data = []
+
     for batch in tqdm(loader, desc="Calculating attributions"):
         inp = batch["input_dict"]
         ent = inp["entity_id"].to(device)
@@ -371,23 +408,28 @@ def extract_attributions(
         days = inp["days_since_tpx"].to(device)
         args = (ent, attr, val, days)
 
-        # Instead of zero arrays, we pass a structurally complete sequence matching the padding ID
-        baseline_ent = torch.zeros_like(ent, device=device)  # assuming pad_id = 0
-        baseline_attr = torch.zeros_like(attr, device=device)
-        baseline_val = torch.zeros_like(val, device=device)
-        baseline_days = torch.zeros_like(days, device=device)
+        bos_token_id = vocab.get("[BOS]", 2)
+        pad_token_id = vocab.get("[PAD]", 0)
+        baseline_ent, baseline_attr, baseline_val, baseline_days = _build_baseline(
+            ent=ent, 
+            attr=attr, 
+            val=val, 
+            days=days,
+            pad_id=pad_token_id, 
+            bos_id=bos_token_id,
+            time_neutral=USE_TIME_NEUTRAL_BASELINE,
+        )
         baseline_args = (baseline_ent, baseline_attr, baseline_val, baseline_days)
 
         try:
-            # Underflow errors from bfloat16 tracking are completely avoided
             with torch.inference_mode(False): 
                 attributions, delta = lig.attribute(
                     inputs=args,
-                    baselines=baseline_args,  # pass the neutral sequence baseline reference
+                    baselines=baseline_args,  
                     target=target_idx,
-                    n_steps=200,              # Riemann integral path density increased (100 -> 200)
+                    n_steps=NUM_CAPTUM_STEPS,              
                     return_convergence_delta=True,
-                    internal_batch_size=32,   # reduced batch slice size to mitigate FP32 VRAM overhead
+                    internal_batch_size=32,   
                 )
         except RuntimeError as e:
             print(f"Skipping batch due to error: {e}")
@@ -405,7 +447,7 @@ def extract_attributions(
             patient_delta = float(abs(delta_np[i]))
             
             if max_delta is not None and patient_delta > max_delta:
-                continue  # if mathematical error threshold breaks max_delta, drop patient metrics
+                continue  
             
             length = int(mask_np[i].sum())
             seq_ent = ent_np[i, :length]
@@ -417,7 +459,6 @@ def extract_attributions(
             for k, (e_id, a_id, v_id, score, day) in enumerate(
                 zip(seq_ent, seq_attr, seq_val, seq_score, seq_days)
             ):
-                
                 if e_id < 5: continue
                 ent_name = id2word.get(e_id, f"Ent_{e_id}")
                 if entity_filter is not None:
@@ -432,6 +473,10 @@ def extract_attributions(
                 attr_name = id2word.get(a_id, f"Attr_{a_id}")
                 full_feature_name = f"{ent_name} - {attr_name}"
                 val_name = id2word.get(v_id, f"Val_{v_id}")
+
+                val_name_str = str(val_name).strip()
+                if val_name_str in _UNKNOWN_VALUE_STRINGS:
+                    val_name = 'Other / Unknown'
             
                 collected_data.append({
                     "Feature": full_feature_name,
@@ -512,13 +557,12 @@ def plot_feature_importance(df, output_dir, label_name, top_k=20, min_freq=50, a
     ax2.set_yticklabels(pos_labels, fontsize=11)
     ax2.tick_params(axis='y', right=False)
 
-    title_suffix = "Cumulative impact" if agg_method == "sum" else "Average impact"
     explanation = "(blue = reduces predicted risk, red = increases predicted risk)"
     ax.set_title(
         f"Top {top_k} risk-increasing and risk-reducing drivers: {label_name}\n{explanation}",
         pad=20, fontsize=15, fontweight='bold',
     )
-    ax.set_xlabel(f"{title_suffix} (attribution score)", fontsize=12)
+    ax.set_xlabel(_score_label(), fontsize=12)
     
     ax.grid(axis='x', linestyle='--', alpha=0.4)
     for spine in ['top', 'right', 'left']:
@@ -563,8 +607,10 @@ def plot_frequency_vs_impact(df, output_dir, label_name, min_freq=50):
     plt.axvline(med_f, color="gray", linestyle="--", alpha=0.3, label=f"Median Freq: {int(med_f)}")
     plt.axhline(0, color="black", linestyle="-", linewidth=0.8)
     
-    top_f = stats.nlargest(8, "Frequency"); top_p = stats.nlargest(8, "Mean_Impact")
-    top_n = stats.nsmallest(8, "Mean_Impact"); top_b = stats.nlargest(8, "Total_Burden")
+    top_f = stats.nlargest(8, "Frequency")
+    top_p = stats.nlargest(8, "Mean_Impact")
+    top_n = stats.nsmallest(8, "Mean_Impact")
+    top_b = stats.nlargest(8, "Total_Burden")
     to_label = pd.concat([top_f, top_p, top_n, top_b]).drop_duplicates(subset="Feature")
     
     texts = []
@@ -586,22 +632,25 @@ def plot_frequency_vs_impact(df, output_dir, label_name, min_freq=50):
     plt.title(f"Frequency vs. severity: {label_name}\n{explanation}", fontsize=14)
     plt.xscale("log")
     plt.xlabel("Frequency (log scale)", fontsize=12)
-    plt.ylabel("Conditional mean attribution", fontsize=12)
+    plt.ylabel(_score_label(), fontsize=12)
     plt.grid(True, which="both", linestyle="--", alpha=0.2)
     plt.tight_layout()
     plt.savefig(output_dir / f"drivers_volcano_{label_name}.png", dpi=300)
     plt.close()
 
 
+def get_deterministic_color_with_context(feature_name: str, string_value: str, palette_list: list) -> str:
+    """Hashes feature layout and category context together to prevent intra-row duplicate styling."""
+    combined_string = f"{str(feature_name)}|||{str(string_value)}"
+    hasher = hashlib.md5(combined_string.encode('utf-8'))
+    hash_int = int(hasher.hexdigest(), 16)
+    palette_index = hash_int % len(palette_list)
+    return palette_list[palette_index]
+
+
 def plot_feature_value_impact(
     df, output_dir, label_name, fup_max, max_delta=None, top_k=20, min_freq=50,
 ):
-    """
-    Generates a SHAP-like strip plot with aligned per-row legends on the left.
-    - Transparent legend background boxes with distinct clearance spacing from scatterplot data.
-    - Top-aligned legends flush with the row's upper border boundary.
-    - Mathematically balanced marker sizes inside the legend vector canvas.
-    """
     if df.empty: return
     csv_path = output_dir / f"drivers_shap_{label_name}.csv"
 
@@ -629,11 +678,17 @@ def plot_feature_value_impact(
     adjusted_rows = []
     for feature in top_features:
         feat_df = df_plot[df_plot["Feature"] == feature].copy()
+        
+        feat_df["Value"] = feat_df["Value"].apply(
+            lambda x: "Other / Unknown" if str(x).strip() in _UNKNOWN_VALUE_STRINGS else x
+        )
         val_counts = feat_df["Value"].value_counts()
         
-        if len(val_counts) > 9:
+        is_ordinal_feature = any(val_to_group.get(v) == "Ordinal level" for v in val_counts.index)
+        
+        if not is_ordinal_feature and len(val_counts) > 9:
             top_9_vals = val_counts.head(9).index.tolist()
-            feat_df["Value"] = feat_df["Value"].apply(lambda v: v if v in top_9_vals else "Other")
+            feat_df["Value"] = feat_df["Value"].apply(lambda v: v if v in top_9_vals else "Other / Unknown")
         
         adjusted_rows.append(feat_df)
         
@@ -642,63 +697,76 @@ def plot_feature_value_impact(
     unique_vals = df_plot["Value"].unique()
     unknowns = [v for v in unique_vals if v not in val_to_group]
     for v in unknowns:
-        if str(v).lower().startswith("other ") or str(v) == "Other":
-            val_to_group[v] = 'Other/Unknown'
-        elif str(v) in ORDINAL_LEVELS_LIST:
+        v_str = str(v).strip()
+        if v_str.lower().startswith("other ") or v_str == "Other" or v_str in ['Other / Remaining', 'Other / Unknown']:
+            val_to_group[v] = 'Other / Unknown'
+        elif v_str in ORDINAL_LEVELS_LIST:
              val_to_group[v] = 'Ordinal level'
         else:
             val_to_group[v] = f"{v}_"
 
-    df_plot["Value_Grouped"] = df_plot["Value"].map(val_to_group).fillna("Other/Unknown")
+    df_plot["Value_Grouped"] = df_plot["Value"].map(val_to_group).fillna("Other / Unknown")
     df_plot.to_csv(csv_path, index=False)
 
-    vir_cmap = plt.get_cmap("viridis", len(ORDINAL_LEVELS_LIST))
-    ord_colors = {lvl: mcolors.to_hex(vir_cmap(i)) for i, lvl in enumerate(ORDINAL_LEVELS_LIST)}
+    categorical_colors_pool = [
+        '#e6194b', '#3cb44b', '#4363d8', '#f58231', '#911eb4',
+        '#26a69a', '#f032e6', '#b29e21', "#8C5B49", "#8D8D8D",
+    ]
     
     num_manual_map = {
-        'No / Male': '#1f77b4', 'Yes / Female / Occured': '#d62728',
-        'Value 2': '#ff7f0e', 'Value 3': '#9467bd', 'Value 4': '#17becf'
+        'No / Male': "#D11D14", 'Yes / Female / Occured': "#203ed1",
+        'Value 2': "#4082b7", 'Value 3': "#54a4a1", 'Value 4': "#88f3cf",
     }
-    heat_cmap = plt.get_cmap("RdYlGn")
-    num_colors = {}
-    for i, k in enumerate(NUMERIC_ROLES.keys()):
-        num_colors[k] = num_manual_map.get(k, mcolors.to_hex(heat_cmap(i / max(1, len(NUMERIC_ROLES)))))
-
+    
+    vir_cmap = plt.get_cmap("viridis", len(ORDINAL_LEVELS_LIST))
+    ord_colors = {lvl: mcolors.to_hex(vir_cmap(i)) for i, lvl in enumerate(ORDINAL_LEVELS_LIST)}
     unknown_color = "#333333"
-    cat_hex_pool = [
-        '#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231',
-        '#911eb4', '#46f0f0', '#f032e6', '#bcf60c', '#fabebe',
-        '#008080', '#e6beff', '#9a6324', '#fffac8', '#800000',
-    ]
 
+    # Contextual multi-index master palette to ensure uniqueness across variables inside a single row legend box
     master_palette = {}
-    cat_counter = 0
-    unique_groups = sorted(df_plot["Value_Grouped"].unique())    
-    for grp in unique_groups:
-        if grp == "Ordinal level": 
-            pass
-        elif grp in num_colors:
-            master_palette[grp] = num_colors[grp]
-        elif grp in UNKNOWN_ROLES or grp == 'Other/Unknown':
-            master_palette[grp] = unknown_color
-        else:
-            master_palette[grp] = cat_hex_pool[cat_counter % len(cat_hex_pool)]
-            cat_counter += 1
-
-    for lvl in ORDINAL_LEVELS_LIST:
-        master_palette[lvl] = ord_colors.get(lvl, unknown_color)
+    for feature in top_features:
+        subset = df_plot[df_plot["Feature"] == feature]
+        unique_vals_in_row = subset["Value"].unique()
+        used_colors_in_row = set()
+        
+        for entry_value in unique_vals_in_row:
+            grp = val_to_group.get(entry_value, entry_value)
+            if grp == "Ordinal level" or entry_value in ORDINAL_LEVELS_LIST:
+                color = ord_colors.get(entry_value, unknown_color)
+            elif grp in NUMERIC_ROLES:
+                color = num_manual_map.get(grp, unknown_color)
+            elif grp in UNKNOWN_ROLES or grp == 'Other / Unknown':
+                color = unknown_color
+            else:
+                color = get_deterministic_color_with_context(feature, entry_value, categorical_colors_pool)
+                # Resolve intra-row matching color collisions through deterministic rotation shifts
+                if color in used_colors_in_row:
+                    try:
+                        start_idx = categorical_colors_pool.index(color)
+                        for offset in range(1, len(categorical_colors_pool)):
+                            alt_idx = (start_idx + offset) % len(categorical_colors_pool)
+                            alt_color = categorical_colors_pool[alt_idx]
+                            if alt_color not in used_colors_in_row:
+                                color = alt_color
+                                break
+                    except ValueError:
+                        pass
+                used_colors_in_row.add(color)
+                
+            master_palette[(feature, entry_value)] = color
 
     def get_value_type(group_name):
         if group_name == 'Ordinal level': return "Ordinal"
         if group_name in NUMERIC_ROLES: return "Numeric/Bool"
-        if group_name in UNKNOWN_ROLES or group_name == "Other/Unknown": return "Other"
+        if group_name in UNKNOWN_ROLES or group_name == "Other / Unknown": return "Other"
         return "Categorical"
     
     df_plot["Group_Type"] = df_plot["Value_Grouped"].apply(get_value_type)
     markers_map = {"Ordinal": "o", "Numeric/Bool": "D", "Categorical": "s", "Other": "X"}
 
-    ROW_HEIGHT = 1.0       
-    ROW_PADDING = 0.45     
+    # --- ROW SPACING CONFIGURATION ---
+    ROW_HEIGHT = 1.25
+    ROW_PADDING = 0.65
     
     feature_y_map = {}
     row_heights = {}
@@ -720,25 +788,28 @@ def plot_feature_value_impact(
         y_shift = 0.5 * df_plot["Row_Height"]
     df_plot["Y_Value"] = df_plot["Feature_Y"] + y_shift
 
-    total_y_max = current_floor + 0.6
-    fig_height = max(7, total_y_max * 0.75)
-    fig, ax = plt.subplots(figsize=(16, fig_height))
+    bottom_line_y = feature_y_map[top_features[0]] - (ROW_HEIGHT / 2) - (ROW_PADDING / 2)
+    top_line_y = feature_y_map[top_features[-1]] + (ROW_HEIGHT / 2) + (ROW_PADDING / 2)
     
-    # Left margin of 0.54 isolates the legend canvas bounding overlaps entirely
-    plt.subplots_adjust(left=0.54, right=0.97, top=0.95, bottom=0.06)
-    ax.set_ylim(feature_y_map[top_features[0]] - (ROW_HEIGHT / 2) - ROW_PADDING, total_y_max)
-    df_plot["Color_Key"] = df_plot.apply(
-        lambda r: r["Value"] if r["Value_Grouped"] == "Ordinal level" else r["Value_Grouped"],
-        axis=1,
-    )
+    SYMMETRY_PADDING = 0.30
+    y_min_limit = bottom_line_y - SYMMETRY_PADDING
+    total_y_max = top_line_y + SYMMETRY_PADDING
     
-    # Balanced scatter sizes map
+    fig_height = max(5, total_y_max * 0.40) 
+    fig = plt.figure(figsize=(10.5, fig_height))
+    
+    gs = fig.add_gridspec(1, 1, left=0.55, right=0.85, top=0.98, bottom=0.14)
+    ax = fig.add_subplot(gs[0, 0])
+    ax.set_ylim(y_min_limit, total_y_max)
+    
+    # Map multi-index key coordinates configuration to extract distinct labels
+    df_plot["Color_Key"] = list(zip(df_plot["Feature"], df_plot["Value"]))
+    
     sizes_map_scatter = {"Ordinal": 45, "Numeric/Bool": 35, "Categorical": 40, "Other": 50}
     combo_counts = df_plot.groupby(["Feature", "Value"]).size().reset_index(name="Combo_Frequency")
-    df_plot = df_plot.merge(combo_counts, on=["Feature", "Value"], how="left")  # sort to show rarest events on top
+    df_plot = df_plot.merge(combo_counts, on=["Feature", "Value"], how="left")  
     df_plot = df_plot.sort_values(by="Combo_Frequency", ascending=False).reset_index(drop=True)    
     
-    # Scatter plot itself
     sns.scatterplot(
         data=df_plot, x="Score", y="Y_Value",
         hue="Color_Key", style="Group_Type", size="Group_Type",
@@ -750,7 +821,7 @@ def plot_feature_value_impact(
     ax.set_yticklabels([]) 
     ax.set_ylabel("")
     ax.tick_params(axis='y', left=False)
-    ax.set_xlabel("Attribution score (positive = risk-increasing, negative = risk-reducing)", fontsize=11)
+    ax.set_xlabel(_score_label(), fontsize=11, labelpad=4)
     
     for f_idx, f in enumerate(top_features):
         y_center = feature_y_map[f]
@@ -762,112 +833,96 @@ def plot_feature_value_impact(
         
     ax.axvline(0, color="black", linestyle="-", alpha=0.4)
 
-    
     for feature in top_features:
         y_center = feature_y_map[feature]
-        # Calculate the absolute upper ceiling coordinate of the row
         y_top_boundary = y_center + (ROW_HEIGHT / 2)
         
         subset = df_plot[df_plot["Feature"] == feature]
-        cat_groups = subset[~subset["Group_Type"].isin(["Ordinal", "Numeric/Bool"])]["Value_Grouped"].unique()
-        raw_vals = subset[subset["Group_Type"].isin(["Ordinal", "Numeric/Bool"])]["Value"].unique()
+        is_ordinal_feature = any(val_to_group.get(v) == "Ordinal level" for v in subset["Value"].unique())
         
-        cat_groups = sorted(cat_groups, key=str)
-        ords = sorted([x for x in raw_vals if x in ORDINAL_LEVELS_LIST], key=lambda x: ORDINAL_LEVELS_LIST.index(x))
-        nums = sorted([x for x in raw_vals if x not in ORDINAL_LEVELS_LIST], key=str)
+        if is_ordinal_feature:
+            named_items = sorted([v for v in subset["Value"].unique() if v in ORDINAL_LEVELS_LIST], key=lambda x: ORDINAL_LEVELS_LIST.index(x))
+            has_leftovers = False
+        else:
+            item_counts = subset["Value"].value_counts()
+            filtered_item_counts = item_counts.drop("Other / Unknown", errors="ignore")
+            named_items = filtered_item_counts.head(MAX_LEGEND_VALUES_TO_SHOW).index.tolist()
+            has_leftovers = (len(item_counts) > MAX_LEGEND_VALUES_TO_SHOW) or ("Other / Unknown" in item_counts.index)
         
-        items_to_show = list(cat_groups) + nums + ords
-
         legend_boxes = []
-        for item in items_to_show:
+        for item in named_items:
             group_name = val_to_group.get(item, item)
-            if group_name == "Ordinal level" or item in ORDINAL_LEVELS_LIST:
-                g_type = "Ordinal"
-                color = master_palette.get(item, unknown_color)
-            elif group_name in NUMERIC_ROLES:
-                g_type = "Numeric/Bool"
-                color = master_palette.get(group_name, unknown_color)
-            else: 
-                g_type = get_value_type(group_name)
-                color = master_palette.get(group_name, unknown_color)
+            g_type = get_value_type(group_name)
+            
+            # Fetch context isolated identifier coordinate
+            color = master_palette.get((feature, item), unknown_color)
             
             marker_char = markers_map.get(g_type, "X")
-            
-            # Canvas setup
             da = DrawingArea(14, 10, 0, 0)
             marker_style = MarkerStyle(marker_char)
-            marker_path = marker_style.get_path()
-            marker_transform = marker_style.get_transform()
-            
-            # Extract the complete transformed path layout to get the true shape boundaries
-            transformed_path = marker_path.transformed(marker_transform)
+            transformed_path = marker_style.get_path().transformed(marker_style.get_transform())
             bbox = transformed_path.get_extents()
             
-            # Calculate true exact geometric center coordinates
             true_center_x = (bbox.x0 + bbox.x1) / 2.0
             true_center_y = (bbox.y0 + bbox.y1) / 2.0
-                            
-            # Build clean linear transformation matrix pipeline:
+                                            
             scale_factor = 7.0 if marker_char in ['s', 'D'] else 8.0
-            Y_VISUAL_OFFSET = 0.5
             final_transform = (
                 transforms.Affine2D()
                 .translate(-true_center_x, -true_center_y)
                 .scale(scale_factor)
-                .translate(7.0, 5.0 + Y_VISUAL_OFFSET)
+                .translate(7.0, 5.5)
             )
             
-            # Apply the centering/scaling matrix to the fully shaped path
-            final_path = transformed_path.transformed(final_transform)
-            
-            patch = PathPatch(final_path, facecolor=color, edgecolor='white', linewidth=0.5)
+            patch = PathPatch(transformed_path.transformed(final_transform), facecolor=color, edgecolor='white', linewidth=0.5)
             da.add_artist(patch)
             
-            ta = TextArea(f" {str(item)}", textprops=dict(fontsize=9, color='#444'))
-            item_box = HPacker(children=[da, ta], align="center", pad=0, sep=0)
-            legend_boxes.append(item_box)
+            ta = TextArea(f" {str(item)}", textprops=dict(fontsize=8.5, color='#444'))
+            legend_boxes.append(HPacker(children=[da, ta], align="center", pad=0, sep=0))
             
+        if has_leftovers:
+            da = DrawingArea(14, 10, 0, 0)
+            final_transform = transforms.Affine2D().translate(-0.0, -0.0).scale(7.0).translate(7.0, 5.5)
+            patch = PathPatch(MarkerStyle("X").get_path().transformed(final_transform), facecolor="#777777", edgecolor='white', linewidth=0.5)
+            da.add_artist(patch)
+            ta = TextArea(" Other / Unknown", textprops=dict(fontsize=8.5, color='#666', fontstyle='italic'))
+            legend_boxes.append(HPacker(children=[da, ta], align="center", pad=0, sep=0))
+
         rows_children = []
-        current_row_items = []
-        accumulated_width = 0
-        max_legend_width_pixels = 560
+        n_elements = len(legend_boxes)
         
-        for i, box in enumerate(legend_boxes):
-            label_text = box.get_children()[1].get_text()
-            approx_text_width = len(label_text) * 5.8  
-            box_width = 14 + approx_text_width + 16 
+        if n_elements > 0:
+            base_items_per_row = n_elements // 2
+            rem = n_elements % 2
             
-            if accumulated_width + box_width > max_legend_width_pixels:
-                if len(rows_children) >= 1:
-                    break
-                rows_children.append(HPacker(children=current_row_items, align="center", pad=0, sep=14))
-                current_row_items = [box]
-                accumulated_width = box_width
-            else:
-                current_row_items.append(box)
-                accumulated_width += box_width
+            idx_ptr = 0
+            for r_sub in range(2):
+                allocated_size = base_items_per_row + (1 if r_sub < rem else 0)
+                if allocated_size == 0:
+                    continue
                 
-        if current_row_items and len(rows_children) < 2:
-            rows_children.append(HPacker(children=current_row_items, align="center", pad=0, sep=14))
+                sub_row_chunk = legend_boxes[idx_ptr : idx_ptr + allocated_size]
+                idx_ptr += allocated_size
+                rows_children.append(HPacker(children=sub_row_chunk, align="center", pad=0, sep=10))
+                
+        while len(rows_children) < 2:
+            rows_children.append(HPacker(children=[], align="center", pad=0, sep=0))
             
         title_box = TextArea(feature, textprops=dict(fontsize=10.5, fontweight='bold', color='#111'))
-        content_box = VPacker(children=[title_box] + rows_children, align="right", pad=0, sep=4)
+        content_box = VPacker(children=[title_box] + rows_children, align="right", pad=0, sep=3)
         
-        # Create a blended transform: X is Axes fraction (0 to 1), Y is Data coordinates
         blended_legend_transform = transforms.blended_transform_factory(ax.transAxes, ax.transData)
-        # Align the right edge of the legend exactly to the left of the plot rectangle
         anchored_box = AnchoredOffsetbox(
             loc='upper right', child=content_box, pad=0, borderpad=0, frameon=False,
-            bbox_to_anchor=(-0.02, y_top_boundary), bbox_transform=blended_legend_transform,
+            bbox_to_anchor=(-0.05, y_top_boundary), bbox_transform=blended_legend_transform,
         )
         anchored_box.set_clip_on(False)
         ax.add_artist(anchored_box)
-
-    plt.title(f"Detailed feature impact: {label_name}", fontsize=14, y=1.0)
+    
     plt.savefig(output_dir / f"drivers_shap_{label_name}.png", dpi=300)
     plt.close()
-    
-    
+
+
 def compute_feature_enrichment(target_indices, background_indices, dataset, top_k=20):
     print(f"   -> Analyzing features for {len(target_indices)} vs {len(background_indices)} samples...")
     
@@ -932,13 +987,13 @@ def run_captum_analysis(
 
     print(" -> Generating Feature Importance Bar Chart...")
     plot_feature_importance(
-        df, output_dir, label_name, 
-        top_k=top_k, min_freq=min_freq, agg_method=agg_method
+        df, output_dir, label_name, top_k=top_k,
+        min_freq=min_freq, agg_method=agg_method,
     )
 
     print(" -> Generating Volcano Plot (Frequency vs Impact)...")
     plot_frequency_vs_impact(df, output_dir, label_name, min_freq=min_freq)
-    
+
     print(" -> Generating Detailed Strip Plot...")
     plot_feature_value_impact(
         df, output_dir, label_name, fup_max,

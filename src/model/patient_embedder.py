@@ -673,7 +673,7 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
             masked_input_dict[feature_key] = input_tokens
 
         return masked_input_dict, final_labels
-
+  
 
 @dataclass
 class PatientDataCollatorForClassification(PatientDataCollatorForMaskedLanguageModelling):
@@ -702,6 +702,8 @@ class PatientDataCollatorForClassification(PatientDataCollatorForMaskedLanguageM
                 patient_labels = [s.pop(k) for k in self.label_keys]
                 batch_labels.append(patient_labels)
             except:
+                print("Error sending input to the model.")
+                print("Maybe a finetuned model is used without labels?")
                 import ipdb; ipdb.set_trace()
 
         # Preprocess the input samples

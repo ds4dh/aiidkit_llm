@@ -1,7 +1,7 @@
 # Run configuration and task (data collator) definition
 data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6/teav
-data_split_type: temporal_split  # random_split, center_split, temporal_split
-result_dir: results_single_run  # base directory name for all results
+data_split_type: random_split  # random_split, center_split, temporal_split
+result_dir: results_final/transformer  # base directory name for all results
 data_collator:
   eav_mappings:
     entity_id: entity

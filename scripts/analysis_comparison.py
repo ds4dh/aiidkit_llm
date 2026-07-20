@@ -1,1017 +1,753 @@
-import gc
 import re
-import sys
+import argparse
+import hmac
+import hashlib
+import json
 import numpy as np
 import pandas as pd
-import seaborn as sns
 import matplotlib.pyplot as plt
-from tqdm import tqdm
-from typing import Dict
 from pathlib import Path
-from collections import defaultdict
+from datasets import load_from_disk
 from sklearn.metrics import (
-    roc_auc_score, average_precision_score,
-    brier_score_loss, precision_recall_curve, roc_curve,
+    average_precision_score, precision_recall_curve, roc_auc_score, roc_curve,
 )
-from statsmodels.stats.multitest import multipletests
-from scripts.script_utils import get_best_optuna_run
-from joblib import Parallel, delayed
+from statsmodels.stats.contingency_tables import mcnemar
 
-# Configuration
+
+# ==========================================
+# SYSTEM CONFIGURATION AND PIPELINE TUNING
+# ==========================================
+parser = argparse.ArgumentParser(description="Run optimized evaluation pipeline with custom thresholding.")
+parser.add_argument(
+    "--threshold_mode",
+    type=str,
+    default="window_specific",
+    choices=["global", "window_specific", "manual"],
+    help="Select boundary constraint tuning mode (global, window_specific, or manual).",
+)
+parser.add_argument(
+    "--target_recall",
+    type=int,
+    default=80,
+    help="Target minimal recall used for tuning model decision threshold (e.g., 80).",
+)
+args = parser.parse_args()
+
+THRESHOLD_MODE = args.threshold_mode
+TARGET_RECALL_INPUT = args.target_recall
+TARGET_RECALL_ANCHOR = float(TARGET_RECALL_INPUT) / 100.0
+THRESHOLD_SUBFOLDER = f"rec{TARGET_RECALL_INPUT}"
+
+USE_CALIBRATED_PROBS = {
+    "Transformer": False,  # trained with CE, so no need of calibration
+    "logistic_regression": True,
+    "random_forest": True,
+    "xgboost": True,
+}
+THRESHOLD_TUNING_SET = "validation"  # validation (standard)), test (sanity checking)
+
+BASE_DATA_PATH = Path("/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6/teav")
 RESULTS_DIR = Path("results_final")
-OUTPUT_DIR = RESULTS_DIR / "analysis" / "comparison"
-CLASSIC_ML_BASE_DIR = RESULTS_DIR / "classic_ml"
-TRANSFORMER_BASE_DIR = RESULTS_DIR / "transformer"
-FROM_OPTUNA = ("optuna" in TRANSFORMER_BASE_DIR.name)
-BEST_CLASSIC_ML_MODEL = "xgboost"
-LOAD_EVALUATION = True
-PLOT_FUP_CURVES = False
+ANALYSIS_DIR = RESULTS_DIR / "analysis" / "comparison"
+ANALYSIS_SUBDIR = ANALYSIS_DIR / THRESHOLD_MODE / THRESHOLD_SUBFOLDER
+CACHE_DIR = ANALYSIS_DIR / "cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# TASKS = ["infection_bacteria", "infection_virus", "death", "graft_loss"]
-TASKS = ["infection_bacteria"]
+CLASSIC_MODELS = ["logistic_regression", "random_forest", "xgboost"]
+ALL_MODELS = ["Transformer"] + CLASSIC_MODELS
+
+TASKS = ["infection_bacteria"]  # ["infection_bacteria", "infection_virus"]
 SPLIT_TYPES = ["random_split", "temporal_split", "center_split"]
-CLASSIC_ML_MODELS_TO_PLOT = ["logistic_regression", "random_forest", "xgboost"]
-MODEL_NAME_MAP = {"logistic_regression": "LR", "random_forest": "RF", "xgboost": "XGB", "Transformer": "TF"}
-
-def get_phase_windows(start, end, horizons, step=30):
-    return {h: w for h in horizons if (w := list(range(start, end + 1 - h, step)))}
-
-CLINICAL_PERIODS_INFECTIONS = {
-    "Perioperative\nphase (0-1 mo)": get_phase_windows(  0,  30, [30, 60, 90]),
-    "Opportunistic\nphase (1-6 mo)": get_phase_windows( 30, 180, [30, 60, 90]),
-    "Maintenance\nphase (6-12 mo)":  get_phase_windows(180, 360, [30, 60, 90]),
-    "Long-term\nphase (1-2 yr)":     get_phase_windows(360, 720, [30, 60, 90]),
-}
-CLINICAL_PERIODS_OUTCOMES = {
-    "Short-term\nphase (0-2 yr)":       get_phase_windows(   0,  360, [360, 720, 1080, 1800]),
-    "Middle-term\nphase (1-3 yr)":      get_phase_windows( 360, 1080, [360, 720, 1080, 1800]),
-    "Long-term\nphase (3-5 yr)":        get_phase_windows(1080, 1800, [360, 720, 1080, 1800]),
-    "Very-long-term\nphase (5-10 yr)":  get_phase_windows(1800, 3600, [360, 720, 1080, 1800]),
-}
-CLINICAL_PERIOD_DICT = {
-    "infection_bacteria": CLINICAL_PERIODS_INFECTIONS,
-    "infection_virus": CLINICAL_PERIODS_INFECTIONS,
-    "death": CLINICAL_PERIODS_OUTCOMES,
-    "graft_loss": CLINICAL_PERIODS_OUTCOMES,
-}
-PROGNOSTIC_PERIODS_INFECTIONS = {
-    "Full length\nhorizon (30 d)":  get_phase_windows(0, 3600, [30]),
-    "Full length\nhorizon (60 d)":  get_phase_windows(0, 3600, [60]),
-    "Full length\nhorizon (90 d)":  get_phase_windows(0, 3600, [90]),
-}
-PROGNOSTIC_PERIODS_OUTCOMES = {
-    "Full length\nhorizon (360 d)":   get_phase_windows(0, 3600, [ 360]),
-    "Full length\nhorizon (720 d)":   get_phase_windows(0, 3600, [ 720]),
-    "Full length\nhorizon (1080 d)":  get_phase_windows(0, 3600, [1080]),
-    "Full length\nhorizon (1800 d)":  get_phase_windows(0, 3600, [1800]),
-}
-PROGNOSTIC_PERIOD_DICT = {
-    "infection_bacteria": PROGNOSTIC_PERIODS_INFECTIONS,
-    "infection_virus": PROGNOSTIC_PERIODS_INFECTIONS,
-    "death": PROGNOSTIC_PERIODS_OUTCOMES,
-    "graft_loss": PROGNOSTIC_PERIODS_OUTCOMES,
-}
-EVALUATION_TYPES = {
-    "clinical": CLINICAL_PERIOD_DICT,
-    "prognostic": PROGNOSTIC_PERIOD_DICT,
-}
 N_BOOTSTRAP = 1000
-MAX_FUP_CURVE_DAYS = 360
-
-# COMMAND TO BUILD CACHE (WITH LOAD_EVALUATION = False):
-# for thresh in rec50 rec55 rec60 rec65 rec70 rec75 rec80 rec85 rec90 rec95 t05 t10 t15 t20 t25 t50 bestf1; do python scripts/analysis_comparison.py "$thresh"; done
-DEFAULT_THRESHOLD_SUFFIX = "t12"  # rec30, rec67, rec70, t10
-THRESHOLD_SUFFIX = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_THRESHOLD_SUFFIX
-METRICS_OF_INTEREST = {
-    "roc_auc": "ROC AUC (→)",
-    "pr_auc": "PR AUC (→)",
-    # "brier": "Brier score (←)",
-    "ece": "ECE (←)",
-    f"recall_{THRESHOLD_SUFFIX}": "Sensitivity (→)",
-    f"specificity_{THRESHOLD_SUFFIX}": "Specificity (→)",
-    # f"precision_{THRESHOLD_SUFFIX}": "Precision (→)",
-    # f"bal_acc_{THRESHOLD_SUFFIX}": "Bal. acc. (→)",
-    # f"f1_{THRESHOLD_SUFFIX}": "F1-score (→)",
-    f"nb_{THRESHOLD_SUFFIX}": "Net benefit (→)",
-    f"delta_nb_{THRESHOLD_SUFFIX}": "Added net ben. (→)",
+TARGET_HORIZONS = [30, 60, 90]
+CLINICAL_WINDOWS = {
+    "Perioperative (0-30 d)": (0, 30),
+    "Opportunistic (31-180 d)": (31, 180),
+    "Maintenance (181-360 d)": (181, 360),
+    "Long-term (361-720 d)": (361, 720),
 }
-PAPER_TABLE_METRICS = [
-    "roc_auc",
-    "pr_auc",
-    "ece",
-    f"recall_{THRESHOLD_SUFFIX}",
-    f"specificity_{THRESHOLD_SUFFIX}",
-    # f"precision_{THRESHOLD_SUFFIX}",
-    f"delta_nb_{THRESHOLD_SUFFIX}",
+
+MODEL_DISPLAY_MAP = {
+    "Transformer": "TF",
+    "logistic_regression": "LR",
+    "random_forest": "RF",
+    "xgboost": "XGB",
+}
+COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
+
+METRIC_MAPPING = [
+    ("ROC-AUC", "↑"), ("PR-AUC", "↑"), ("ECE", "↓"), 
+    ("Sensitivity (recall)", "↑"), ("Precision", "↑"), ("Specificity", "↑")
 ]
-COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
-Y_LIM_DICT = {
-    "roc_auc": (0.5, 1.0),
-    "pr_auc": (0.0, 0.5),
-    "brier": (0.0, 0.25),
-    "ece": (0.0, 0.25),
-    "recall": (0.0, 1.0),
-    "specificity": (0.0, 1.0),
-    "precision": (0.0, 1.0),
-    "bal_acc": (0.0, 1.0),
-    "f1": (0.0, 1.0),
-    "nb": (0.0, 0.1),
-    "delta_nb": (0.0, 0.1),
+
+# Create a unique parameter signature token for parameter-dependent caching
+PARAM_SIGNATURE = {
+    "THRESHOLD_MODE": THRESHOLD_MODE,
+    "TARGET_RECALL_ANCHOR": TARGET_RECALL_ANCHOR,
+    "THRESHOLD_TUNING_SET": THRESHOLD_TUNING_SET,
+    "USE_CALIBRATED_PROBS": USE_CALIBRATED_PROBS
 }
+PARAM_HASH = hashlib.md5(json.dumps(PARAM_SIGNATURE, sort_keys=True).encode()).hexdigest()[:10]
 
-def main():
-    # Setup and paths
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    CACHE_DIR = OUTPUT_DIR / "cache"
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    PERIOD_CACHE_SIG = f"thresh_{THRESHOLD_SUFFIX}_boot_{N_BOOTSTRAP}"
-    
-    # Load raw data
-    print(">>> Loading raw prediction data for FUP curves...")
-    raw_data_pool = load_all_raw_predictions()
-    if not raw_data_pool:
-        print("No results found. Check your paths in the configuration!")
-        return
-        
-    # FUP bootstrap calculations
-    fup_boot_df = pd.DataFrame()  # initialize empty fallback
-    if PLOT_FUP_CURVES:
-        fup_cache_path = CACHE_DIR / f"fup_bootstrapped_{PERIOD_CACHE_SIG}.pkl"
-        if LOAD_EVALUATION and fup_cache_path.exists():
-            print(f">>> Loading cached FUP bootstraps ({PERIOD_CACHE_SIG})...")
-            fup_boot_df = pd.read_pickle(fup_cache_path)
-        else:       
-            print(">>> Computing FUP-specific bootstrapped metrics...")
-            fup_boot_df = compute_fup_bootstrap_metrics(
-                raw_pool=raw_data_pool, models_to_compare=[BEST_CLASSIC_ML_MODEL, "Transformer"], n_iterations=N_BOOTSTRAP
-            )
-            fup_boot_df.to_pickle(fup_cache_path)
-    else:
-        print(">>> Skipping FUP curve calculations as per configuration.")
 
-    # Clinical / prognostic period calculations
-    period_dfs = {}
-    for eval_type, period_dict in EVALUATION_TYPES.items():
-        period_cache_path = CACHE_DIR / f"period_df_{eval_type}_{PERIOD_CACHE_SIG}.pkl"
-        if LOAD_EVALUATION and period_cache_path.exists():
-            print(f">>> Loading cached {eval_type} period metrics ({PERIOD_CACHE_SIG})...")
-            period_dfs[eval_type] = pd.read_pickle(period_cache_path)
-        else:
-            print(f">>> Aggregating into {eval_type} period metrics...")
-            period_dfs[eval_type] = compute_period_metrics(raw_data_pool, period_dict, n_iterations=N_BOOTSTRAP)
-            period_dfs[eval_type].to_pickle(period_cache_path)
-        
-    # Plot figures
-    for task in TASKS:
-        print(f"\n>>> Processing task: {task.upper()}")
-        
-        # Plot FUP curves only if flag is enabled and data is present
-        if PLOT_FUP_CURVES and not fup_boot_df.empty:
-            task_fup_boot = fup_boot_df[fup_boot_df["Task"] == task].copy()
-            if not task_fup_boot.empty:
-                plot_fup_curves(task_fup_boot, BEST_CLASSIC_ML_MODEL, "Transformer", OUTPUT_DIR, task)
-
-        # Period Plots and Tables (Will run perfectly fine on their own)
-        for eval_type, p_df in period_dfs.items():
-            for split in SPLIT_TYPES:
-                compute_overall_prevalence(raw_data_pool, EVALUATION_TYPES[eval_type], task, split)
-
-            task_period = p_df[p_df["Task"] == task].copy()
-            if task_period.empty: continue
-            plot_period_performance_bars(task_period, task, OUTPUT_DIR, eval_type)
-            generate_performance_summaries(task_period, OUTPUT_DIR, task, eval_type)
-            generate_paper_style_table(task_period, OUTPUT_DIR, task, eval_type)
-            
-            # Generate continuous plots directly from aggregated raw pool structures
-            if raw_data_pool:
-                print(f">>> Generating continuous ROC, PR, and net benefit curves for {eval_type} periods...")
-                plot_curve_trajectories(raw_data_pool, EVALUATION_TYPES[eval_type], task, OUTPUT_DIR, eval_type, curve_type="ROC")
-                plot_curve_trajectories(raw_data_pool, EVALUATION_TYPES[eval_type], task, OUTPUT_DIR, eval_type, curve_type="PR")
-                plot_decision_curves(raw_data_pool, EVALUATION_TYPES[eval_type], task, OUTPUT_DIR, eval_type)
-
-        # Clear memory after each processed task
-        gc.collect()
-    
-    # Statistical tests
-    significance_df = test_model_superiority(period_dfs["clinical"], BEST_CLASSIC_ML_MODEL, "Transformer")
-    significance_df.to_csv(OUTPUT_DIR / "statistical_significance.csv", index=False)
-    print("\nDone.")
-    
-
-# -------------------------------------------------
-# --- Parallel chunk core task execution engine ---
-# -------------------------------------------------
-
-def get_vectorized_metrics_from_bootstraps(
-    y_true_boot: np.ndarray,  
-    y_prob_boot: np.ndarray,  
-    y_cal_boot: np.ndarray,   
-) -> dict:
-    n_iters, min_len = y_true_boot.shape
-    results = {}
-
-    valid_rows_mask = np.any(y_true_boot == 0, axis=1) & np.any(y_true_boot == 1, axis=1)
-    valid_indices = np.where(valid_rows_mask)[0]
-
-    roc_aucs = np.full(n_iters, np.nan)
-    pr_aucs = np.full(n_iters, np.nan)
-    briers = np.full(n_iters, np.nan)
-    eces = np.full(n_iters, np.nan)
-    
-    n_bins = 10
+# ==========================================
+# MATHEMATICAL & PREDICTION LOADING UTILS
+# ==========================================
+def compute_expected_calibration_error(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10) -> float:
     bin_boundaries = np.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    n_samples = len(y_true)
+    if n_samples == 0:
+        return 0.0
     
-    # Sklearn calls must remain in loop, but we minimize everything else
-    for idx in valid_indices:
-        yt = y_true_boot[idx]
-        yp = y_prob_boot[idx]
-        yc = y_cal_boot[idx]
-            
-        roc_aucs[idx] = roc_auc_score(yt, yp)
-        pr_aucs[idx] = average_precision_score(yt, yp)
-        briers[idx] = brier_score_loss(yt, yc)
+    for i in range(n_bins):
+        bin_lower = bin_boundaries[i]
+        bin_upper = bin_boundaries[i + 1]
+        in_bin = (y_prob >= bin_lower) & (y_prob < bin_upper) if i < n_bins - 1 else (y_prob >= bin_lower) & (y_prob <= bin_upper)
+        prop_in_bin = np.mean(in_bin)
         
-        bin_indices = np.digitize(yc, bin_boundaries[1:-1])
-        ece_val = 0.0
-        for b in range(n_bins):
-            in_bin = (bin_indices == b)
-            n_in_bin = np.sum(in_bin)
-            if n_in_bin > 0:
-                ece_val += np.abs(np.mean(yt[in_bin]) - np.mean(yc[in_bin])) * n_in_bin
-        eces[idx] = ece_val / min_len
-
-    results["roc_auc"] = roc_aucs
-    results["pr_auc"] = pr_aucs
-    results["brier"] = briers
-    results["ece"] = eces
-
-    any_suffix_requested = any(k.endswith(f"_{THRESHOLD_SUFFIX}") for k in METRICS_OF_INTEREST.keys())
-    if any_suffix_requested:
-        recalls = np.full(n_iters, np.nan)
-        specificities = np.full(n_iters, np.nan)
-        precisions = np.full(n_iters, np.nan)
-        bal_accs = np.full(n_iters, np.nan)
-        f1_scores = np.full(n_iters, np.nan)
-        net_benefits = np.full(n_iters, np.nan)
-        delta_net_benefits = np.full(n_iters, np.nan)
-
-        if THRESHOLD_SUFFIX.startswith("rec"):
-            target_rec = int(THRESHOLD_SUFFIX.replace("rec", "")) / 100.0
-            rec_thresholds = np.zeros(n_iters)
+        if prop_in_bin > 0:
+            accuracy_in_bin = np.mean(y_true[in_bin])
+            avg_confidence_in_bin = np.mean(y_prob[in_bin])
+            ece += prop_in_bin * np.abs(avg_confidence_in_bin - accuracy_in_bin)
             
-            for idx in valid_indices:
-                p, r, t = precision_recall_curve(y_true_boot[idx], y_cal_boot[idx])
-                valid_idx = np.where(r[:-1] >= target_rec)[0]
-                rec_thresholds[idx] = t[valid_idx[-1]] if len(valid_idx) > 0 else 0.0
-                
-            thresh_matrix = rec_thresholds[:, np.newaxis]
-            preds = (y_cal_boot >= thresh_matrix).astype(int)
-        else:
-            t_val = int(THRESHOLD_SUFFIX.replace("t", "")) / 100.0
-            preds = (y_cal_boot >= t_val).astype(int)
-            rec_thresholds = np.full(n_iters, t_val)
-
-        # CRITICAL: Fully vectorized evaluations down below across all 1000 matrices instantly
-        tp = np.sum((preds == 1) & (y_true_boot == 1), axis=1)
-        fp = np.sum((preds == 1) & (y_true_boot == 0), axis=1)
-        tn = np.sum((preds == 0) & (y_true_boot == 0), axis=1)
-        fn = np.sum((preds == 0) & (y_true_boot == 1), axis=1)
-        
-        positives = tp + fn
-        negatives = fp + tn
-        
-        with np.errstate(divide='ignore', invalid='ignore'):
-            computed_recalls = np.where(positives > 0, tp / positives, 0.0)
-            computed_specificities = np.where(negatives > 0, tn / negatives, 0.0)
-            computed_precisions = np.where((tp + fp) > 0, tp / (tp + fp), 0.0)
-            computed_bal_accs = (computed_recalls + computed_specificities) / 2.0
-            
-            f1_denom = computed_precisions + computed_recalls
-            computed_f1_scores = np.where(f1_denom > 0, (2 * computed_precisions * computed_recalls) / f1_denom, 0.0)
-            
-            weight = rec_thresholds / (1.0 - rec_thresholds)
-            weight = np.where(rec_thresholds < 1.0, weight, 0.0)
-            computed_net_benefits = (tp / min_len) - (fp / min_len) * weight
-            
-            prevalence = positives / min_len
-            nb_all = prevalence - (1.0 - prevalence) * weight
-            computed_delta_net_benefits = computed_net_benefits - np.maximum(nb_all, 0.0)
-
-        recalls[valid_rows_mask] = computed_recalls[valid_rows_mask]
-        specificities[valid_rows_mask] = computed_specificities[valid_rows_mask]
-        precisions[valid_rows_mask] = computed_precisions[valid_rows_mask]
-        bal_accs[valid_rows_mask] = computed_bal_accs[valid_rows_mask]
-        f1_scores[valid_rows_mask] = computed_f1_scores[valid_rows_mask]
-        net_benefits[valid_rows_mask] = computed_net_benefits[valid_rows_mask]
-        delta_net_benefits[valid_rows_mask] = computed_delta_net_benefits[valid_rows_mask]
-
-        results[f"recall_{THRESHOLD_SUFFIX}"] = recalls
-        results[f"specificity_{THRESHOLD_SUFFIX}"] = specificities
-        results[f"precision_{THRESHOLD_SUFFIX}"] = precisions
-        results[f"bal_acc_{THRESHOLD_SUFFIX}"] = bal_accs
-        results[f"f1_{THRESHOLD_SUFFIX}"] = f1_scores
-        results[f"nb_{THRESHOLD_SUFFIX}"] = net_benefits
-        results[f"delta_nb_{THRESHOLD_SUFFIX}"] = delta_net_benefits
-
-    return results
+    return ece
 
 
-def _process_single_fup(split, task, h, fup, raw_pool, models_to_compare, n_iterations):
-    models = raw_pool[split]
-    model_arrays = {}
+def load_transformer_flat_dataframe(task: str, split: str, dataset_split: str, target_horizon) -> pd.DataFrame:
+    if target_horizon == "combined":
+        dfs = [load_transformer_flat_dataframe(task, split, dataset_split, h) for h in TARGET_HORIZONS]
+        valid_dfs = [d for d in dfs if not d.empty]
+        return pd.concat(valid_dfs, ignore_index=True) if valid_dfs else pd.DataFrame()
+
+    # Tier 1 Caching Check (Base Dataframe Storage)
+    cache_file = CACHE_DIR / f"raw_tf_{task}_{split}_{dataset_split}_{target_horizon}.parquet"
+    if cache_file.exists():
+        return pd.read_parquet(cache_file)
+
+    file_name = "validation_probs.npz" if dataset_split == "validation" else "test_probs.npz"
+    task_base_dir = RESULTS_DIR / "transformer" / split / "e00-a15-v60" / "finetuning" / task
     
-    for m in models_to_compare:
-        if m in models and task in models[m] and h in models[m][task] and fup in models[m][task][h]:
-            d = models[m][task][h][fup]
-            y_t = d["labels"]
-            mask = y_t != -100
-            if mask.any():
-                model_arrays[m] = {
-                    "true": y_t[mask],
-                    "prob": d["probs"][mask],
-                    "cal": d["probs_cal"][mask] if "probs_cal" in d else d["probs"][mask]
-                }
-    
-    if len(model_arrays) != len(models_to_compare):
-        return []
-
-    min_len = min(len(arr["true"]) for arr in model_arrays.values())
-    for m in model_arrays:
-        model_arrays[m]["true"] = model_arrays[m]["true"][:min_len]
-        model_arrays[m]["prob"] = model_arrays[m]["prob"][:min_len]
-        model_arrays[m]["cal"] = model_arrays[m]["cal"][:min_len]
-
-    ref_model = models_to_compare[0]
-    y_true_ref = model_arrays[ref_model]["true"]
-    classes, counts = np.unique(y_true_ref, return_counts=True)
-    
-    rng = np.random.default_rng()
-    boot_indices = np.empty((n_iterations, min_len), dtype=int)
-    ptr = 0
-    for cls, count in zip(classes, counts):
-        cls_locs = np.where(y_true_ref == cls)[0]
-        sampled_raw = rng.choice(cls_locs, size=(n_iterations, count), replace=True)
-        boot_indices[:, ptr : ptr + count] = sampled_raw
-        ptr += count
-
-    local_records = []
-    for model, arrays in model_arrays.items():
-        y_true_boot = arrays["true"][boot_indices]
-        y_prob_boot = arrays["prob"][boot_indices]
-        y_cal_boot = arrays["cal"][boot_indices]
-        
-        metrics_dict = get_vectorized_metrics_from_bootstraps(y_true_boot, y_prob_boot, y_cal_boot)
-        
-        # MASSIVE SPEEDUP: Eliminate inner iterative loop. Build full matrix block layouts.
-        for m_name, iterations_array in metrics_dict.items():
-            if m_name in METRICS_OF_INTEREST:
-                valid_mask = ~np.isnan(iterations_array)
-                indices = np.where(valid_mask)[0]
-                vals = iterations_array[valid_mask]
-                
-                if len(vals) == 0: continue
-                
-                # Create dict maps via vectorized assignment chunks
-                chunk_df = pd.DataFrame({
-                    "Split": split, "Model": model, "Task": task,
-                    "Horizon": h, "FUP": fup, "Metric": m_name,
-                    "Value": vals, "Bootstrap_iter": indices
-                })
-                local_records.append(chunk_df)
-                
-    return local_records
-
-
-def compute_fup_bootstrap_metrics(raw_pool: Dict, models_to_compare: list, n_iterations: int = 1000) -> pd.DataFrame:
-    ref_model = models_to_compare[0]
-    print(">>>> Collecting valid FUP coordinates...")
-    fup_coordinates = []
-    for split, models in raw_pool.items():
-        if ref_model not in models: continue
-        for task in TASKS:
-            if task not in models[ref_model]: continue
-            for h, fups in models[ref_model][task].items():
-                for fup in fups.keys():
-                    fup_coordinates.append((split, task, h, fup))
-
-    print(f">>>> Found {len(fup_coordinates)} FUP groups within {MAX_FUP_CURVE_DAYS} days. Parallelizing Workflow...")
-    
-    # Process across multiple cores concurrently
-    results = Parallel(n_jobs=-1)(
-        delayed(_process_single_fup)(split, task, h, fup, raw_pool, models_to_compare, n_iterations)
-        for split, task, h, fup in tqdm(fup_coordinates, desc="Bootstrapping FUPs")
-    )
-    
-    # Flatten outputs safely
-    flattened_dfs = [df for sublist in results for df in sublist if isinstance(df, pd.DataFrame)]
-    if not flattened_dfs:
+    if not task_base_dir.exists():
         return pd.DataFrame()
-    return pd.concat(flattened_dfs, ignore_index=True)
-
-
-def compute_period_metrics(raw_pool: Dict, period_dict: Dict, do_bootstrapping: bool = True, n_iterations: int = 1000) -> pd.DataFrame:
-    all_period_dfs = []
-    
-    for split, models in raw_pool.items():
-        available_models = list(models.keys())
-        if not available_models: continue
-            
-        for task, clinical_periods in period_dict.items():
-            for period_name, h_fup_map in clinical_periods.items():
-                model_arrays = {}
-                for model in available_models:
-                    if task not in models[model]: continue
-                    horizons_data = models[model][task]
-                    y_t_list, y_p_list, y_c_list = [], [], []
-                    
-                    for h, fups in h_fup_map.items():
-                        if h not in horizons_data: continue
-                        for fup in fups:
-                            if fup in horizons_data[h]:
-                                d = horizons_data[h][fup]
-                                valid_mask = d["labels"] != -100
-                                if valid_mask.any():
-                                    y_t_list.append(d["labels"][valid_mask])
-                                    y_p_list.append(d["probs"][valid_mask])
-                                    y_c_list.append((d["probs_cal"] if "probs_cal" in d else d["probs"])[valid_mask])
-                                
-                    if y_t_list:
-                        model_arrays[model] = {
-                            "true": np.concatenate(y_t_list),
-                            "prob": np.concatenate(y_p_list),
-                            "cal": np.concatenate(y_c_list)
-                        }
-
-                if not model_arrays: continue
-                
-                min_len = min(len(arr["true"]) for arr in model_arrays.values())
-                for m in model_arrays:
-                    model_arrays[m]["true"] = model_arrays[m]["true"][:min_len]
-                    model_arrays[m]["prob"] = model_arrays[m]["prob"][:min_len]
-                    model_arrays[m]["cal"] = model_arrays[m]["cal"][:min_len]
-                
-                ref_model = list(model_arrays.keys())[0]
-                y_true_ref = model_arrays[ref_model]["true"]
-                classes, counts = np.unique(y_true_ref, return_counts=True)
-                
-                rng = np.random.default_rng()
-                iters = n_iterations if do_bootstrapping else 1
-                
-                print(f">>>> Bootstrapping period: {split} - {task} - {period_name.splitlines()[0]}")
-                
-                boot_indices = np.empty((iters, min_len), dtype=int)
-                if do_bootstrapping:
-                    ptr = 0
-                    for cls, count in zip(classes, counts):
-                        cls_locs = np.where(y_true_ref == cls)[0]
-                        boot_indices[:, ptr : ptr + count] = rng.choice(cls_locs, size=(iters, count), replace=True)
-                        ptr += count
-                else:
-                    boot_indices[0, :] = np.arange(min_len)
-
-                for model, arrays in model_arrays.items():
-                    y_true_boot = arrays["true"][boot_indices]
-                    y_prob_boot = arrays["prob"][boot_indices]
-                    y_cal_boot = arrays["cal"][boot_indices]
-                    
-                    metrics_dict = get_vectorized_metrics_from_bootstraps(y_true_boot, y_prob_boot, y_cal_boot)
-                    
-                    for m_name, iterations_array in metrics_dict.items():
-                        if m_name in METRICS_OF_INTEREST:
-                            valid_mask = ~np.isnan(iterations_array)
-                            indices = np.where(valid_mask)[0]
-                            vals = iterations_array[valid_mask]
-                            
-                            if len(vals) == 0: continue
-                            
-                            chunk_df = pd.DataFrame({
-                                "Split": split, "Model": model, "Period": period_name,
-                                "Task": task, "Metric": m_name, "Value": vals
-                            })
-                            if do_bootstrapping:
-                                chunk_df["Bootstrap_iter"] = indices
-                            all_period_dfs.append(chunk_df)
-                                
-    if not all_period_dfs:
-        return pd.DataFrame()
-    return pd.concat(all_period_dfs, ignore_index=True)
-
-
-# -------------------------------------------------------------------------
-# --- Downstream Plotting and IO Scripts ----------------------------------
-# -------------------------------------------------------------------------
-
-def load_all_raw_predictions() -> Dict:
-    raw_pool = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(dict))))
-    for split in SPLIT_TYPES:
-        for task in TASKS:
-            if FROM_OPTUNA:
-                try:
-                    trial_name, pt_config = get_best_optuna_run(TRANSFORMER_BASE_DIR, split, task)
-                    base_dir = TRANSFORMER_BASE_DIR / split / task / trial_name / split / pt_config
-                except Exception as e:
-                    print(f"[!] Skipping {split} / {task} due to error: {e}")
-                    continue
-            else:
-                try:
-                    [base_dir] = (d for d in (TRANSFORMER_BASE_DIR / split).iterdir() if d.is_dir())
-                except ValueError:
-                    continue
-                
-            t_path = base_dir / "finetuning" / task
-            if t_path.exists():
-                _extract_npz_to_pool(t_path, "Transformer", split, task, raw_pool)
-                
-            for ml_model in CLASSIC_ML_MODELS_TO_PLOT:
-                c_path = CLASSIC_ML_BASE_DIR / split / ml_model / task
-                if c_path.exists():
-                    _extract_npz_to_pool(c_path, ml_model, split, task, raw_pool)
-                    
-    return raw_pool
-
-
-def _extract_npz_to_pool(task_dir: Path, model_name: str, split: str, task: str, pool: Dict):
-    for npz_file in task_dir.rglob("*.npz"):
-        match = re.search(r"hrz\(([\d-]+)\)", npz_file.parent.name)
-        if not match: continue
-        horizons = [int(h) for h in match.group(1).split("-")]
         
-        try: data = np.load(npz_file)
-        except Exception: continue
-            
-        fup_keys = {int(re.match(r"^test_fup_(\d+)_", k).group(1)) for k in data.keys() if re.match(r"^test_fup_(\d+)_", k)}
-        for fup in fup_keys:
-            l_key, p_key, pc_key = f"test_fup_{fup:04d}_labels", f"test_fup_{fup:04d}_probs", f"test_fup_{fup:04d}_probs_cal"
-            if l_key not in data or p_key not in data: continue
-            
-            labels, probs = data[l_key], data[p_key]
-            probs_cal = data[pc_key] if pc_key in data else probs
-            
-            for col_idx, h in enumerate(horizons):
-                l_col = labels if labels.ndim == 1 else labels[:, col_idx]
-                p_col = probs if probs.ndim == 1 else probs[:, col_idx]
-                pc_col = probs_cal if probs_cal.ndim == 1 else probs_cal[:, col_idx]
-                    
-                pool[split][model_name][task][h][fup] = {"labels": l_col, "probs": p_col, "probs_cal": pc_col}
-
-
-def plot_fup_curves(df: pd.DataFrame, baseline_name: str, transformer_name: str, output_dir: Path, task_name: str):
-    df_comp = df[df["Model"].isin([baseline_name, transformer_name])].copy()
-    if df_comp.empty: return
+    candidates = [p for p in task_base_dir.iterdir() if p.is_dir() and p.name.startswith("hrz(")]
+    matched_dir = None
+    target_idx = None
     
-    summary = df_comp.groupby(["Split", "Horizon", "FUP", "Metric", "Model"])["Value"].agg(
-        mean="mean", ci_lower=lambda x: np.percentile(x, 2.5), ci_upper=lambda x: np.percentile(x, 97.5)
-    ).reset_index()
-    
-    metrics = list(METRICS_OF_INTEREST.keys())
-    horizons = sorted(summary["Horizon"].unique())
-    colors = {baseline_name: "#ff7f0e", transformer_name: "#1f77b4"}
-    
-    for metric in metrics:
-        metric_data = summary[summary["Metric"] == metric]
-        if metric_data.empty: continue
-        
-        fig, axes = plt.subplots(
-            len(horizons), len(SPLIT_TYPES), 
-            figsize=(5 * len(SPLIT_TYPES), 3.5 * len(horizons)),
-            sharex=True, sharey=True, squeeze=False
-        )
-        
-        title_suffix = task_name.replace('_', ' ').capitalize()
-        tf_title = MODEL_NAME_MAP.get(transformer_name, transformer_name)
-        ml_title = MODEL_NAME_MAP.get(baseline_name, baseline_name)
-        fig.suptitle(f"{METRICS_OF_INTEREST[metric]} across follow-up time {tf_title} vs {ml_title} ({title_suffix})", fontsize=16, fontweight='bold', y=1.02)
-        
-        y_limits = None
-        for base_metric, limits in Y_LIM_DICT.items():
-            if metric.startswith(base_metric):
-                y_limits = limits
+    for c in candidates:
+        match = re.search(r"hrz\(([\d-]+)\)", c.name)
+        if match:
+            horizons = [int(h) for h in match.group(1).split("-")]
+            if target_horizon in horizons:
+                matched_dir = c
+                target_idx = horizons.index(target_horizon)
                 break
                 
-        for row_idx, h in enumerate(horizons):
-            for col_idx, split in enumerate(SPLIT_TYPES):
-                ax = axes[row_idx, col_idx]
-                subset = metric_data[(metric_data["Horizon"] == h) & (metric_data["Split"] == split)]
-                if subset.empty:
-                    ax.set_visible(False)
-                    continue
-                    
-                for model in [baseline_name, transformer_name]:
-                    model_data = subset[subset["Model"] == model].sort_values("FUP")
-                    if model_data.empty: continue
-                    
-                    c = colors[model]
-                    ax.plot(model_data["FUP"], model_data["mean"], label=MODEL_NAME_MAP.get(model, model), color=c, linewidth=2)
-                    ax.fill_between(model_data["FUP"], model_data["ci_lower"], model_data["ci_upper"], color=c, alpha=0.2)
-                
-                if MAX_FUP_CURVE_DAYS is not None: ax.set_xlim(0, MAX_FUP_CURVE_DAYS)
-                if y_limits: ax.set_ylim(y_limits)
-                if row_idx == 0: ax.set_title(split.capitalize().replace('_', ' '), fontsize=13, fontweight='bold')
-                if col_idx == 0: ax.set_ylabel(f"Horizon {h}d", fontsize=11, fontweight='bold')
-                if row_idx == len(horizons) - 1:
-                    ax.set_xlabel("Follow-Up Time (days)", fontsize=11)
-                    ax.tick_params(labelbottom=True)
-                    
-        handles, labels = axes[0,0].get_legend_handles_labels()
-        if handles: fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, -0.05), ncol=2, fontsize=12, frameon=False)
-            
-        plt.tight_layout()
-        out_file = output_dir / f"fup_curves_{task_name}_{metric}.png"
-        plt.savefig(out_file, bbox_inches='tight', dpi=150)
-        plt.close()
-
-
-def test_model_superiority(df: pd.DataFrame, baseline_name: str, target_name: str = "Transformer"):
-    print(f"\n>>> Statistical testing: {target_name} vs {baseline_name}")
-    df_comp = df[df["Model"].isin([baseline_name, target_name])].copy()
-    if df_comp.empty: return pd.DataFrame()
-    
-    pivot = df_comp.pivot_table(index=["Split", "Task", "Period", "Metric", "Bootstrap_iter"], columns="Model", values="Value").dropna().reset_index()
-    if target_name not in pivot.columns or baseline_name not in pivot.columns: return pd.DataFrame()
-
-    pivot["Delta"] = pivot[target_name] - pivot[baseline_name]
-    stats = pivot.groupby(["Split", "Task", "Period", "Metric"]).agg(
-        delta_mean=("Delta", "mean"),
-        ci_lower=("Delta", lambda x: np.percentile(x, 2.5)),
-        ci_upper=("Delta", lambda x: np.percentile(x, 97.5)),
-        p_value_raw=("Delta", lambda x: np.mean(x <= 0) if x.mean() > 0 else np.mean(x >= 0))
-    ).reset_index()
-    
-    stats["p_value_raw"] = stats["p_value_raw"].replace(0, 1 / df["Bootstrap_iter"].nunique())
-    reject, pvals_corrected, _, _ = multipletests(stats["p_value_raw"], alpha=0.05, method='fdr_bh')
-    
-    stats["p_value_fdr"] = pvals_corrected
-    stats["significant"] = reject
-    return stats
-
-
-def plot_period_performance_bars(df: pd.DataFrame, task_name: str, output_dir: Path, eval_type: str):
-    metrics = list(METRICS_OF_INTEREST.keys())
-    model_order = CLASSIC_ML_MODELS_TO_PLOT + ["Transformer"]
-    col_keys = [m for m in model_order if m in df["Model"].unique()]
-    if not metrics or not col_keys: return
-
-    sns.set_theme(style="whitegrid")
-    fig, axes = plt.subplots(len(metrics), len(SPLIT_TYPES), figsize=(6 * len(SPLIT_TYPES), 4.0 * len(metrics)), sharex=True, sharey="row", squeeze=False)
-
-    for r, metric in enumerate(metrics):
-        y_limits = None
-        for base_metric, limits in Y_LIM_DICT.items():
-            if metric.startswith(base_metric):
-                y_limits = limits
-                break
-            
-        for c, split in enumerate(SPLIT_TYPES):
-            ax = axes[r, c]
-            subset = df[(df["Metric"] == metric) & (df["Split"] == split)]
-            if subset.empty:
-                ax.set_visible(False)
-                continue
-
-            sns.barplot(data=subset, x="Period", y="Value", hue="Model", hue_order=col_keys, palette=COLORS[:len(col_keys)], ax=ax, edgecolor='black', linewidth=0.6, alpha=0.9)
-            if y_limits is not None: ax.set_ylim(y_limits)
-            if r == 0: ax.set_title(split.replace('_', ' ').title(), fontsize=14, fontweight='bold')
-            if c == 0: ax.set_ylabel(f"{METRICS_OF_INTEREST[metric]}", fontsize=11, fontweight='bold')
-            else: ax.set_ylabel("")
-            
-            ax.set_xlabel("Clinical Period" if r == len(metrics)-1 else "")
-            ax.tick_params(labelbottom=(r == len(metrics)-1))
-            if ax.get_legend(): ax.get_legend().remove()
-
-    handles, labels = axes[0,0].get_legend_handles_labels()
-    pretty_labels = [MODEL_NAME_MAP.get(lbl, lbl) for lbl in labels]
-    fig.legend(
-        handles, pretty_labels, loc="lower center", bbox_to_anchor=(0.5, 1.0),
-        ncol=len(labels), fontsize=13, title_fontsize=14, frameon=False,
-        title=f"Model architecture ({task_name.replace('_', ' ')})",
-    )
-    plt.tight_layout(rect=[0, 0, 1, 1.0])
-    plt.savefig(output_dir / f"{eval_type}_bars_{task_name}.png", bbox_inches='tight', dpi=150)
-    plt.close()
-
-
-def plot_curve_trajectories(raw_pool: Dict, period_dict: Dict, task_name: str, output_dir: Path, eval_type: str, curve_type: str = "ROC"):
-    """
-    Plots complete continuous ROC or PR curve trajectories across splits (columns) 
-    and Clinical Periods (rows) comparing all evaluated models directly (threshold markers removed).
-    """
-    clinical_periods = period_dict.get(task_name, {})
-    if not clinical_periods: return
-    
-    model_order = CLASSIC_ML_MODELS_TO_PLOT + ["Transformer"]
-    
-    sns.set_theme(style="white")
-    fig, axes = plt.subplots(
-        len(clinical_periods), len(SPLIT_TYPES), 
-        figsize=(5.5 * len(SPLIT_TYPES), 4.5 * len(clinical_periods)), 
-        squeeze=False
-    )
-    
-    legend_tracker = {}
-
-    for r, (period_name, h_fup_map) in enumerate(clinical_periods.items()):
-        for c, split in enumerate(SPLIT_TYPES):
-            ax = axes[r, c]
-            models_data = raw_pool.get(split, {})
-            
-            if curve_type == "ROC":
-                ax.plot([0, 1], [0, 1], linestyle="--", color="gray", alpha=0.6, label="Baseline (0.50)")
-            
-            for m_idx, model in enumerate(model_order):
-                if model not in models_data or task_name not in models_data[model]: continue
-                
-                horizons_data = models_data[model][task_name]
-                y_t_list, y_p_list = [], []
-                
-                for h, fups in h_fup_map.items():
-                    if h not in horizons_data: continue
-                    for fup in fups:
-                        if fup in horizons_data[h]:
-                            d = horizons_data[h][fup]
-                            valid_mask = d["labels"] != -100
-                            if valid_mask.any():
-                                y_t_list.append(d["labels"][valid_mask])
-                                y_p_list.append(d["probs"][valid_mask])
-                                
-                if not y_t_list: continue
-                
-                y_true = np.concatenate(y_t_list)
-                y_prob = np.concatenate(y_p_list)
-                
-                if len(np.unique(y_true)) < 2: continue
-                
-                # Generate Base Curves (Threshold markers have been completely removed)
-                if curve_type == "ROC":
-                    fpr, tpr, _ = roc_curve(y_true, y_prob)
-                    auc_val = roc_auc_score(y_true, y_prob)
-                    lbl = f"{MODEL_NAME_MAP.get(model, model)} (AUC={auc_val:.3f})"
-                    line, = ax.plot(fpr, tpr, color=COLORS[m_idx], linewidth=2, label=lbl)
-                    legend_tracker[MODEL_NAME_MAP.get(model, model)] = line
-                else:
-                    precision, recall, _ = precision_recall_curve(y_true, y_prob)
-                    auc_val = average_precision_score(y_true, y_prob)
-                    lbl = f"{MODEL_NAME_MAP.get(model, model)} (PR-AUC={auc_val:.3f})"
-                    line, = ax.plot(recall, precision, color=COLORS[m_idx], linewidth=2, label=lbl)
-                    legend_tracker[MODEL_NAME_MAP.get(model, model)] = line
-            
-            ax.set_xlim([0.0, 1.0])
-            ax.set_ylim([0.0, 1.05])
-            ax.grid(True, linestyle=":", alpha=0.6)
-            
-            if r == 0: 
-                ax.set_title(split.replace('_', ' ').title(), fontsize=13, fontweight='bold')
-            if c == 0: 
-                ax.set_ylabel(f"{period_name}\n\n" + ("Sensitivity" if curve_type == "ROC" else "Precision"), fontsize=11)
-            if r == len(clinical_periods) - 1: 
-                ax.set_xlabel("1.0 - Specificity" if curve_type == "ROC" else "Recall", fontsize=11)
-            
-            ax.legend(loc="lower right" if curve_type=="ROC" else "upper right", fontsize=9, frameon=True, framealpha=0.8)
-
-    title_task = task_name.replace('_', ' ').title()
-    fig.suptitle(f"Continuous Performance Spaces ({curve_type} Curves): {title_task}", fontsize=16, fontweight='bold', y=1.01)
-    plt.tight_layout()
-    
-    out_name = output_dir / f"{eval_type}_{curve_type.lower()}_curves_{task_name}.png"
-    plt.savefig(out_name, bbox_inches='tight', dpi=150)
-    plt.close()
-
-
-def plot_decision_curves(raw_pool: Dict, period_dict: Dict, task_name: str, output_dir: Path, eval_type: str):
-    """
-    Plots Clinical Decision Curves (Net Benefit) across splits (columns) and Clinical Periods (rows)
-    comparing all models against references. X-limits are bounded to 0.5 and vertical threshold indicators are removed.
-    """
-    clinical_periods = period_dict.get(task_name, {})
-    if not clinical_periods: return
-    
-    model_order = CLASSIC_ML_MODELS_TO_PLOT + ["Transformer"]
-    thresholds = np.linspace(0.01, 0.99, 100)
-    
-    sns.set_theme(style="white")
-    fig, axes = plt.subplots(
-        len(clinical_periods), len(SPLIT_TYPES), 
-        figsize=(5.5 * len(SPLIT_TYPES), 4.5 * len(clinical_periods)), 
-        squeeze=False
-    )
-    
-    for r, (period_name, h_fup_map) in enumerate(clinical_periods.items()):
-        for c, split in enumerate(SPLIT_TYPES):
-            ax = axes[r, c]
-            models_data = raw_pool.get(split, {})
-            
-            y_true_ref = None
-            for model in model_order:
-                if model in models_data and task_name in models_data[model]:
-                    horizons_data = models_data[model][task_name]
-                    y_t_list = []
-                    for h, fups in h_fup_map.items():
-                        if h not in horizons_data: continue
-                        for fup in fups:
-                            if fup in horizons_data[h]:
-                                mask = horizons_data[h][fup]["labels"] != -100
-                                if mask.any():
-                                    y_t_list.append(horizons_data[h][fup]["labels"][mask])
-                    if y_t_list:
-                        y_true_ref = np.concatenate(y_t_list)
-                        break
-            
-            if y_true_ref is None or len(y_true_ref) == 0:
-                ax.set_visible(False)
-                continue
-                
-            n_samples = len(y_true_ref)
-            n_positives = np.sum(y_true_ref == 1)
-            prevalence = n_positives / n_samples
-            
-            ax.plot(thresholds, np.zeros_like(thresholds), color="black", linestyle="-", linewidth=1.2, label="Treat None (Only No)")
-            
-            with np.errstate(divide='ignore', invalid='ignore'):
-                nb_all = prevalence - (1.0 - prevalence) * (thresholds / (1.0 - thresholds))
-            ax.plot(thresholds, nb_all, color="darkgray", linestyle="--", linewidth=1.5, label="Treat All (Only Yes)")
-            
-            max_nb_plotted = 0.02
-            
-            for m_idx, model in enumerate(model_order):
-                if model not in models_data or task_name not in models_data[model]: continue
-                
-                horizons_data = models_data[model][task_name]
-                y_t_list, y_p_list = [], []
-                
-                for h, fups in h_fup_map.items():
-                    if h not in horizons_data: continue
-                    for fup in fups:
-                        if fup in horizons_data[h]:
-                            d = horizons_data[h][fup]
-                            valid_mask = d["labels"] != -100
-                            if valid_mask.any():
-                                y_t_list.append(d["labels"][valid_mask])
-                                y_p_list.append((d["probs_cal"] if "probs_cal" in d else d["probs"])[valid_mask])
-                                
-                if not y_t_list: continue
-                
-                y_true = np.concatenate(y_t_list)
-                y_prob = np.concatenate(y_p_list)
-                
-                nb_model = []
-                for t in thresholds:
-                    tp = np.sum((y_prob >= t) & (y_true == 1))
-                    fp = np.sum((y_prob >= t) & (y_true == 0))
-                    val = (tp / n_samples) - (fp / n_samples) * (t / (1.0 - t))
-                    nb_model.append(val)
-                
-                max_nb_plotted = max(max_nb_plotted, max(nb_model), prevalence)
-                ax.plot(thresholds, nb_model, color=COLORS[m_idx], linewidth=2.2, label=MODEL_NAME_MAP.get(model, model))
-                
-            # Constrained x-limit to 0.5 globally for all DCA structures
-            ax.set_xlim([0.0, 0.5])
-            ax.set_ylim([-0.02, max_nb_plotted * 1.0])
-            ax.grid(True, linestyle=":", alpha=0.5)
-            
-            if r == 0: 
-                ax.set_title(split.replace('_', ' ').title(), fontsize=13, fontweight='bold')
-            if c == 0: 
-                ax.set_ylabel(f"{period_name}\n\nNet Benefit", fontsize=11)
-            if r == len(clinical_periods) - 1: 
-                ax.set_xlabel("Threshold Probability", fontsize=11)
-            
-            ax.legend(loc="upper right", fontsize=8, frameon=True, framealpha=0.8)
-
-    title_task = task_name.replace('_', ' ').title()
-    fig.suptitle(f"Decision Curve Analysis (Clinical Utility): {title_task}", fontsize=16, fontweight='bold', y=1.01)
-    plt.tight_layout()
-    
-    out_name = output_dir / f"{eval_type}_decision_curves_{task_name}.png"
-    plt.savefig(out_name, bbox_inches='tight', dpi=150)
-    plt.close()
-    
-    
-def generate_paper_style_table(df: pd.DataFrame, output_dir: Path, task_name: str, eval_type: str):
-    valid_periods = list(EVALUATION_TYPES[eval_type][task_name].keys())
-    df_filtered = df[(df["Metric"].isin(PAPER_TABLE_METRICS)) & (df["Period"].isin(valid_periods))].copy()
-    if df_filtered.empty: return
-
-    df_mean = df_filtered.groupby(["Split", "Model", "Metric", "Period"])["Value"].mean().reset_index() if "Bootstrap_iter" in df_filtered.columns else df_filtered.copy()
-    clean_metric_map = {k: v.replace(" (→)", "").replace(" (←)", "") for k, v in METRICS_OF_INTEREST.items()}
-    df_mean["Metric_Name"] = df_mean["Metric"].map(clean_metric_map)
-
-    pivot_table = df_mean.pivot(index=["Split", "Model"], columns=["Period", "Metric_Name"], values="Value")
-    clean_to_orig = {clean_metric_map[k]: k for k in PAPER_TABLE_METRICS}
-
-    def format_and_bold_group(s, is_lower):
-        valid_vals = s.dropna().unique()
-        if len(valid_vals) > 0:
-            sorted_vals = np.sort(valid_vals)
-            if not is_lower: sorted_vals = sorted_vals[::-1] 
-            best_val, second_best_val = sorted_vals[0], sorted_vals[1] if len(sorted_vals) > 1 else None
-        else: best_val, second_best_val = None, None
-
-        return s.apply(lambda x: "-" if pd.isnull(x) else f"<b>{x:.3f}</b>" if np.isclose(x, best_val, atol=1e-5) else f"<u>{x:.3f}</u>" if second_best_val is not None and np.isclose(x, second_best_val, atol=1e-5) else f"{x:.3f}")
-
-    for col in pivot_table.columns:
-        period, clean_metric = col
-        orig_metric = clean_to_orig.get(clean_metric)
-        is_lower_better = "←" in METRICS_OF_INTEREST.get(orig_metric, "") if orig_metric else False
-        pivot_table[col] = pivot_table[col].groupby(level='Split').transform(format_and_bold_group, is_lower=is_lower_better)
-
-    model_order = CLASSIC_ML_MODELS_TO_PLOT + ["Transformer"]
-    ordered_metrics = [clean_metric_map[m] for m in PAPER_TABLE_METRICS if m in df_filtered["Metric"].unique()]
-    existing_splits = [s for s in SPLIT_TYPES if s in pivot_table.index.get_level_values('Split')]
-    existing_models = [m for m in model_order if m in pivot_table.index.get_level_values('Model')]
-    existing_periods = [p for p in valid_periods if p in pivot_table.columns.get_level_values('Period')]
-    
-    pivot_table = pivot_table.reindex(
-        index=pd.MultiIndex.from_product([existing_splits, existing_models], names=['Split', 'Model']),
-        columns=pd.MultiIndex.from_product([existing_periods, ordered_metrics], names=['Period', 'Metric_Name'])
-    ).dropna(how='all')
-
-    center_css = "style='text-align: center; vertical-align: middle;'"
-    html = ["<div style='overflow-x: auto; width: 100%;'>", "  <table border='1' style='border-collapse: collapse; table-layout: fixed; width: 166%; word-wrap: break-word;'>\n <thead><tr>"]
-    html.append(f"      <th rowspan='2' {center_css}>Split<br>strategy</th><th rowspan='2' {center_css}>Model</th>")
-    for period in existing_periods: html.append(f"      <th colspan='{len(ordered_metrics)}' {center_css}>{period.replace('\n', ' ')}</th>")
-    html.append("    </tr><tr>")
-    for _ in existing_periods:
-        for metric in ordered_metrics: html.append(f"      <th {center_css}>{metric}</th>")
-    html.append("    </tr></thead><tbody>")
-    
-    current_split = None
-    for idx, row in pivot_table.iterrows():
-        split, model = idx
-        row_style = " style='border-top: 2px solid currentColor;'" if (split != current_split and current_split is not None) else ""
-        html.append(f"    <tr{row_style}>")
-        if split != current_split:
-            html.append(f"      <td rowspan='{len(pivot_table.xs(split, level='Split'))}' {center_css}><b>{split.capitalize().replace('_', '<br>')}</b></td>")
-            current_split = split
-        html.append(f"      <td {center_css}>{MODEL_NAME_MAP.get(model, model)}</td>")
-        for val in row: html.append(f"      <td {center_css}>{val}</td>")
-        html.append("    </tr>")
+    if matched_dir is None or not (matched_dir / file_name).exists():
+        return pd.DataFrame()
         
-    html.append("  </tbody></table></div>")
-    with open(output_dir / f"{eval_type}_paper_table_{task_name}.md", "w", encoding='utf-8') as f:
-        f.write(f"### Hierarchical performance comparison: {task_name.replace('_', ' ').capitalize()} ({eval_type.capitalize()})\n\n" + "\n".join(html))
-
-
-def generate_performance_summaries(df: pd.DataFrame, output_dir: Path, task_name: str, eval_type: str):
-    grouped = df.groupby(["Period", "Metric", "Model"])["Value"].agg(["mean", "std"])
-    grouped["Formatted"] = grouped.apply(lambda r: f"{r['mean']:.3f} ± {r['std']:.3f}", axis=1)
-    pivot_table = grouped.reset_index().pivot(index=["Period", "Metric"], columns="Model", values="Formatted").reset_index()
-    cols = ["Period", "Metric"] + [m for m in (CLASSIC_ML_MODELS_TO_PLOT + ["Transformer"]) if m in pivot_table.columns]
+    npz_data = np.load(matched_dir / file_name, allow_pickle=True)
+    prefix = f"{dataset_split}_" if dataset_split == "validation" else "test_"
+    fup_pattern = re.compile(rf"^{prefix}fup_(\d+)_labels$")
     
-    with open(output_dir / f"{eval_type}_summary_{task_name}.md", "w") as f:
-        f.write(f"# Performance Summary: {task_name.replace('_', ' ').title()}\n\n" + pivot_table[cols].to_markdown(index=False))
-
-
-def compute_overall_prevalence(raw_pool: Dict, period_dict: Dict, task_name: str, split_name: str):
-    """
-    Computes and prints the absolute counts and proportions of positive vs negative cases
-    for a specific task and split strategy across all aggregated clinical periods.
-    """
-    clinical_periods = period_dict.get(task_name, {})
-    if not clinical_periods:
-        print(f"No periods found for task: {task_name}")
-        return
-
-    # Classic ML and Transformers share the same ground-truth labels,
-    # so we can just read from the first available model architecture.
-    available_models = list(raw_pool.get(split_name, {}).keys())
-    if not available_models:
-        print(f"No model data found for split: {split_name}")
-        return
-    ref_model = available_models[0]
-    horizons_data = raw_pool[split_name][ref_model][task_name]
-
-    print(f"=== Population Prevalence for {task_name.upper()} ({split_name}) ===")
+    flat_records = []
+    fup_days = {int(fup_pattern.match(k).group(1)) for k in npz_data.files if fup_pattern.match(k)}
     
-    for period_name, h_fup_map in clinical_periods.items():
-        y_t_list = []
+    prob_suffix = "probs_cal" if USE_CALIBRATED_PROBS["Transformer"] else "probs"
+    prob_template = f"{prefix}fup_%04d_{prob_suffix}"
+    
+    for fup_day in sorted(fup_days):
+        if f"{prefix}fup_{fup_day:04d}_labels" not in npz_data.files:
+            continue
+        y_true_all = npz_data[f"{prefix}fup_{fup_day:04d}_labels"]
         
-        # Gather all valid labels across the windows defining this period
-        for h, fups in h_fup_map.items():
-            if h not in horizons_data: continue
-            for fup in fups:
-                if fup in horizons_data[h]:
-                    labels = horizons_data[h][fup]["labels"]
-                    valid_mask = labels != -100
-                    if valid_mask.any():
-                        y_t_list.append(labels[valid_mask])
-                        
-        if not y_t_list:
-            print(f"{period_name.replace('\n', ' ')}: No valid data points.")
+        target_prob_str = prob_template % fup_day
+        if target_prob_str not in npz_data.files:
+            target_prob_str = f"{prefix}fup_{fup_day:04d}_probs"
+        y_prob_all = npz_data[target_prob_str]
+        
+        y_true = y_true_all if y_true_all.ndim == 1 else y_true_all[:, target_idx]
+        y_prob = y_prob_all if y_prob_all.ndim == 1 else y_prob_all[:, target_idx]
+        
+        raw_fup_dir = BASE_DATA_PATH / split / f"fup_{fup_day:04d}"
+        if not raw_fup_dir.exists():
+            raw_fup_dir = BASE_DATA_PATH / split / f"fup_{fup_day:04d}d"
+        if not raw_fup_dir.exists():
             continue
             
-        y_true = np.concatenate(y_t_list)
-        total = len(y_true)
-        positives = np.sum(y_true == 1)
-        negatives = np.sum(y_true == 0)
+        raw_ds = load_from_disk(str(raw_fup_dir))[dataset_split]
+        raw_keys = raw_ds["patientkey"]
         
-        pos_rate = (positives / total) * 100
-        neg_rate = (negatives / total) * 100
+        for idx in range(len(y_prob)):
+            if int(y_true[idx]) == -100:
+                continue
+            flat_records.append({
+                "patientkey": raw_keys[idx],
+                "time_step": fup_day,
+                "horizon": int(target_horizon),
+                "y_true": int(y_true[idx]),
+                "y_prob": float(y_prob[idx])
+            })
+            
+    df = pd.DataFrame(flat_records)
+    if not df.empty:
+        df.to_parquet(cache_file, index=False)
+    return df
+
+
+def load_classic_ml_flat_dataframe(model_name: str, task: str, split: str, dataset_split: str, target_horizon) -> pd.DataFrame:
+    if target_horizon == "combined":
+        dfs = [load_classic_ml_flat_dataframe(model_name, task, split, dataset_split, h) for h in TARGET_HORIZONS]
+        valid_dfs = [d for d in dfs if not d.empty]
+        return pd.concat(valid_dfs, ignore_index=True) if valid_dfs else pd.DataFrame()
+
+    # Tier 1 Caching Check (Base Dataframe Storage)
+    cache_file = CACHE_DIR / f"raw_ml_{model_name}_{task}_{split}_{dataset_split}_{target_horizon}.parquet"
+    if cache_file.exists():
+        return pd.read_parquet(cache_file)
+
+    file_name = "val_predictions.npz" if dataset_split == "validation" else "test_predictions.npz"
+    hrz_str = f"{target_horizon:04d}"
+    
+    task_dir = RESULTS_DIR / "classic_ml" / split / model_name / task
+    if not task_dir.exists():
+        return pd.DataFrame()
         
-        print(f"{period_name.replace('\n', ' ')}:")
-        print(f"   • Total Samples: {total}")
-        print(f"   • Positives (Class 1): {positives} ({pos_rate:.2f}%)")
-        print(f"   • Negatives (Class 0): {negatives} ({neg_rate:.2f}%)")
-    print("=" * 50)
+    matched_dir = None
+    for p in task_dir.iterdir():
+        if p.is_dir() and f"hrz({hrz_str})" in p.name:
+            matched_dir = p
+            break
+            
+    if matched_dir is None or not (matched_dir / file_name).exists():
+        return pd.DataFrame()
+        
+    npz_data = np.load(matched_dir / file_name, allow_pickle=True)
+    prefix = f"{dataset_split}_" if dataset_split == "validation" else "test_"
+    fup_pattern = re.compile(rf"^{prefix}fup_(\d+)_labels$")
+    
+    flat_records = []
+    fup_days = {int(fup_pattern.match(k).group(1)) for k in npz_data.files if fup_pattern.match(k)}
+    
+    prob_suffix = "probs_cal" if USE_CALIBRATED_PROBS[model_name] else "probs"
+    prob_template = f"{prefix}fup_%04d_{prob_suffix}"
+    
+    for fup_day in sorted(fup_days):
+        if f"{prefix}fup_{fup_day:04d}_labels" not in npz_data.files:
+            continue
+        y_true = npz_data[f"{prefix}fup_{fup_day:04d}_labels"].flatten()
+        
+        target_prob_str = prob_template % fup_day
+        if target_prob_str not in npz_data.files:
+            target_prob_str = f"{prefix}fup_{fup_day:04d}_probs"
+        y_prob = npz_data[target_prob_str].flatten()
+        
+        raw_fup_dir = BASE_DATA_PATH / split / f"fup_{fup_day:04d}"
+        if not raw_fup_dir.exists():
+            raw_fup_dir = BASE_DATA_PATH / split / f"fup_{fup_day:04d}d"
+        if not raw_fup_dir.exists():
+            continue
+            
+        raw_ds = load_from_disk(str(raw_fup_dir))[dataset_split]
+        raw_keys = raw_ds["patientkey"]
+        
+        for idx in range(len(y_prob)):
+            if int(y_true[idx]) == -100:
+                continue
+            flat_records.append({
+                "patientkey": raw_keys[idx],
+                "time_step": fup_day,
+                "horizon": int(target_horizon),
+                "y_true": int(y_true[idx]),
+                "y_prob": float(y_prob[idx])
+            })
+            
+    df = pd.DataFrame(flat_records)
+    if not df.empty:
+        df.to_parquet(cache_file, index=False)
+    return df
+
+
+def bootstrap_metric_ci(sub_df: pd.DataFrame, model_name: str, thresh: float, metric_type: str) -> tuple:
+    y_true_orig = sub_df['y_true'].values
+    y_prob_orig = sub_df[f'y_prob_{model_name}'].values
+    
+    if metric_type == "ROC-AUC":
+        pe = roc_auc_score(y_true_orig, y_prob_orig) if len(np.unique(y_true_orig)) >= 2 else 0.5
+    elif metric_type == "PR-AUC":
+        pe = average_precision_score(y_true_orig, y_prob_orig) if len(np.unique(y_true_orig)) >= 2 else 0.0
+    elif metric_type == "ECE":
+        pe = compute_expected_calibration_error(y_true_orig, y_prob_orig)
+    else:
+        preds_bin = (y_prob_orig >= thresh).astype(int)
+        tp = np.sum((preds_bin == 1) & (y_true_orig == 1))
+        fp = np.sum((preds_bin == 1) & (y_true_orig == 0))
+        tn = np.sum((preds_bin == 0) & (y_true_orig == 0))
+        fn = np.sum((preds_bin == 0) & (y_true_orig == 1))
+        
+        if metric_type == "Sensitivity (recall)":
+            pe = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        elif metric_type == "Precision":
+            pe = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        elif metric_type == "Specificity":
+            pe = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+
+    boot_stats = []
+    np.random.seed(42)
+    
+    n_samples = len(sub_df)
+    boot_indices = np.random.choice(n_samples, size=(N_BOOTSTRAP, n_samples), replace=True)
+    
+    for i in range(N_BOOTSTRAP):
+        indices = boot_indices[i]
+        yt = y_true_orig[indices]
+        yp = y_prob_orig[indices]
+        
+        if len(np.unique(yt)) < 2:
+            continue
+            
+        if metric_type == "ROC-AUC":
+            boot_stats.append(roc_auc_score(yt, yp))
+        elif metric_type == "PR-AUC":
+            boot_stats.append(average_precision_score(yt, yp))
+        elif metric_type == "ECE":
+            boot_stats.append(compute_expected_calibration_error(yt, yp))
+        else:
+            p_bin = (yp >= thresh).astype(int)
+            tp_b = np.sum((p_bin == 1) & (yt == 1))
+            fp_b = np.sum((p_bin == 1) & (yt == 0))
+            tn_b = np.sum((p_bin == 0) & (yt == 0))
+            fn_b = np.sum((p_bin == 0) & (yt == 1))
+            
+            if metric_type == "Sensitivity (recall)":
+                boot_stats.append(tp_b / (tp_b + fn_b) if (tp_b + fn_b) > 0 else 0.0)
+            elif metric_type == "Precision":
+                boot_stats.append(tp_b / (tp_b + fp_b) if (tp_b + fp_b) > 0 else 0.0)
+            elif metric_type == "Specificity":
+                boot_stats.append(tn_b / (tn_b + fp_b) if (tn_b + fp_b) > 0 else 0.0)
+                
+    if not boot_stats:
+        return pe, f"{pe:.3f} (NaN - NaN)"
+        
+    low_bound = np.percentile(boot_stats, 2.5)
+    high_bound = np.percentile(boot_stats, 97.5)
+    return pe, f"{pe:.3f} ({low_bound:.3f} - {high_bound:.3f})"
+
+
+def calculate_strict_threshold(df: pd.DataFrame, low: int, high: int, target_recall: float, label: str) -> float:
+    sub = df[(df['time_step'] >= low) & ((df['time_step'] + df['horizon']) <= high)].copy()
+    sub = sub[sub['y_true'] != -100]
+    
+    if sub.empty:
+        raise RuntimeError(f"Strict Error: Zero tracking validation samples located within window frame {low}-{high}d for model setup: {label}")
+    if len(np.unique(sub['y_true'])) < 2:
+        raise RuntimeError(f"Strict Error: Class label space has zero variance in window {low}-{high}d for model setup: {label}")
+        
+    p, r, t = precision_recall_curve(sub['y_true'].values, sub['y_prob'].values)
+    valid_indices = np.where(r[:-1] >= target_recall)[0]
+    
+    if len(valid_indices) == 0:
+        raise RuntimeError(f"Strict Error: Target recall anchor of {target_recall:.2%} cannot be satisfied by model prediction arrays in slice {low}-{high}d for: {label}")
+        
+    return float(t[valid_indices[-1]])
+
+
+# ==========================================
+# REPORT STRUCTURING & CLEANING BREAKDOWNS
+# ==========================================
+def build_report_layout_and_mapping() -> tuple:
+    METRIC_SORT_ORDER = ["Total evaluation frames", "Primary analysis"]
+    ROW_CLEANING_MAP = {
+        "Total evaluation frames": "Total evaluation frames",
+        "Primary analysis": "Primary analysis",
+        "Post-hoc analysis": "Post-hoc analysis"
+    }
+    
+    for m in CLASSIC_MODELS:
+        disp = MODEL_DISPLAY_MAP[m]
+        key_head = f"TF vs {disp}"
+        METRIC_SORT_ORDER.append(key_head)
+        ROW_CLEANING_MAP[key_head] = key_head
+        
+        sub_metrics = [
+            (f"  Discordant pairs (TF correct) ({disp})", "  Discordant pairs (TF correct)"),
+            (f"  Discordant pairs ({disp} correct) ({disp})", f"  Discordant pairs ({disp} correct)"),
+            (f"  McNemar p-value ({disp})", "  McNemar p-value"),
+            (f"  Statistical winner ({disp})", "  Statistical winner")
+        ]
+        for internal_key, clean_name in sub_metrics:
+            METRIC_SORT_ORDER.append(internal_key)
+            ROW_CLEANING_MAP[internal_key] = clean_name
+            
+    METRIC_SORT_ORDER.append("Post-hoc analysis")
+    
+    for metric_prefix, arrow in METRIC_MAPPING:
+        head_lbl = f"{metric_prefix} ({arrow})"
+        METRIC_SORT_ORDER.append(head_lbl)
+        ROW_CLEANING_MAP[head_lbl] = head_lbl
+        
+        for model in ["logistic_regression", "random_forest", "xgboost", "Transformer"]:
+            disp = MODEL_DISPLAY_MAP[model]
+            internal_key = f"  {metric_prefix} ({arrow}) ({disp})"
+            METRIC_SORT_ORDER.append(internal_key)
+            ROW_CLEANING_MAP[internal_key] = f"  {disp}"
+            
+    return METRIC_SORT_ORDER, ROW_CLEANING_MAP
+
+
+# ==========================================
+# STRATIFIED STRATEGY EVALUATION MODULES
+# ==========================================
+def process_split_strategy(task: str, split: str, horizon, analysis_dir: Path) -> dict:
+    horizon_str = f"horizon_{horizon:04d}d" if isinstance(horizon, int) else "horizon_combined"
+    
+    # Parameter-dependent cache check
+    report_out_path = analysis_dir / f"{split}_{horizon_str}_head_to_head_report_{PARAM_HASH}.csv"
+    cache_data_path = CACHE_DIR / f"plot_cache_{task}_{split}_{horizon_str}_{PARAM_HASH}.npz"
+    
+    if report_out_path.exists() and cache_data_path.exists():
+        print(f" [Cache Hit] Report and plotting cache recovered cleanly for split [{split}] under hash token: {PARAM_HASH}")
+        cached_npz = np.load(cache_data_path, allow_pickle=True)
+        plotted_window_cache = {}
+        for w_name in CLINICAL_WINDOWS.keys():
+            if f"{w_name}_y_true" in cached_npz:
+                cols = {
+                    'time_step': cached_npz[f"{w_name}_time_step"],
+                    'horizon': cached_npz[f"{w_name}_horizon"],
+                    'y_true': cached_npz[f"{w_name}_y_true"],
+                }
+                for m in ALL_MODELS:
+                    cols[f'y_prob_{m}'] = cached_npz[f"{w_name}_y_prob_{m}"]
+                
+                sub_df = pd.DataFrame(cols)
+                thresh_resolved = cached_npz[f"{w_name}_thresh"].item()
+                plotted_window_cache[w_name] = (sub_df, thresh_resolved)
+                
+        df_report = pd.read_csv(report_out_path, index_col="Evaluation metric").fillna("")
+        print(f"\n>>> REPORT SUMMARY (CACHED): STRATEGY SPLIT [{split.upper()}] | HORIZON: {str(horizon).upper()} <<<")
+        print(df_report.to_markdown())
+        return plotted_window_cache
+
+    val_dfs = {"Transformer": load_transformer_flat_dataframe(task, split, "validation", horizon)}
+    test_dfs = {"Transformer": load_transformer_flat_dataframe(task, split, "test", horizon)}
+    
+    for m in CLASSIC_MODELS:
+        val_dfs[m] = load_classic_ml_flat_dataframe(m, task, split, "validation", horizon)
+        test_dfs[m] = load_classic_ml_flat_dataframe(m, task, split, "test", horizon)
+        
+    if val_dfs["Transformer"].empty or test_dfs["Transformer"].empty:
+        return None
+
+    tuning_dfs = val_dfs if THRESHOLD_TUNING_SET == "validation" else test_dfs
+
+    print(f" [Guard] Verifying alignment parity on set [{THRESHOLD_TUNING_SET}] for split [{split}]...")
+    for m in CLASSIC_MODELS:
+        if tuning_dfs[m].empty:
+            raise RuntimeError(f"Alignment Error: Dataframe for baseline model '{m}' on set [{THRESHOLD_TUNING_SET}] is empty.")
+            
+        val_check = pd.merge(
+            tuning_dfs["Transformer"][['patientkey', 'time_step', 'horizon', 'y_true']], 
+            tuning_dfs[m][['patientkey', 'time_step', 'horizon', 'y_true']], 
+            on=['patientkey', 'time_step', 'horizon'], 
+            suffixes=('_TF', f'_{MODEL_DISPLAY_MAP[m]}')
+        )
+        
+        mismatched_indices = val_check['y_true_TF'] != val_check[f'y_true_{MODEL_DISPLAY_MAP[m]}']
+        count_mismatched_labels = np.sum(mismatched_indices)
+        
+        # --- CONDENSED NOTIFICATION WARNING FOR SAMPLES REMOVED ---
+        if len(tuning_dfs["Transformer"]) != len(val_check) or len(tuning_dfs[m]) != len(val_check) or count_mismatched_labels > 0:
+            # Isolate rows to drop from Transformer
+            merged_keys = val_check[~mismatched_indices][['patientkey', 'time_step', 'horizon']]
+            tf_dropped = tuning_dfs["Transformer"].merge(merged_keys, on=['patientkey', 'time_step', 'horizon'], how='left', indicator=True)
+            tf_dropped_rows = tf_dropped[tf_dropped['_merge'] == 'left_only']
+            
+            # Isolate rows to drop from Classic Baseline model
+            ml_dropped = tuning_dfs[m].merge(merged_keys, on=['patientkey', 'time_step', 'horizon'], how='left', indicator=True)
+            ml_dropped_rows = ml_dropped[ml_dropped['_merge'] == 'left_only']
+            
+            # Extract clinical label distributions tracking dropped validation states
+            pos_dropped_tf = np.sum(tf_dropped_rows['y_true'] == 1)
+            neg_dropped_tf = np.sum(tf_dropped_rows['y_true'] == 0)
+            pos_dropped_ml = np.sum(ml_dropped_rows['y_true'] == 1)
+            neg_dropped_ml = np.sum(ml_dropped_rows['y_true'] == 0)
+            
+            print(f" [Guard Warning] Sample misalignment detected on set [{THRESHOLD_TUNING_SET}] for split [{split}] vs model [{m}].")
+            print(f"   -> Transformer dropped total rows: {len(tf_dropped_rows)} (Positive cases: {pos_dropped_tf}, Negative cases: {neg_dropped_tf})")
+            print(f"   -> Baseline ({m}) dropped total rows: {len(ml_dropped_rows)} (Positive cases: {pos_dropped_ml}, Negative cases: {neg_dropped_ml})")
+            
+            # Self-healing synchronization step
+            clean_intersection_keys = val_check[~mismatched_indices][['patientkey', 'time_step', 'horizon']]
+            tuning_dfs["Transformer"] = pd.merge(tuning_dfs["Transformer"], clean_intersection_keys, on=['patientkey', 'time_step', 'horizon'])
+            tuning_dfs[m] = pd.merge(tuning_dfs[m], clean_intersection_keys, on=['patientkey', 'time_step', 'horizon'])
+            
+            tuning_dfs["Transformer"] = tuning_dfs["Transformer"].sort_values(by=["patientkey", "time_step", "horizon"]).reset_index(drop=True)
+            tuning_dfs[m] = tuning_dfs[m].sort_values(by=["patientkey", "time_step", "horizon"]).reset_index(drop=True)
+
+        final_verify = pd.merge(
+            tuning_dfs["Transformer"][['patientkey', 'time_step', 'horizon', 'y_true']], 
+            tuning_dfs[m][['patientkey', 'time_step', 'horizon', 'y_true']], 
+            on=['patientkey', 'time_step', 'horizon'], 
+            suffixes=('_TF', f'_{MODEL_DISPLAY_MAP[m]}')
+        )
+        assert len(tuning_dfs["Transformer"]) == len(tuning_dfs[m]) == len(final_verify), "Self-healing row reduction error."
+            
+    print(f" [Guard] Parity alignment verified and synchronized successfully on [{THRESHOLD_TUNING_SET}].")
+        
+    df_merged = test_dfs["Transformer"][['patientkey', 'time_step', 'horizon', 'y_true', 'y_prob']].rename(columns={'y_prob': 'y_prob_Transformer'})
+    for m in CLASSIC_MODELS:
+        if test_dfs[m].empty: continue
+        m_sub = test_dfs[m][['patientkey', 'time_step', 'horizon', 'y_prob']].rename(columns={'y_prob': f'y_prob_{m}'})
+        df_merged = pd.merge(df_merged, m_sub, on=['patientkey', 'time_step', 'horizon'])
+        
+    global_thresholds = {}
+    if THRESHOLD_MODE == "global":
+        for m in ALL_MODELS:
+            global_thresholds[m] = calculate_strict_threshold(
+                tuning_dfs[m], 0, 9999, TARGET_RECALL_ANCHOR, 
+                f"{m} ({split} - Tuning Set: {THRESHOLD_TUNING_SET.upper()})"
+            )
+            
+    split_results = {}
+    plotted_window_cache = {}
+    npz_save_payload = {}
+    
+    for w_idx, (window_name, (low, high)) in enumerate(CLINICAL_WINDOWS.items()):
+        sub_df = df_merged[
+            (df_merged['time_step'] >= low) & 
+            ((df_merged['time_step'] + df_merged['horizon']) <= high)
+        ].copy()
+        
+        if sub_df.empty:
+            continue
+            
+        y_true = sub_df['y_true'].values
+        window_record = {"Total evaluation frames": len(sub_df), "Primary analysis": "", "Post-hoc analysis": ""}
+        
+        preds_map = {}
+        thresholds_resolved = {}
+        
+        for m in ALL_MODELS:
+            if THRESHOLD_MODE == "global":
+                thresholds_resolved[m] = global_thresholds[m]
+            else:
+                thresholds_resolved[m] = calculate_strict_threshold(
+                    tuning_dfs[m], low, high, TARGET_RECALL_ANCHOR, 
+                    f"{m} ({split} - Tuning Set: {THRESHOLD_TUNING_SET.upper()})"
+                )
+                
+            preds_map[m] = (sub_df[f'y_prob_{m}'].values >= thresholds_resolved[m]).astype(int)
+
+        for m in CLASSIC_MODELS:
+            disp = MODEL_DISPLAY_MAP[m]
+            correct_trans = (preds_map["Transformer"] == y_true)
+            correct_baseline = (preds_map[m] == y_true)
+            
+            b = int(np.sum(correct_trans & ~correct_baseline))
+            c = int(np.sum(~correct_trans & correct_baseline))
+            
+            contingency_table = [[np.sum(correct_trans & correct_baseline), b], [c, np.sum(~correct_trans & ~correct_baseline)]]
+            try:
+                res = mcnemar(contingency_table, exact=True)
+                p_val = res.pvalue
+                winner = "Tie" if p_val > 0.05 else ("TF" if b > c else disp)
+            except Exception:
+                p_val = np.nan
+                winner = "NaN"
+                
+            window_record[f"TF vs {disp}"] = ""
+            window_record[f"  Discordant pairs (TF correct) ({disp})"] = b
+            window_record[f"  Discordant pairs ({disp} correct) ({disp})"] = c
+            window_record[f"  McNemar p-value ({disp})"] = f"{p_val:.3e}" if not pd.isna(p_val) else "NaN"
+            window_record[f"  Statistical winner ({disp})"] = winner
+
+        for metric_prefix, arrow in METRIC_MAPPING:
+            raw_estimates = {}
+            string_outputs = {}
+            
+            window_record[f"{metric_prefix} ({arrow})"] = ""
+            for target_model in ALL_MODELS:
+                pe_val, formatted_str = bootstrap_metric_ci(sub_df, target_model, thresholds_resolved[target_model], metric_prefix)
+                raw_estimates[target_model] = pe_val
+                string_outputs[target_model] = formatted_str
+
+            best_model = min(raw_estimates, key=raw_estimates.get) if metric_prefix == "ECE" else max(raw_estimates, key=raw_estimates.get)
+
+            for target_model in ALL_MODELS:
+                disp = MODEL_DISPLAY_MAP[target_model]
+                final_cell_text = string_outputs[target_model]
+                if target_model == best_model:
+                    final_cell_text = f"**{final_cell_text}**"
+                window_record[f"  {metric_prefix} ({arrow}) ({disp})"] = final_cell_text
+
+        split_results[window_name] = window_record
+        plotted_window_cache[window_name] = (sub_df, thresholds_resolved)
+        
+        npz_save_payload[f"{window_name}_time_step"] = sub_df['time_step'].values
+        npz_save_payload[f"{window_name}_horizon"] = sub_df['horizon'].values
+        npz_save_payload[f"{window_name}_y_true"] = sub_df['y_true'].values
+        for m in ALL_MODELS:
+            npz_save_payload[f"{window_name}_y_prob_{m}"] = sub_df[f'y_prob_{m}'].values
+        npz_save_payload[f"{window_name}_thresh"] = thresholds_resolved
+
+    if not split_results:
+        return None
+
+    METRIC_SORT_ORDER, ROW_CLEANING_MAP = build_report_layout_and_mapping()
+    df_report = pd.DataFrame(split_results).reindex(METRIC_SORT_ORDER)
+    df_report.index = df_report.index.map(ROW_CLEANING_MAP)
+    df_report.index.name = "Evaluation metric"
+    df_report = df_report.fillna("")
+    df_report.to_csv(report_out_path)
+    np.savez(cache_data_path, **npz_save_payload)
+    
+    print(f"\n>>> REPORT SUMMARY: STRATEGY SPLIT [{split.upper()}] | HORIZON: {str(horizon).upper()} <<<")
+    with pd.option_context('display.max_colwidth', None, 'display.max_rows', None):
+        print(df_report.to_markdown())
+        
+    return plotted_window_cache
+
+
+# ==========================================
+# VISUAL GRAPH PLOTTING ENGINES
+# ==========================================
+def render_matrix_visualization_grids(plotted_data_cache: dict, analysis_dir: Path, horizon_suffix: str):
+    n_splits = len(SPLIT_TYPES)
+    n_windows = len(CLINICAL_WINDOWS)
+    
+    fig_roc, axes_roc = plt.subplots(n_windows, n_splits, figsize=(6.5 * n_splits, 5.5 * n_windows), squeeze=False)
+    fig_pr, axes_pr = plt.subplots(n_windows, n_splits, figsize=(6.5 * n_splits, 5.5 * n_windows), squeeze=False)
+    fig_dca, axes_dca = plt.subplots(n_windows, n_splits, figsize=(6.5 * n_splits, 5.5 * n_windows), squeeze=False)
+    
+    model_fullname_map = {
+        "logistic_regression": "Logistic regression",
+        "random_forest": "Random forest",
+        "xgboost": "XGBoost",
+        "Transformer": "Transformer"
+    }
+
+    for w_idx, window_name in enumerate(CLINICAL_WINDOWS.keys()):
+        max_dca_y_limit = 0.02
+        for s_idx, split in enumerate(SPLIT_TYPES):
+            if split not in plotted_data_cache or window_name not in plotted_data_cache[split]: continue
+            sub_df, _ = plotted_data_cache[split][window_name]
+            prevalence = np.sum(sub_df['y_true'].values == 1) / len(sub_df)
+            max_dca_y_limit = max(max_dca_y_limit, prevalence * 1.05)
+
+        for s_idx, split in enumerate(SPLIT_TYPES):
+            ax_roc = axes_roc[w_idx, s_idx]
+            ax_pr = axes_pr[w_idx, s_idx]
+            ax_dca = axes_dca[w_idx, s_idx]
+
+            if split not in plotted_data_cache or window_name not in plotted_data_cache[split]:
+                for ax in [ax_roc, ax_pr, ax_dca]:
+                    ax.text(0.5, 0.5, "(Not Applicable for this Horizon)", 
+                            fontsize=14, color="darkred", ha='center', va='center', weight='bold')
+                    ax.set_xlim([0.0, 1.0])
+                    ax.set_ylim([0.0, 1.0])
+                    ax.grid(False)
+                    if w_idx == 0: ax.set_title(split.replace('_', ' ').title(), fontsize=20, fontweight='bold', pad=16)
+                    if s_idx == 0: 
+                        lbl = "Sensitivity" if ax == ax_roc else ("Precision" if ax == ax_pr else "Net benefit")
+                        ax.set_ylabel(f"{window_name}\n\n{lbl}", fontsize=18, fontweight='bold')
+                continue
+
+            sub_df, thresholds_resolved = plotted_data_cache[split][window_name]
+            y_true = sub_df['y_true'].values
+            
+            for m_idx, m in enumerate(["logistic_regression", "random_forest", "xgboost", "Transformer"]):
+                p_arr = sub_df[f'y_prob_{m}'].values
+                full_label = model_fullname_map[m]
+                c_hex = COLORS[m_idx]
+                
+                fpr, tpr, _ = roc_curve(y_true, p_arr)
+                ax_roc.plot(fpr, tpr, label=full_label, color=c_hex, lw=3.5)
+                
+                prec_arr, rec_arr, _ = precision_recall_curve(y_true, p_arr)
+                ax_pr.plot(rec_arr, prec_arr, label=full_label, color=c_hex, lw=3.5)
+                
+                dca_thresh = np.linspace(0.01, 0.50, 50)
+                net_benefit = []
+                for t in dca_thresh:
+                    tp = np.sum((p_arr >= t) & (y_true == 1))
+                    fp = np.sum((p_arr >= t) & (y_true == 0))
+                    net_benefit.append((tp / len(y_true)) - (fp / len(y_true)) * (t / (1.0 - t)))
+                ax_dca.plot(dca_thresh, net_benefit, label=full_label, color=c_hex, lw=3.5)
+
+            ax_roc.plot([0, 1], [0, 1], linestyle="--", color="gray", alpha=0.5)
+            ax_roc.set_xlim([0.0, 1.0])
+            ax_roc.set_ylim([0.0, 1.05])
+            ax_roc.grid(True, linestyle=":", alpha=0.5)
+            ax_roc.tick_params(labelsize=14)
+            if w_idx == 0: ax_roc.set_title(split.replace('_', ' ').title(), fontsize=20, fontweight='bold', pad=16)
+            if s_idx == 0: ax_roc.set_ylabel(f"{window_name}\n\nSensitivity", fontsize=18, fontweight='bold')
+            if w_idx == n_windows - 1: ax_roc.set_xlabel("1.0 - Specificity", fontsize=18, fontweight='bold', labelpad=12)
+            leg_roc = ax_roc.legend(loc="lower right", fontsize=15, frameon=True, framealpha=0.9)
+            for handle in leg_roc.legend_handles: handle.set_linewidth(4.5)
+
+            ax_pr.set_xlim([0.0, 1.0])
+            ax_pr.set_ylim([0.0, 1.05])
+            ax_pr.grid(True, linestyle=":", alpha=0.5)
+            ax_pr.tick_params(labelsize=14)
+            if w_idx == 0: ax_pr.set_title(split.replace('_', ' ').title(), fontsize=20, fontweight='bold', pad=16)
+            if s_idx == 0: ax_pr.set_ylabel(f"{window_name}\n\nPrecision", fontsize=18, fontweight='bold')
+            if w_idx == n_windows - 1: ax_pr.set_xlabel("Recall", fontsize=18, fontweight='bold', labelpad=12)
+            leg_pr = ax_pr.legend(loc="upper right", fontsize=15, frameon=True, framealpha=0.9)
+            for handle in leg_pr.legend_handles: handle.set_linewidth(4.5)
+
+            prevalence = np.sum(y_true == 1) / len(y_true)
+            ax_dca.plot(dca_thresh, np.zeros_like(dca_thresh), color="black", linestyle="-", label="Treat none")
+            ax_dca.plot(dca_thresh, prevalence - (1.0 - prevalence) * (dca_thresh / (1.0 - dca_thresh)), color="darkgray", linestyle="--", label="Treat all")
+            ax_dca.set_xlim([0.0, 0.5])
+            ax_dca.set_ylim([-0.01 * (int(max_dca_y_limit * 10) + 1), max_dca_y_limit])
+            ax_dca.grid(True, linestyle=":", alpha=0.5)
+            ax_dca.tick_params(labelsize=14)
+            if w_idx == 0: ax_dca.set_title(split.replace('_', ' ').title(), fontsize=20, fontweight='bold', pad=16)
+            if s_idx == 0: ax_dca.set_ylabel(f"{window_name}\n\nNet benefit", fontsize=18, fontweight='bold')
+            if w_idx == n_windows - 1: ax_dca.set_xlabel("Threshold probability", fontsize=18, fontweight='bold', labelpad=12)
+            leg_dca = ax_dca.legend(loc="upper right", fontsize=13, frameon=True, framealpha=0.9)
+            for handle in leg_dca.legend_handles: handle.set_linewidth(4.5)
+
+    fig_roc.tight_layout()
+    fig_roc.savefig(analysis_dir / f"matrix_roc_comparison_curves_{horizon_suffix}_{PARAM_HASH}.png", dpi=200, bbox_inches='tight')
+    plt.close(fig_roc)
+
+    fig_pr.tight_layout()
+    fig_pr.savefig(analysis_dir / f"matrix_pr_comparison_curves_{horizon_suffix}_{PARAM_HASH}.png", dpi=200, bbox_inches='tight')
+    plt.close(fig_pr)
+
+    fig_dca.tight_layout()
+    fig_dca.savefig(analysis_dir / f"matrix_dca_comparison_curves_{horizon_suffix}_{PARAM_HASH}.png", dpi=200, bbox_inches='tight')
+    plt.close(fig_dca)
+
+
+# ============================================
+# CENTRAL CORE EXECUTIVE PIPELINE ORCHESTRATOR
+# ============================================
+def process_evaluation_pipeline(task: str, horizon):
+    horizon_str = f"horizon_{horizon:04d}d" if isinstance(horizon, int) else "horizon_combined"
+    task_horizon_dir = ANALYSIS_SUBDIR / task / horizon_str
+    analysis_dir = task_horizon_dir / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    
+    plotted_data_cache = {}
+    
+    for split in SPLIT_TYPES:
+        window_cache = process_split_strategy(task, split, horizon, analysis_dir)
+        if window_cache is not None:
+            plotted_data_cache[split] = window_cache
+            
+    if plotted_data_cache:
+        plot_file_check = analysis_dir / f"matrix_roc_comparison_curves_{horizon_str}_{PARAM_HASH}.png"
+        if plot_file_check.exists():
+            print(f" -> Visualization plots match parameter signature hash [{PARAM_HASH}]. Skipping plot rendering.")
+        else:
+            print(f" -> Initializing large-format visual grid compilation maps for {horizon_str}...")
+            render_matrix_visualization_grids(plotted_data_cache, analysis_dir, horizon_str)
 
 
 if __name__ == "__main__":
-    main()
+    for target_task in TASKS:
+        for target_horizon in ["combined"] + TARGET_HORIZONS:
+            process_evaluation_pipeline(target_task, target_horizon)

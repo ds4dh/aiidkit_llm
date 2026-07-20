@@ -1,13 +1,13 @@
 # Run parameters
 data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6/classic_ml
-data_split_type: temporal_split  # random_split, center_split, temporal_split
-result_dir: results_classic_ml_final
+data_split_type: random_split  # random_split, center_split, temporal_split
+result_dir: results_final/classic_ml
 model_types: [logistic_regression, random_forest, xgboost]
 prediction_tasks:
   infection_bacteria:   {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
   infection_virus:      {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  death:                {fups: [0, 360, 720, 1080, 1800], horizons: [360, 720, 1080, 1800]}
-  graft_loss:           {fups: [0, 360, 720, 1080, 1800], horizons: [360, 720, 1080, 1800]}
+  # death:                {fups: [0, 360, 720, 1080, 1800], horizons: [360, 720, 1080, 1800]}
+  # graft_loss:           {fups: [0, 360, 720, 1080, 1800], horizons: [360, 720, 1080, 1800]}
 
 # Columns to exclude from input features
 ignore_columns:

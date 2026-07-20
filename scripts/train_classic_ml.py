@@ -213,12 +213,11 @@ def train_model_run(
         return
 
     # Setup output directory
-    # Logic: if "none", list the FUPs (e.g., 0090); if "valid"/"all", use as is 
     hrz_str = f"{horizon:04d}"
     if train_data_augment == "none":
-        fut_str = format_fup_string(train_fups) # e.g. "0090"
+        fut_str = format_fup_string(train_fups)
     else:
-        fut_str = train_data_augment # e.g. "valid" or "all"
+        fut_str = train_data_augment
     fuv_str = format_fup_string(valid_fups)
     task_subdir = f"hrz({hrz_str})_fut({fut_str})_fuv({fuv_str})"
     result_dir = Path(cfg['result_dir']) / cfg['data_split_type']
@@ -226,8 +225,11 @@ def train_model_run(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Train
+    target_us_ratio = None
     inv_tusr = cfg.get('target_undersampling_ratio')
-    if inv_tusr is not None: target_us_ratio = 1.0 / inv_tusr  # cf. transformers
+    if inv_tusr is not None: 
+        target_us_ratio = 1.0 / inv_tusr
+
     if use_optuna:
         trainer = OptunaTrainer(
             model_type=model_type,
@@ -238,7 +240,6 @@ def train_model_run(
         )
         trainer.optimize_and_train(X_train, y_train, X_val, y_val)
     else:
-        # Extract fixed values (like n_jobs: -1) and merge with chosen fixed_params
         base_params = {k: v for k, v in model_config.get('optuna_params', {}).items() if not isinstance(v, list)}
         final_params = {**base_params, **model_config.get('fixed_params', {})}
         trainer = BaselineTrainer(
@@ -255,29 +256,45 @@ def train_model_run(
         label_names=[label_key], 
         early_stopping_metric="roc_auc"
     )
-    all_predictions = {}  # to aggregate labels and model predictions
+    
+    # Initialize final_metrics and extraction caches
+    final_metrics = {}
+    all_test_predictions = {}
+    all_val_predictions = {}
 
     # Calibration (on aggregated validation set)
-    print("Fitting calibration...")
+    print("Fitting calibration and saving validation predictions...")
     evaluator.current_prefix = "val_all"
-    _ = trainer.evaluate(X_val, y_val, evaluator, prefix="val_all")
+    metrics_val_all = trainer.evaluate(X_val, y_val, evaluator, prefix="val_all")
+    final_metrics.update(metrics_val_all)
     
+    for key, array in evaluator.saved_labels_and_probs.items():
+        all_val_predictions[f"validation_all_{key}"] = array
+
+    # Process stratified validation sets
+    for fup in valid_fups:
+        X_val_fup, y_val_fup, _ = load_combined_data(
+            data_root, [fup], "validation.parquet",
+            label_key, ignore_cols, enforced_features=features,
+        )
+        if X_val_fup is not None and len(X_val_fup) > 0:
+            prefix = f"validation_fup_{fup:04d}"
+            metrics_fup_val = trainer.evaluate(X_val_fup, y_val_fup, evaluator, prefix=prefix)
+            final_metrics.update(metrics_fup_val)
+            for key, array in evaluator.saved_labels_and_probs.items():
+                all_val_predictions[f"{prefix}_{key}"] = array
+
     # Test all follow-up periods
-    final_metrics = {}
     X_test_all, y_test_all, _ = load_combined_data(
         data_root, valid_fups, "test.parquet",
         label_key, ignore_cols, enforced_features=features,
     )
     if X_test_all is not None:
         prefix = "test_all"
-        metrics_all = trainer.evaluate(
-            X_test_all, y_test_all, evaluator, prefix=prefix,
-        )
+        metrics_all = trainer.evaluate(X_test_all, y_test_all, evaluator, prefix=prefix)
         final_metrics.update(metrics_all)
-        
-        # Grab the cached label and prediction arrays
         for key, array in evaluator.saved_labels_and_probs.items():
-            all_predictions[f"{prefix}_{key}"] = array
+            all_test_predictions[f"{prefix}_{key}"] = array
 
     # Test per follow-up period (stratified)
     for fup in test_fups:
@@ -287,23 +304,23 @@ def train_model_run(
         )
         if X_test_fup is not None and len(X_test_fup) > 0:
             prefix = f"test_fup_{fup:04d}"
-            metrics_fup = trainer.evaluate(
-                X_test_fup, y_test_fup, evaluator, prefix=prefix
-            )
+            metrics_fup = trainer.evaluate(X_test_fup, y_test_fup, evaluator, prefix=prefix)
             final_metrics.update(metrics_fup)
-            
-            # Grab the cached arrays
             for key, array in evaluator.saved_labels_and_probs.items():
-                all_predictions[f"{prefix}_{key}"] = array
+                all_test_predictions[f"{prefix}_{key}"] = array
 
-    # Save metric results, label and predictions
-    preds_path = output_dir / "test_predictions.npz"
-    np.savez_compressed(preds_path, **all_predictions)
+    # Save validation arrays, test arrays, and JSON outputs separately
+    preds_val_path = output_dir / "val_predictions.npz"   
+    preds_test_path = output_dir / "test_predictions.npz" 
+    
+    np.savez_compressed(preds_val_path, **all_val_predictions)
+    np.savez_compressed(preds_test_path, **all_test_predictions)
+    
     json_path = output_dir / "test_results.json"
     with open(json_path, "w") as f:
         json.dump(final_metrics, f, indent=4)
     print(f"Results saved to {json_path}")
-
+    
 
 # ================
 # TRAINING CLASSES
