@@ -4,6 +4,8 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from datasets import Dataset, load_from_disk
+from scipy.special import logit
+from sklearn.linear_model import LogisticRegression
 
 
 def scan_all_fups(data_dir: Path) -> list[int]:
@@ -72,6 +74,66 @@ def extract_horizons_from_path(checkpoint_path: Path) -> list[int]:
         raise ValueError(f"Could not parse horizon keys from path layout string: {run_dir.name}")
     
     return [int(h) for h in match.group(1).split("-")] 
+
+
+def calibrate_array_pair(
+    y_val_true: np.ndarray, 
+    y_val_prob: np.ndarray, 
+    y_test_prob: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Fits a regularized Platt-Scaling (Logistic Regression) model on validation outputs
+    and transforms both validation and test probabilities.
+    """
+    if len(y_val_true) == 0 or len(np.unique(y_val_true)) < 2:
+        return y_val_prob, y_test_prob
+
+    # Clip probabilities to protect against logit numerical instability
+    val_probs = np.clip(y_val_prob, 1e-7, 1.0 - 1e-7)
+    test_probs = np.clip(y_test_prob, 1e-7, 1.0 - 1e-7)
+
+    X_val_logits = logit(val_probs).reshape(-1, 1)
+    X_test_logits = logit(test_probs).reshape(-1, 1)
+
+    # L2 Regularized Platt Scaling (C=1.0 prevents parameter explosion on imbalanced labels)
+    calibrator = LogisticRegression(C=1.0, penalty="l2", solver="lbfgs", random_state=42)
+    calibrator.fit(X_val_logits, y_val_true)
+
+    if hasattr(calibrator, "classes_"):
+        pos_indices = np.where(calibrator.classes_ == 1)[0]
+        if len(pos_indices) > 0:
+            pos_idx = pos_indices[0]
+            cal_val = calibrator.predict_proba(X_val_logits)[:, pos_idx]
+            cal_test = calibrator.predict_proba(X_test_logits)[:, pos_idx]
+            return cal_val, cal_test
+
+    return y_val_prob, y_test_prob
+
+
+def calibrate_dataframe_pair(
+    df_val: pd.DataFrame,
+    df_test: pd.DataFrame,
+    prob_col: str = "y_prob",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Convenience wrapper around calibrate_array_pair for pandas DataFrames.
+    """
+    if df_val.empty or df_test.empty:
+        return df_val, df_test
+
+    df_val_out = df_val.copy()
+    df_test_out = df_test.copy()
+
+    cal_val, cal_test = calibrate_array_pair(
+        y_val_true=df_val["y_true"].values,
+        y_val_prob=df_val[prob_col].values,
+        y_test_prob=df_test[prob_col].values,
+    )
+
+    df_val_out[prob_col] = cal_val
+    df_test_out[prob_col] = cal_test
+
+    return df_val_out, df_test_out
 
 
 def get_best_optuna_run(results_dir: Path, split_type: str, task_key: str) -> tuple[str, str]:

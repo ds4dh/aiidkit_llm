@@ -250,76 +250,27 @@ def train_model_run(
         )
         trainer.train(X_train, y_train)
     
-    # Evaluate
+    # Initialize custom clinical evaluation pipelines 
     evaluator = CustomEvaluator(
         do_clustering=False, 
         label_names=[label_key], 
         early_stopping_metric="roc_auc"
     )
     
-    # Initialize final_metrics and extraction caches
-    final_metrics = {}
-    all_test_predictions = {}
-    all_val_predictions = {}
-
-    # Calibration (on aggregated validation set)
-    print("Fitting calibration and saving validation predictions...")
-    evaluator.current_prefix = "val_all"
-    metrics_val_all = trainer.evaluate(X_val, y_val, evaluator, prefix="val_all")
-    final_metrics.update(metrics_val_all)
+    # Automatically scan data split root directories for all available follow-up tracking milestones
+    all_possible_fups = scan_all_fups(data_root)
     
-    for key, array in evaluator.saved_labels_and_probs.items():
-        all_val_predictions[f"validation_all_{key}"] = array
-
-    # Process stratified validation sets
-    for fup in valid_fups:
-        X_val_fup, y_val_fup, _ = load_combined_data(
-            data_root, [fup], "validation.parquet",
-            label_key, ignore_cols, enforced_features=features,
-        )
-        if X_val_fup is not None and len(X_val_fup) > 0:
-            prefix = f"validation_fup_{fup:04d}"
-            metrics_fup_val = trainer.evaluate(X_val_fup, y_val_fup, evaluator, prefix=prefix)
-            final_metrics.update(metrics_fup_val)
-            for key, array in evaluator.saved_labels_and_probs.items():
-                all_val_predictions[f"{prefix}_{key}"] = array
-
-    # Test all follow-up periods
-    X_test_all, y_test_all, _ = load_combined_data(
-        data_root, valid_fups, "test.parquet",
-        label_key, ignore_cols, enforced_features=features,
+    # Launch final dynamic head-to-head testing run
+    test_classic_ml_model(
+        trainer=trainer,
+        data_root=data_root,
+        all_possible_fups=all_possible_fups,
+        label_key=label_key,
+        ignore_cols=ignore_cols,
+        features=features,
+        evaluator=evaluator,
+        output_dir=output_dir
     )
-    if X_test_all is not None:
-        prefix = "test_all"
-        metrics_all = trainer.evaluate(X_test_all, y_test_all, evaluator, prefix=prefix)
-        final_metrics.update(metrics_all)
-        for key, array in evaluator.saved_labels_and_probs.items():
-            all_test_predictions[f"{prefix}_{key}"] = array
-
-    # Test per follow-up period (stratified)
-    for fup in test_fups:
-        X_test_fup, y_test_fup, _ = load_combined_data(
-            data_root, [fup], "test.parquet",
-            label_key, ignore_cols, enforced_features=features,
-        )
-        if X_test_fup is not None and len(X_test_fup) > 0:
-            prefix = f"test_fup_{fup:04d}"
-            metrics_fup = trainer.evaluate(X_test_fup, y_test_fup, evaluator, prefix=prefix)
-            final_metrics.update(metrics_fup)
-            for key, array in evaluator.saved_labels_and_probs.items():
-                all_test_predictions[f"{prefix}_{key}"] = array
-
-    # Save validation arrays, test arrays, and JSON outputs separately
-    preds_val_path = output_dir / "val_predictions.npz"   
-    preds_test_path = output_dir / "test_predictions.npz" 
-    
-    np.savez_compressed(preds_val_path, **all_val_predictions)
-    np.savez_compressed(preds_test_path, **all_test_predictions)
-    
-    json_path = output_dir / "test_results.json"
-    with open(json_path, "w") as f:
-        json.dump(final_metrics, f, indent=4)
-    print(f"Results saved to {json_path}")
     
 
 # ================
@@ -606,5 +557,78 @@ def build_model_pipeline(X_train, y_train, model_type, model_params, target_rati
     return ImbPipeline(steps)
 
 
+def test_classic_ml_model(
+    trainer,  # BaselineTrainer or OptunaTrainer instance
+    data_root: Path,
+    all_possible_fups: list[int],
+    label_key: str,
+    ignore_cols: set,
+    features: list,
+    evaluator: CustomEvaluator,
+    output_dir: Path
+):
+    """
+    Symmetrical scoring pipeline for baseline ML models. Sequentially extracts 
+    every frame on disk and logs matching validation/test matrix diagnostics.
+    """
+    from transformers.trainer_utils import EvalPrediction
+    from scipy.special import logit
+    
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Define execution matrices for validation and testing splits
+    split_configs = [
+        {"split_label": "validation", "filename": "validation.parquet", "json_name": "validation_results.json", "npz_name": "val_predictions.npz"},
+        {"split_label": "test",       "filename": "test.parquet",       "json_name": "test_results.json",       "npz_name": "test_predictions.npz"}
+    ]
+    
+    for config in split_configs:
+        # Check if the target source files actually exist on disk before launching the pass
+        file_check_sample = data_root / f"fup_{all_possible_fups[0]:04d}d" / config["filename"]
+        if not file_check_sample.exists():
+            print(f"    [Skip] Partition data missing for split: [{config['split_label']}]")
+            continue
+            
+        print(f"\n>>> Running classic ML final evaluation pass over all FUPs for: [{config['split_label'].upper()}]")
+        
+        final_metrics = {}
+        all_predictions = {}
+        
+        # Compute the global aggregated matrix cut across ALL discovered FUP folders
+        X_all, y_all, _ = load_combined_data(
+            data_root, all_possible_fups, config["filename"], label_key, ignore_cols, enforced_features=features
+        )
+        
+        if X_all is not None and len(X_all) > 0:
+            prefix = f"{config['split_label']}_all"
+            metrics_all = trainer.evaluate(X_all, y_all, evaluator, prefix=prefix)
+            final_metrics.update(metrics_all)
+            for key, array in evaluator.saved_labels_and_probs.items():
+                all_predictions[f"{prefix}_{key}"] = array
+                
+        # Iterate through individual stratified FUP time-steps sequentially
+        for fup in all_possible_fups:
+            X_fup, y_fup, _ = load_combined_data(
+                data_root, [fup], config["filename"], label_key, ignore_cols, enforced_features=features
+            )
+            if X_fup is not None and len(X_fup) > 0:
+                prefix = f"{config['split_label']}_fup_{fup:04d}"
+                metrics_fup = trainer.evaluate(X_fup, y_fup, evaluator, prefix=prefix)
+                final_metrics.update(metrics_fup)
+                for key, array in evaluator.saved_labels_and_probs.items():
+                    all_predictions[f"{prefix}_{key}"] = array
+                    
+        # Explicitly flush out evaluator memory storage arrays between passes
+        evaluator.saved_labels_and_probs = None
+        
+        # Write files out using mirrored path formats
+        np.savez_compressed(output_dir / config["npz_name"], **all_predictions)
+        with open(output_dir / config["json_name"], "w") as f:
+            json.dump(final_metrics, f, indent=4)
+            
+        print(f"    [SUCCESS] Saved {config['split_label']} classic ML arrays and stats to: {output_dir}")
+        
+        
 if __name__ == "__main__":
     main()

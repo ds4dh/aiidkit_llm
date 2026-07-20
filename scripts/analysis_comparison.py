@@ -1,6 +1,5 @@
 import re
 import argparse
-import hmac
 import hashlib
 import json
 import numpy as np
@@ -12,6 +11,7 @@ from sklearn.metrics import (
     average_precision_score, precision_recall_curve, roc_auc_score, roc_curve,
 )
 from statsmodels.stats.contingency_tables import mcnemar
+from scripts.script_utils import calibrate_array_pair, calibrate_dataframe_pair
 
 
 # ==========================================
@@ -28,7 +28,7 @@ parser.add_argument(
 parser.add_argument(
     "--target_recall",
     type=int,
-    default=80,
+    default=70,
     help="Target minimal recall used for tuning model decision threshold (e.g., 80).",
 )
 args = parser.parse_args()
@@ -39,7 +39,7 @@ TARGET_RECALL_ANCHOR = float(TARGET_RECALL_INPUT) / 100.0
 THRESHOLD_SUBFOLDER = f"rec{TARGET_RECALL_INPUT}"
 
 USE_CALIBRATED_PROBS = {
-    "Transformer": False,  # trained with CE, so no need of calibration
+    "Transformer": True,  # trained with CE, so no need of calibration?
     "logistic_regression": True,
     "random_forest": True,
     "xgboost": True,
@@ -154,8 +154,8 @@ def load_transformer_flat_dataframe(task: str, split: str, dataset_split: str, t
     flat_records = []
     fup_days = {int(fup_pattern.match(k).group(1)) for k in npz_data.files if fup_pattern.match(k)}
     
-    prob_suffix = "probs_cal" if USE_CALIBRATED_PROBS["Transformer"] else "probs"
-    prob_template = f"{prefix}fup_%04d_{prob_suffix}"
+    # Always pull raw uncalibrated probabilities for post-hoc analysis-time calibration
+    prob_template = f"{prefix}fup_%04d_probs"
     
     for fup_day in sorted(fup_days):
         if f"{prefix}fup_{fup_day:04d}_labels" not in npz_data.files:
@@ -230,8 +230,8 @@ def load_classic_ml_flat_dataframe(model_name: str, task: str, split: str, datas
     flat_records = []
     fup_days = {int(fup_pattern.match(k).group(1)) for k in npz_data.files if fup_pattern.match(k)}
     
-    prob_suffix = "probs_cal" if USE_CALIBRATED_PROBS[model_name] else "probs"
-    prob_template = f"{prefix}fup_%04d_{prob_suffix}"
+    # Always pull raw uncalibrated probabilities for post-hoc analysis-time calibration
+    prob_template = f"{prefix}fup_%04d_probs"
     
     for fup_day in sorted(fup_days):
         if f"{prefix}fup_{fup_day:04d}_labels" not in npz_data.files:
@@ -435,7 +435,18 @@ def process_split_strategy(task: str, split: str, horizon, analysis_dir: Path) -
     for m in CLASSIC_MODELS:
         val_dfs[m] = load_classic_ml_flat_dataframe(m, task, split, "validation", horizon)
         test_dfs[m] = load_classic_ml_flat_dataframe(m, task, split, "test", horizon)
-        
+    
+    # Global post-hoc calibration
+    if THRESHOLD_MODE == "global":
+        for m in ALL_MODELS:
+            if USE_CALIBRATED_PROBS.get(m, False) and not val_dfs[m].empty and not test_dfs[m].empty:
+                val_dfs[m], test_dfs[m] = calibrate_dataframe_pair(
+                    df_val=val_dfs[m], 
+                    df_test=test_dfs[m], 
+                    prob_col="y_prob",
+                )
+        print(f" [Post-Hoc Global Calibration] Calibrated requested models on full Validation split [{split}].")
+    
     if val_dfs["Transformer"].empty or test_dfs["Transformer"].empty:
         return None
 
@@ -456,8 +467,9 @@ def process_split_strategy(task: str, split: str, horizon, analysis_dir: Path) -
         mismatched_indices = val_check['y_true_TF'] != val_check[f'y_true_{MODEL_DISPLAY_MAP[m]}']
         count_mismatched_labels = np.sum(mismatched_indices)
         
-        # --- CONDENSED NOTIFICATION WARNING FOR SAMPLES REMOVED ---
+        # Notification warning for samples removed
         if len(tuning_dfs["Transformer"]) != len(val_check) or len(tuning_dfs[m]) != len(val_check) or count_mismatched_labels > 0:
+            
             # Isolate rows to drop from Transformer
             merged_keys = val_check[~mismatched_indices][['patientkey', 'time_step', 'horizon']]
             tf_dropped = tuning_dfs["Transformer"].merge(merged_keys, on=['patientkey', 'time_step', 'horizon'], how='left', indicator=True)
@@ -474,8 +486,8 @@ def process_split_strategy(task: str, split: str, horizon, analysis_dir: Path) -
             neg_dropped_ml = np.sum(ml_dropped_rows['y_true'] == 0)
             
             print(f" [Guard Warning] Sample misalignment detected on set [{THRESHOLD_TUNING_SET}] for split [{split}] vs model [{m}].")
-            print(f"   -> Transformer dropped total rows: {len(tf_dropped_rows)} (Positive cases: {pos_dropped_tf}, Negative cases: {neg_dropped_tf})")
-            print(f"   -> Baseline ({m}) dropped total rows: {len(ml_dropped_rows)} (Positive cases: {pos_dropped_ml}, Negative cases: {neg_dropped_ml})")
+            print(f"    -> Transformer dropped total rows: {len(tf_dropped_rows)} (Positive cases: {pos_dropped_tf}, Negative cases: {neg_dropped_tf})")
+            print(f"    -> Baseline ({m}) dropped total rows: {len(ml_dropped_rows)} (Positive cases: {pos_dropped_ml}, Negative cases: {neg_dropped_ml})")
             
             # Self-healing synchronization step
             clean_intersection_keys = val_check[~mismatched_indices][['patientkey', 'time_step', 'horizon']]
@@ -495,12 +507,6 @@ def process_split_strategy(task: str, split: str, horizon, analysis_dir: Path) -
             
     print(f" [Guard] Parity alignment verified and synchronized successfully on [{THRESHOLD_TUNING_SET}].")
         
-    df_merged = test_dfs["Transformer"][['patientkey', 'time_step', 'horizon', 'y_true', 'y_prob']].rename(columns={'y_prob': 'y_prob_Transformer'})
-    for m in CLASSIC_MODELS:
-        if test_dfs[m].empty: continue
-        m_sub = test_dfs[m][['patientkey', 'time_step', 'horizon', 'y_prob']].rename(columns={'y_prob': f'y_prob_{m}'})
-        df_merged = pd.merge(df_merged, m_sub, on=['patientkey', 'time_step', 'horizon'])
-        
     global_thresholds = {}
     if THRESHOLD_MODE == "global":
         for m in ALL_MODELS:
@@ -514,30 +520,56 @@ def process_split_strategy(task: str, split: str, horizon, analysis_dir: Path) -
     npz_save_payload = {}
     
     for w_idx, (window_name, (low, high)) in enumerate(CLINICAL_WINDOWS.items()):
-        sub_df = df_merged[
-            (df_merged['time_step'] >= low) & 
-            ((df_merged['time_step'] + df_merged['horizon']) <= high)
-        ].copy()
-        
-        if sub_df.empty:
+        # Slice test frame for evaluation
+        sub_test_df = test_dfs["Transformer"][
+            (test_dfs["Transformer"]['time_step'] >= low) & 
+            ((test_dfs["Transformer"]['time_step'] + test_dfs["Transformer"]['horizon']) <= high)
+        ][['patientkey', 'time_step', 'horizon', 'y_true', 'y_prob']].rename(columns={'y_prob': 'y_prob_Transformer'}).copy()
+
+        for m in CLASSIC_MODELS:
+            if test_dfs[m].empty: continue
+            m_sub = test_dfs[m][
+                (test_dfs[m]['time_step'] >= low) & 
+                ((test_dfs[m]['time_step'] + test_dfs[m]['horizon']) <= high)
+            ][['patientkey', 'time_step', 'horizon', 'y_prob']].rename(columns={'y_prob': f'y_prob_{m}'})
+            sub_test_df = pd.merge(sub_test_df, m_sub, on=['patientkey', 'time_step', 'horizon'])
+
+        if sub_test_df.empty:
             continue
             
-        y_true = sub_df['y_true'].values
-        window_record = {"Total evaluation frames": len(sub_df), "Primary analysis": "", "Post-hoc analysis": ""}
+        y_true = sub_test_df['y_true'].values
+        window_record = {"Total evaluation frames": len(sub_test_df), "Primary analysis": "", "Post-hoc analysis": ""}
         
         preds_map = {}
         thresholds_resolved = {}
         
         for m in ALL_MODELS:
+            # Extract window-specific tuning slice
+            val_m = tuning_dfs[m]
+            val_win_mask = (val_m['time_step'] >= low) & ((val_m['time_step'] + val_m['horizon']) <= high)
+            sub_val_df = val_m[val_win_mask].copy()
+
+            # Window-specific post-hoc calibration
+            if THRESHOLD_MODE != "global" and USE_CALIBRATED_PROBS.get(m, False):
+                if not sub_val_df.empty and not sub_test_df.empty:
+                    cal_win_val, cal_win_test = calibrate_array_pair(
+                        y_val_true=sub_val_df["y_true"].values,
+                        y_val_prob=sub_val_df["y_prob"].values,
+                        y_test_prob=sub_test_df[f"y_prob_{m}"].values
+                    )
+                    sub_val_df["y_prob"] = cal_win_val
+                    sub_test_df[f"y_prob_{m}"] = cal_win_test
+
+            # Threhsold resolution
             if THRESHOLD_MODE == "global":
                 thresholds_resolved[m] = global_thresholds[m]
             else:
                 thresholds_resolved[m] = calculate_strict_threshold(
-                    tuning_dfs[m], low, high, TARGET_RECALL_ANCHOR, 
-                    f"{m} ({split} - Tuning Set: {THRESHOLD_TUNING_SET.upper()})"
+                    sub_val_df, low, high, TARGET_RECALL_ANCHOR, 
+                    f"{m} [{window_name}] ({split} - Tuning Set: {THRESHOLD_TUNING_SET.upper()})"
                 )
                 
-            preds_map[m] = (sub_df[f'y_prob_{m}'].values >= thresholds_resolved[m]).astype(int)
+            preds_map[m] = (sub_test_df[f'y_prob_{m}'].values >= thresholds_resolved[m]).astype(int)
 
         for m in CLASSIC_MODELS:
             disp = MODEL_DISPLAY_MAP[m]
@@ -568,7 +600,7 @@ def process_split_strategy(task: str, split: str, horizon, analysis_dir: Path) -
             
             window_record[f"{metric_prefix} ({arrow})"] = ""
             for target_model in ALL_MODELS:
-                pe_val, formatted_str = bootstrap_metric_ci(sub_df, target_model, thresholds_resolved[target_model], metric_prefix)
+                pe_val, formatted_str = bootstrap_metric_ci(sub_test_df, target_model, thresholds_resolved[target_model], metric_prefix)
                 raw_estimates[target_model] = pe_val
                 string_outputs[target_model] = formatted_str
 
@@ -582,13 +614,13 @@ def process_split_strategy(task: str, split: str, horizon, analysis_dir: Path) -
                 window_record[f"  {metric_prefix} ({arrow}) ({disp})"] = final_cell_text
 
         split_results[window_name] = window_record
-        plotted_window_cache[window_name] = (sub_df, thresholds_resolved)
+        plotted_window_cache[window_name] = (sub_test_df, thresholds_resolved)
         
-        npz_save_payload[f"{window_name}_time_step"] = sub_df['time_step'].values
-        npz_save_payload[f"{window_name}_horizon"] = sub_df['horizon'].values
-        npz_save_payload[f"{window_name}_y_true"] = sub_df['y_true'].values
+        npz_save_payload[f"{window_name}_time_step"] = sub_test_df['time_step'].values
+        npz_save_payload[f"{window_name}_horizon"] = sub_test_df['horizon'].values
+        npz_save_payload[f"{window_name}_y_true"] = sub_test_df['y_true'].values
         for m in ALL_MODELS:
-            npz_save_payload[f"{window_name}_y_prob_{m}"] = sub_df[f'y_prob_{m}'].values
+            npz_save_payload[f"{window_name}_y_prob_{m}"] = sub_test_df[f'y_prob_{m}'].values
         npz_save_payload[f"{window_name}_thresh"] = thresholds_resolved
 
     if not split_results:

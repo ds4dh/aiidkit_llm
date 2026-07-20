@@ -40,7 +40,7 @@ def main():
     """
     Fine-tune models for the prediction tasks in the yaml file from the CLI config
     """
-    # Identify pretaining and finetuning directories
+    # Identify pretraining and finetuning directories
     train_data_augment = CLI_CFG["train_data_augment"]
     mlm_masking_rules = CLI_CFG["data_collator"]["mlm_masking_rules"]
     pretrain_run_id = "-".join([f"{k[0]}{int(v * 100):02d}" for k, v in mlm_masking_rules.items()])
@@ -83,10 +83,9 @@ def main():
                     )
                     finetune_disciminative_model(
                         task_key=task_key,
-                        horizons=horizons,  # can be int of list of int for multi-label classification
+                        horizons=horizons,  
                         fup_train=train_fups,
                         fup_valid=valid_fups,
-                        fup_test=train_fups,  # same as training (but not same patients)
                         train_data_augment=train_data_augment,
                         enforce_monotonicity=enforce_monotonicity,
                         run_id=finetune_run_id,
@@ -104,11 +103,10 @@ def main():
 
 
 def finetune_disciminative_model(
-    task_key: str,  # todo: include this as well in multi-label classification
+    task_key: str,
     horizons: list[int],
     fup_valid: list[int],
     fup_train: list[int],
-    fup_test: list[int],
     train_data_augment: str,
     enforce_monotonicity: bool,
     run_id: str = "default_run",
@@ -118,28 +116,34 @@ def finetune_disciminative_model(
     """
     Fine-tune one model on a specific infection prediction task
     """
-    # Load data for classification task, using vocabulary from pretraining phase
+    data_root_dir = Path(CLI_CFG["data_dir"]) / CLI_CFG["data_split_type"]
+    all_possible_fups = scan_all_fups(data_root_dir)
     label_keys = [f"label_{task_key}_{h:04d}d" for h in horizons]
+
+    # Load raw dataset and metadata
     dataset, _, vocab = load_hf_data_and_metadata(
-        data_dir=Path(CLI_CFG["data_dir"]) / CLI_CFG["data_split_type"],
-        fup_train=fup_train, fup_valid=fup_valid, fup_test=fup_test,
+        data_dir=data_root_dir,
+        fup_train=fup_train,
+        fup_valid=all_possible_fups,
+        fup_test=all_possible_fups,
         label_keys=label_keys,
         target_undersampling_ratio=CLI_CFG.get("target_undersampling_ratio", None),
         time_mapping=CLI_CFG["data_collator"]["time_mapping"],
         eav_mappings=CLI_CFG["data_collator"]["eav_mappings"],
     )
 
-    # Prepare datasets
-    for split in dataset.keys():  # first, add split info
+    # Prepare split identification flags across arrays
+    for split in dataset.keys():
         col_vals = [split] * len(dataset[split])
         dataset[split] = dataset[split].add_column("split", col_vals)
-    for split in dataset.keys():  # then only, filter out invalid samples
+    for split in dataset.keys():
         label_matrix = np.stack([dataset[split][k] for k in label_keys], axis=1)
         keep_mask = (label_matrix != -100).any(axis=1)
         dataset[split] = dataset[split].select(np.where(keep_mask)[0])
+        
+    # Prepare datasets used for training and runtime evaluation (selected FUPs)
     train_dataset = dataset["train"]
     eval_datasets = prepare_dataset_fup_dict(dataset["validation"], fup_valid)
-    test_datasets = prepare_dataset_fup_dict(dataset["test"], fup_test)
 
     # Auto-detect model sub-directory and best pre-trained model checkpoint
     pretrained_last_ckpt_dir = get_last_checkpoint(str(pretrained_dir))
@@ -153,17 +157,17 @@ def finetune_disciminative_model(
     CLI_CFG["model"]["enforce_monotonicity"] = enforce_monotonicity
     CLI_CFG["model"]["task"] = "classification"
     CLI_CFG["model"]["model_args"]["num_labels"] = len(label_keys)
-    CLI_CFG["model"]["model_args"]["problem_type"] = "multi_label_classification"  # if len(label_keys) > 1 else "binary_classification"
+    CLI_CFG["model"]["model_args"]["problem_type"] = "multi_label_classification"
 
-    # Initialize model, with weights from the pre-training stage
+    # Initialize model
     model = PatientEmbeddingModelFactory.from_pretrained(**CLI_CFG["model"])
-    max_pos_embeddings = model.config.max_position_embeddings  # pre-compute
+    max_pos_embeddings = model.config.max_position_embeddings  
     
     # Inject LoRA, if required
     if CLI_CFG.get("use_lora", False):
         peft_conf = CLI_CFG.get("lora_config", {})
         peft_config = LoraConfig(**peft_conf)
-        model = get_peft_model(model, peft_config)  # this hides max_pos_embeddings
+        model = get_peft_model(model, peft_config)
         print(">>> LoRA Enabled. Trainable parameters:")
         model.print_trainable_parameters()
 
@@ -192,16 +196,16 @@ def finetune_disciminative_model(
 
     # Training arguments, with the correct output directory
     fmt_fn = lambda x: "-".join(f"{i:04d}" for i in sorted(([x] if isinstance(x, int) else x or [])))    
-    fut_str = fmt_fn(fup_train) if train_data_augment == "none" else train_data_augment    # training: "fut(0090)" vs "fut(all)"
-    fuv_str = fmt_fn(fup_valid)  # validation: "fuv(0090)" vs "fuv(0000-0030...)"
-    hrz_str = fmt_fn(horizons)  # horizons: "hrz(0030-0090)"
+    fut_str = fmt_fn(fup_train) if train_data_augment == "none" else train_data_augment    
+    fuv_str = fmt_fn(fup_valid)  
+    hrz_str = fmt_fn(horizons)  
     task_subdir = f"hrz({hrz_str})_fut({fut_str})_fuv({fuv_str})"
     run_subdir = str(Path(task_key) / task_subdir)
     ft_cfg["output_dir"] = str(finetuning_dir / run_subdir)
     if cli_args.silent: ft_cfg["report_to"] = "none"
     ft_args = TrainingArguments(**ft_cfg)
 
-    # Re-initialize a wandb run within the same worspace
+    # Re-initialize a wandb run within the same workspace
     use_wandb = (not cli_args.silent) and (CLI_CFG.get("finetuner", {}).get("report_to") == "wandb")
     if use_wandb:
         workspace = Path(__file__).stem
@@ -212,7 +216,7 @@ def finetune_disciminative_model(
     trainer = PrefixAwareTrainer(
         model=model,
         train_dataset=train_dataset, 
-        eval_dataset=eval_datasets,  # dictionary with different follow-up periods
+        eval_dataset=eval_datasets,
         args=ft_args,
         data_collator=ft_collator,
         compute_loss_func=loss_func,
@@ -222,27 +226,25 @@ def finetune_disciminative_model(
     )
     trainer.remove_callback(PrinterCallback)
 
-    # Fine-tune the model and reset wandb for the next run
-    trainer.train()  # best model saved automatically
+    # Fine-tune the model
+    trainer.train()  
     
-    # Test best model, using calibration from validation set
-    if "test" in dataset:
-        output_path = Path(ft_cfg["output_dir"]) / "test_results.json"
-        test_model(trainer, eval_datasets, test_datasets, output_path)
-        print(f"Final test results saved to {output_path}")
+    # Post-hoc evaluation over ALL un-truncated elements
+    test_model(
+        trainer=trainer,
+        dataset_dict=dataset, # Contains the full, un-truncated data splits
+        all_possible_fups=all_possible_fups,
+        output_dir=Path(ft_cfg["output_dir"]),
+    )
 
     # Reset wandb and clean up CUDA memory for the next run
     if use_wandb: wandb.finish()
     del dataset, model, trainer
-    gc.collect()  # ensure deleted objects are collected by the garbage collector
-    torch.cuda.empty_cache()  # free deleted local objects from CUDA memory 
+    gc.collect()  
+    torch.cuda.empty_cache()  
 
 
 class PrefixAwareTrainer(Trainer):
-    """
-    Inject the current prefix (e.g., "eval_fup_0030") into the evaluator, to
-    access it from the custom evaluator, which allows to have stratified plots
-    """
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
         if hasattr(self.compute_metrics, "current_prefix"):
             self.compute_metrics.current_prefix = metric_key_prefix
@@ -252,66 +254,71 @@ class PrefixAwareTrainer(Trainer):
 
 def test_model(
     trainer: Trainer,
-    eval_datasets: dict[str, Dataset],
-    test_datasets: dict[str, Dataset],
-    output_path: str,
+    dataset_dict: dict,  
+    all_possible_fups: list[int],
+    output_dir: Path,       
 ):
     """
-    Aggregates evaluation on all subsplits of both the validation and test sets
-    and outputs separate prediction matrices for metric threshold tuning.
-    """
-    final_metrics = {}
-    all_test_predictions = {}
-    all_val_predictions = {}
-    output_dir = Path(output_path).parent
-
-    # Evaluate using validation set for later threshold tuning maps
-    print("\n>>> Collecting validation split predictions for threshold tuning...")
-    val_all = eval_datasets.pop("all")
-    results_val_all = trainer.evaluate(val_all, metric_key_prefix="val_all")
-    final_metrics.update(results_val_all)
+    Aggregates post-training evaluation across ALL discovered FUP time-steps
+    on both the validation and test splits, saving symmetrical JSON and NPZ structures.
+    """    
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     
-    for key, array in trainer.compute_metrics.saved_labels_and_probs.items():
-        all_val_predictions[f"validation_all_{key}"] = array
-
-    for fup_key, fup_val_dataset in eval_datasets.items():
-        prefix = f"validation_{fup_key}"
-        results_val = trainer.evaluate(fup_val_dataset, metric_key_prefix=prefix)
-        final_metrics.update(results_val)
-        for key, array in trainer.compute_metrics.saved_labels_and_probs.items():
-            all_val_predictions[f"{prefix}_{key}"] = array
-
-    # Evaluate using testing set, for final evaluation benchmarks
-    print("\n>>> Collecting test split predictions...")
-    test_all = test_datasets.pop("all")
-    results_all = trainer.evaluate(test_all, metric_key_prefix="test_all")
-    final_metrics.update(results_all)
+    val_fup_datasets = prepare_dataset_fup_dict(dataset_dict["validation"], all_possible_fups)
+    split_configs = []
     
-    for key, array in trainer.compute_metrics.saved_labels_and_probs.items():
-        all_test_predictions[f"test_all_{key}"] = array
-
-    for fup_key, fup_test_dataset in test_datasets.items():
-        prefix = f"test_{fup_key}"
-        results_test = trainer.evaluate(fup_test_dataset, metric_key_prefix=prefix)
-        final_metrics.update(results_test)
+    if "validation" in dataset_dict:
+        split_configs.append({
+            "split_label": "validation", 
+            "datasets": val_fup_datasets, 
+            "json_name": "validation_results.json", 
+            "npz_name": "validation_probs.npz"
+        })
+    if "test" in dataset_dict:
+        test_fup_datasets = prepare_dataset_fup_dict(dataset_dict["test"], all_possible_fups)
+        split_configs.append({
+            "split_label": "test",       
+            "datasets": test_fup_datasets, 
+            "json_name": "test_results.json",       
+            "npz_name": "test_probs.npz"
+        })
+    
+    for config in split_configs:
+        print(f"\n>>> Running final unified scoring pass over all FUPs for: [{config['split_label'].upper()}]")        
+        final_metrics = {}
+        all_predictions = {}
+        
+        # Process the aggregated global view first
+        mega_ds = config["datasets"].pop("all")
+        results_mega = trainer.evaluate(mega_ds, metric_key_prefix=f"{config['split_label']}_all")
+        final_metrics.update(results_mega)
         for key, array in trainer.compute_metrics.saved_labels_and_probs.items():
-            all_test_predictions[f"{prefix}_{key}"] = array
-
-    # Compress and write to disk
-    val_preds_path = output_dir / "val_probs.npz"
-    test_preds_path = output_dir / "test_probs.npz"
-    np.savez_compressed(val_preds_path, **all_val_predictions)
-    np.savez_compressed(test_preds_path, **all_test_predictions)
-    with open(output_path, "w") as f:
-        json.dump(final_metrics, f, indent=4)
+            all_predictions[f"{config['split_label']}_all_{key}"] = array
+            
+        # Process individual FUP segments sequentially
+        for fup_key, fup_dataset in config["datasets"].items():
+            prefix = f"{config['split_label']}_{fup_key}"
+            results_fup = trainer.evaluate(fup_dataset, metric_key_prefix=prefix)
+            final_metrics.update(results_fup)
+            
+            for key, array in trainer.compute_metrics.saved_labels_and_probs.items():
+                all_predictions[f"{prefix}_{key}"] = array
+                
+            trainer.compute_metrics.saved_labels_and_probs = None
+            torch.cuda.empty_cache()
+            
+        # Write outputs to disk
+        np.savez_compressed(output_dir / config["npz_name"], **all_predictions)
+        with open(output_dir / config["json_name"], "w") as f:
+            json.dump(final_metrics, f, indent=4)
+            
+        print(f"    [SUCCESS] Saved {config['split_label']} arrays and stats under: {output_dir}")
 
 
 def preprocess_logits_for_metrics(logits, labels):
-    """
-    Minimizes memory usage by keeping only the logits needed for metrics.
-    """
     if isinstance(logits, tuple):
-        return logits[0]  # depends on the model
+        return logits[0]  
     return logits
 
 

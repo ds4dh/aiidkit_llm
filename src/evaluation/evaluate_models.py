@@ -471,14 +471,15 @@ class BaseEmbeddingEvaluatorForClassification:
     
     def _apply_calibration_strategy(self, labels, probs):
         """
-        Calibrate model output probabilities using Platt scaling (logistic regression)
+        Calibrate model output probabilities using regularized Platt scaling (logistic regression).
         """
-        is_train = "test" not in self.current_prefix
+        is_train = "test" not in self.current_prefix and "validation" not in self.current_prefix
         num_labels = labels.shape[1]
 
+        # Initialize with L2 Regularization (C=1.0) instead of penalty=None
         if is_train and self.calibrators is None:
             self.calibrators = [
-                LogisticRegression(penalty=None, solver='lbfgs') 
+                LogisticRegression(C=1.0, penalty='l2', solver='lbfgs') 
                 for _ in range(num_labels)
             ]
         
@@ -499,7 +500,7 @@ class BaseEmbeddingEvaluatorForClassification:
             logits_i = logit(safe_probs).reshape(-1, 1)
 
             try:
-                # Fit only if in training mode and we have both positive and negative samples
+                # Only fit when explicitly in training mode
                 if is_train and len(np.unique(valid_labels)) > 1:
                     self.calibrators[i].fit(logits_i, valid_labels)
                 
@@ -510,44 +511,19 @@ class BaseEmbeddingEvaluatorForClassification:
                         probs_cal[valid_mask, i] = self.calibrators[i].predict_proba(logits_i)[:, pos_idx[0]]
                     else:
                         probs_cal[valid_mask, i] = 0.0
+                
+                # Model not fitted yet (e.g., first evaluation step had no valid positive labels)
                 else:
-                    # Model not fitted yet (e.g., first evaluation step had no valid positive labels)
                     probs_cal[valid_mask, i] = probs[valid_mask, i]
                     
+            # Fallback to raw probabilities if anything fails
             except Exception as e:
-                # Fallback to raw probabilities if anything fails
                 probs_cal[valid_mask, i] = probs[valid_mask, i]
                 
             # Keep raw probabilities for the -100 tokens (they get ignored in metrics anyway)
             probs_cal[~valid_mask, i] = probs[~valid_mask, i]
         
         return np.clip(probs_cal, 0.0, 1.0)
-
-    # def _apply_calibration_strategy(self, labels, probs):
-    #     """Calibrate model output probabilities given outcome probabilities."""
-    #     is_train = "test" not in self.current_prefix
-    #     num_labels = labels.shape[1]
-
-    #     # Init list if needed
-    #     if is_train and self.calibrators is None:
-    #         self.calibrators = [
-    #             IsotonicRegression(out_of_bounds="clip", y_min=0, y_max=1) 
-    #             for _ in range(num_labels)
-    #         ]
-        
-    #     if self.calibrators is None:
-    #         return probs
-
-    #     probs_cal = np.zeros_like(probs)
-    #     for i in range(num_labels):
-    #         try:
-    #             if is_train:
-    #                 self.calibrators[i].fit(probs[:, i], labels[:, i])
-    #             probs_cal[:, i] = self.calibrators[i].transform(probs[:, i])
-    #         except Exception:
-    #             probs_cal[:, i] = probs[:, i]  # fallback
-        
-    #     return np.clip(probs_cal, 0.0, 1.0)
 
     def _compute_single_label_metrics(self, y_true, y_prob, y_cal):
         """
