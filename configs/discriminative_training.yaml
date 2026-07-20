@@ -25,8 +25,8 @@ early_stopping_metric: roc_auc    # metric to use for early stopping (per label,
 prediction_tasks:                 # horizon elements can be lists (multi-label) or integers / singletons (binary)
   infection_bacteria: {fups: [0, 30, 60, 90, 180, 360], horizons: [[30, 60, 90]]}
   infection_virus:    {fups: [0, 30, 60, 90, 180, 360], horizons: [[30, 60, 90]]}
-  death:              {fups: [0, 360, 720, 1080, 1800], horizons: [[360, 720, 1080, 1800]]}
-  graft_loss:         {fups: [0, 360, 720, 1080, 1800], horizons: [[360, 720, 1080, 1800]]}
+  # death:              {fups: [0, 360, 720, 1080, 1800], horizons: [[360, 720, 1080, 1800]]}
+  # graft_loss:         {fups: [0, 360, 720, 1080, 1800], horizons: [[360, 720, 1080, 1800]]}
 
 # Arguments for optuna run (perform both pretraining and finetuning for different hyper-parameters)
 optuna:
