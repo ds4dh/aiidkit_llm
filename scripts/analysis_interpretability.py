@@ -38,21 +38,21 @@ GENERATE_SANITIZE_PLOTS = False
 # Run configuration
 RESULTS_DIR = Path("results_final")
 TRANSFORMER_BASE_DIR = RESULTS_DIR / "transformer"
-OUTPUT_DIR_BASE_NAME = RESULTS_DIR / Path("analysis/interpretability")
-DATA_DIR = Path("/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6/teav")
+OUTPUT_DIR_BASE_NAME = RESULTS_DIR / "analysis" / "interpretability"
+DATA_DIR = Path("/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6_old/teav")
 CONFIG_PATH = Path("configs/discriminative_training.yaml")
 FROM_OPTUNA = "optuna" in TRANSFORMER_BASE_DIR.name
-DATA_SPLIT_TYPE = "temporal_split"
-PLOT_ONLY = True  # run downstream plots directly from cache
+DATA_SPLIT_TYPE = "random_split"  # "temporal_split"
+PLOT_ONLY = False  # run downstream plots directly from cache
 MAX_LEGEND_VALUES_TO_SHOW = 5  # threshold capping distinct legend item limits
 
 # Captum configuration
 TOP_K = 15
 MIN_FREQ = 20
-MAX_DELTA = 0.10  # 0.05
+MAX_DELTA = 0.10
 AGG_METHOD = "mean"
 NUM_CAPTUM_SAMPLES = 1000
-NUM_CAPTUM_STEPS = 100
+NUM_CAPTUM_STEPS = 200
 
 # -------------------------------------------------------------------------------------------------------
 # THEORETICAL INTERPRETABILITY FRAMEWORK CONSTANTS
@@ -62,29 +62,30 @@ NUM_CAPTUM_STEPS = 100
 # -------------------------------------------------------------------------------------------------------
 ATTRIBUTIONS_TO_VALUES_ONLY = True
 USE_TIME_NEUTRAL_BASELINE = True
-OUTPUT_DIR = f"{OUTPUT_DIR_BASE_NAME}_{NUM_CAPTUM_STEPS}-steps_{int(100 * MAX_DELTA):03d}-delta_{ATTRIBUTIONS_TO_VALUES_ONLY}-values"
+OUTPUT_SUBDIR = f"{NUM_CAPTUM_STEPS}-steps_{int(100 * MAX_DELTA):03d}-delta_{ATTRIBUTIONS_TO_VALUES_ONLY}-values"
+OUTPUT_DIR = OUTPUT_DIR_BASE_NAME / OUTPUT_SUBDIR
 
 # Task configuration
 TASK_CONFIG = {
-    "bacteria_perioperative": {  
-        "task": "infection_bacteria", 
+    "bacteria_perioperative": {
+        "task": "infection_bacteria",
         "horizon": 30, "fup_min": 0, "fup_max": 0, "fup_step": 30,
     },
-    "bacteria_opportunistic": {  
+    "bacteria_opportunistic": {
         "task": "infection_bacteria",
         "horizon": 30, "fup_min": 30, "fup_max": 150, "fup_step": 30,
     },
-    "bacteria_maintenance": {  
+    "bacteria_maintenance": {
         "task": "infection_bacteria",
         "horizon": 30, "fup_min": 180, "fup_max": 330, "fup_step": 30,
     },
-    "bacteria_long_term": {  
+    "bacteria_long_term": {
         "task": "infection_bacteria",
-        "horizon": 30, "fup_min": 360, "fup_max": 690, "fup_step": 30,
+        "horizon": 30, "fup_min": 360, "fup_max": 1050, "fup_step": 30,
     },
-    "bacteria_very_long_term": {  
+    "bacteria_very_long_term": {
         "task": "infection_bacteria",
-        "horizon": 30, "fup_min": 720, "fup_max": 1770, "fup_step": 30,
+        "horizon": 30, "fup_min": 1080, "fup_max": 3570, "fup_step": 30,
     },
 }
 
@@ -224,8 +225,7 @@ def _score_label() -> str:
 
 def main():
     with open(CONFIG_PATH, 'r') as f:  config = yaml.safe_load(f)
-    output_dir = Path(OUTPUT_DIR)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     for config_name, task_params in TASK_CONFIG.items():
         task_key = task_params["task"]
@@ -268,7 +268,7 @@ def main():
 
         print("\n>>> Loading dataset...")
         data_dir_split = DATA_DIR / DATA_SPLIT_TYPE
-        sanity_dir = output_dir / "sanity_check" if GENERATE_SANITIZE_PLOTS else None
+        sanity_dir = OUTPUT_DIR / "sanity_check" if GENERATE_SANITIZE_PLOTS else None
         
         dataset, _, vocab = load_hf_data_and_metadata(
             data_dir=data_dir_split,
@@ -330,7 +330,7 @@ def main():
 
         label_name = f"{config_name}_hrz{hrz:04d}d_fup{fup_min}-{fup_max}-{fup_step}".lower()
         run_captum_analysis(
-            model=model, dataset=test_ds, collator=collator, output_dir=output_dir,
+            model=model, dataset=test_ds, collator=collator, OUTPUT_DIR=OUTPUT_DIR,
             label_name=label_name, fup_max=fup_max, indices=selected_idx, vocab=vocab,
             device="cuda", target_idx=target_idx, max_delta=MAX_DELTA, top_k=TOP_K,
             plot_only=PLOT_ONLY, agg_method=AGG_METHOD, min_freq=MIN_FREQ,
@@ -340,7 +340,7 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
 
-    print(f"\nSuccess! All results can be found in {output_dir}")
+    print(f"\nSuccess! All results can be found in {OUTPUT_DIR}")
 
 
 class ForwardWrapperForCaptum(torch.nn.Module):
@@ -493,9 +493,9 @@ def extract_attributions(
     return df
 
 
-def plot_feature_importance(df, output_dir, label_name, top_k=20, min_freq=50, agg_method="mean"):
+def plot_feature_importance(df, OUTPUT_DIR, label_name, top_k=20, min_freq=50, agg_method="mean"):
     if df.empty: return
-    csv_path = output_dir / f"drivers_bar_{label_name}_{agg_method}.csv"
+    csv_path = OUTPUT_DIR / f"drivers_bar_{label_name}_{agg_method}.csv"
 
     df = df.copy()
     df["Feature_Value"] = df["Feature"] + ": " + df["Value"].astype(str)
@@ -571,11 +571,11 @@ def plot_feature_importance(df, output_dir, label_name, top_k=20, min_freq=50, a
     ax2.spines['bottom'].set_visible(False)
 
     plt.tight_layout()
-    plt.savefig(output_dir / f"drivers_bar_{label_name}.png", dpi=300, bbox_inches='tight')
+    plt.savefig(OUTPUT_DIR / f"drivers_bar_{label_name}.png", dpi=300, bbox_inches='tight')
     plt.close(fig)
 
 
-def plot_frequency_vs_impact(df, output_dir, label_name, min_freq=50):
+def plot_frequency_vs_impact(df, OUTPUT_DIR, label_name, min_freq=50):
     if df.empty: return
     
     stats = df.groupby("Feature").agg(
@@ -635,7 +635,7 @@ def plot_frequency_vs_impact(df, output_dir, label_name, min_freq=50):
     plt.ylabel(_score_label(), fontsize=12)
     plt.grid(True, which="both", linestyle="--", alpha=0.2)
     plt.tight_layout()
-    plt.savefig(output_dir / f"drivers_volcano_{label_name}.png", dpi=300)
+    plt.savefig(OUTPUT_DIR / f"drivers_volcano_{label_name}.png", dpi=300)
     plt.close()
 
 
@@ -649,10 +649,10 @@ def get_deterministic_color_with_context(feature_name: str, string_value: str, p
 
 
 def plot_feature_value_impact(
-    df, output_dir, label_name, fup_max, max_delta=None, top_k=20, min_freq=50,
+    df, OUTPUT_DIR, label_name, fup_max, max_delta=None, top_k=20, min_freq=50,
 ):
     if df.empty: return
-    csv_path = output_dir / f"drivers_shap_{label_name}.csv"
+    csv_path = OUTPUT_DIR / f"drivers_shap_{label_name}.csv"
 
     counts = df["Feature"].value_counts()
     valid = counts[counts >= min_freq].index
@@ -919,7 +919,7 @@ def plot_feature_value_impact(
         anchored_box.set_clip_on(False)
         ax.add_artist(anchored_box)
     
-    plt.savefig(output_dir / f"drivers_shap_{label_name}.png", dpi=300)
+    plt.savefig(OUTPUT_DIR / f"drivers_shap_{label_name}.png", dpi=300)
     plt.close()
 
 
@@ -966,12 +966,12 @@ def compute_feature_enrichment(target_indices, background_indices, dataset, top_
 
 
 def run_captum_analysis(
-    model, dataset, collator, vocab, device, output_dir, label_name,
+    model, dataset, collator, vocab, device, OUTPUT_DIR, label_name,
     fup_max, indices, target_idx=0, entity_filter=None, max_delta=None,
     top_k=20, min_freq=20, plot_only=None, agg_method="mean",
 ):
     print(f" -> Extracting attributions for {len(indices)} samples...")
-    csv_path = output_dir / f"attributions_analysis_{label_name}.csv"
+    csv_path = OUTPUT_DIR / f"attributions_analysis_{label_name}.csv"
     
     df = extract_attributions(
         model, dataset, collator, indices, vocab, device,
@@ -987,16 +987,16 @@ def run_captum_analysis(
 
     print(" -> Generating Feature Importance Bar Chart...")
     plot_feature_importance(
-        df, output_dir, label_name, top_k=top_k,
+        df, OUTPUT_DIR, label_name, top_k=top_k,
         min_freq=min_freq, agg_method=agg_method,
     )
 
     print(" -> Generating Volcano Plot (Frequency vs Impact)...")
-    plot_frequency_vs_impact(df, output_dir, label_name, min_freq=min_freq)
+    plot_frequency_vs_impact(df, OUTPUT_DIR, label_name, min_freq=min_freq)
 
     print(" -> Generating Detailed Strip Plot...")
     plot_feature_value_impact(
-        df, output_dir, label_name, fup_max,
+        df, OUTPUT_DIR, label_name, fup_max,
         max_delta=max_delta, top_k=top_k, min_freq=min_freq
     )
 

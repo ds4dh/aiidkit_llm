@@ -6,6 +6,7 @@ from pathlib import Path
 from datasets import Dataset, load_from_disk
 from scipy.special import logit
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import average_precision_score
 
 
 def scan_all_fups(data_dir: Path) -> list[int]:
@@ -74,6 +75,41 @@ def extract_horizons_from_path(checkpoint_path: Path) -> list[int]:
         raise ValueError(f"Could not parse horizon keys from path layout string: {run_dir.name}")
     
     return [int(h) for h in match.group(1).split("-")] 
+
+
+def paired_bootstrap_pr_auc_pvalue(
+    y_true: np.ndarray, 
+    p_tf: np.ndarray, 
+    p_base: np.ndarray, 
+    n_bootstraps: int = 1000, 
+    seed: int = 42
+) -> float:
+    """
+    Computes a one-tailed paired bootstrap p-value testing if Transformer PR-AUC
+    is significantly higher than a baseline model's PR-AUC on the exact same test samples.
+    """
+    if len(np.unique(y_true)) < 2:
+        return np.nan
+        
+    n_samples = len(y_true)
+    rng = np.random.default_rng(seed)
+    boot_indices = rng.choice(n_samples, size=(n_bootstraps, n_samples), replace=True)
+    
+    diffs = []
+    for idx in boot_indices:
+        yt_b = y_true[idx]
+        if len(np.unique(yt_b)) < 2:
+            continue
+        auc_tf = average_precision_score(yt_b, p_tf[idx])
+        auc_base = average_precision_score(yt_b, p_base[idx])
+        diffs.append(auc_tf - auc_base)
+        
+    if not diffs:
+        return np.nan
+        
+    # Empirical p-value for the hypothesis: Transformer PR-AUC > Baseline PR-AUC
+    p_value = np.mean(np.array(diffs) <= 0)
+    return float(p_value)
 
 
 def calibrate_array_pair(

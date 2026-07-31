@@ -12,37 +12,38 @@ from pathlib import Path
 from torch.utils.data import DataLoader
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.lines import Line2D
-from scipy.stats import fisher_exact, chi2_contingency
+from sklearn.calibration import calibration_curve
+from scipy.stats import fisher_exact
 from lifelines import KaplanMeierFitter
-from lifelines.statistics import logrank_test, multivariate_logrank_test
+from lifelines.statistics import multivariate_logrank_test
 from transformers.trainer_utils import get_last_checkpoint
 
 from src.model.patient_embedder import PatientEmbeddingModelFactory, PatientDataCollatorForClassification
 from src.evaluation.evaluate_models import UMAP_HDBSCAN_Clusterer, ModelInterpreter
 from src.data.patient_dataset import load_hf_data_and_metadata
 from scripts.analysis_interpretability import find_best_checkpoint, extract_horizons_from_path
-from scripts.script_utils import scan_all_fups, get_best_optuna_run
+from scripts.script_utils import scan_all_fups, get_best_optuna_run, calibrate_array_pair
 
 # Model selection
 RESULTS_DIR = Path("results_final")
 TRANSFORMER_BASE_DIR = RESULTS_DIR / "transformer"
 OUTPUT_DIR = RESULTS_DIR / Path("analysis/stratification")
 CONFIG_PATH = Path("configs/discriminative_training.yaml") 
-DATA_DIR = Path("/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6/teav")
+DATA_DIR = Path("/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6_old/teav")
 
 # Configuration
 FROM_OPTUNA = "optuna" in TRANSFORMER_BASE_DIR.name
 DATA_SPLIT_TYPE = "temporal_split"
 TASKS = [
     "infection_bacteria",
-    "infection_virus",
-    "death",
-    "graft_loss",
+    # "infection_virus",
+    # "death",
+    # "graft_loss",
 ]
-MAX_FUP = 3600                  
+MAX_FUP = 3600
 if DATA_SPLIT_TYPE == "temporal_split":
     MAX_FUP = 2400
-BASE_FUP_FOR_PREDICTION = 90   
+BASE_FUP_FOR_PREDICTION = 90
 PREDICTION_HORIZON = 30
 SAFE_NUM_PROC = 4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -50,14 +51,14 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # Fontsize scaling configurations
 FS_SCALE = 1.3
 plt.rcParams.update({
-    'font.size': 14 * FS_SCALE,              
-    'axes.labelsize': 17 * FS_SCALE,         
-    'axes.titlesize': 16 * FS_SCALE,         
-    'xtick.labelsize': 14 * FS_SCALE,        
-    'ytick.labelsize': 14 * FS_SCALE,        
-    'legend.fontsize': 13 * FS_SCALE,        
-    'legend.title_fontsize': 14 * FS_SCALE,  
-    'figure.titlesize': 22 * FS_SCALE,       
+    'font.size': 14 * FS_SCALE,
+    'axes.labelsize': 17 * FS_SCALE,
+    'axes.titlesize': 16 * FS_SCALE,
+    'xtick.labelsize': 14 * FS_SCALE,
+    'ytick.labelsize': 14 * FS_SCALE,
+    'legend.fontsize': 13 * FS_SCALE,
+    'legend.title_fontsize': 14 * FS_SCALE,
+    'figure.titlesize': 22 * FS_SCALE,
 })
 
 
@@ -112,8 +113,10 @@ def main():
             fup_test=all_fups, 
             label_keys=all_required_labels,
         )
-        test_ds = dataset["test"]
-        test_ds = test_ds.add_column("split", ["test"] * len(test_ds))
+        
+        # Tag dataset splits
+        val_ds = dataset["validation"].add_column("split", ["validation"] * len(dataset["validation"]))
+        test_ds = dataset["test"].add_column("split", ["test"] * len(dataset["test"]))
 
         model_cfg_base = config["model"].copy()
         if "model_args" not in model_cfg_base:
@@ -131,11 +134,16 @@ def main():
             max_position_embeddings=config["data_collator"].get("max_position_embeddings", 512)
         )
 
+        # Prepare test dataloader at base FUP
         base_test_ds = test_ds.filter(lambda x: x["fup"] == BASE_FUP_FOR_PREDICTION)
         if len(base_test_ds) == 0:
             print(f"[Error] No patients found at FUP {BASE_FUP_FOR_PREDICTION}")
             continue
-        loader = DataLoader(base_test_ds, batch_size=32, collate_fn=collator.torch_call)
+        loader_test = DataLoader(base_test_ds, batch_size=32, collate_fn=collator.torch_call)
+
+        # Prepare validation dataloader at base FUP for post-hoc calibration
+        base_val_ds = val_ds.filter(lambda x: x["fup"] == BASE_FUP_FOR_PREDICTION)
+        loader_val = DataLoader(base_val_ds, batch_size=32, collate_fn=collator.torch_call) if len(base_val_ds) > 0 else None
 
         print(f"\nInitializing pre-trained model from {Path(checkpoint_path_pt).name}...")
         pt_model_cfg = model_cfg_base.copy()
@@ -151,7 +159,7 @@ def main():
         interpreter_pt = ModelInterpreter(model_pt, device=DEVICE)
         
         print("Extracting pre-trained embeddings...")
-        res_pt = interpreter_pt.get_embeddings_and_predictions(loader, extract_logits=False)
+        res_pt = interpreter_pt.get_embeddings_and_predictions(loader_test, extract_logits=False)
         embeddings_pt = res_pt["embeddings"]
         
         del model_pt, interpreter_pt
@@ -172,10 +180,40 @@ def main():
         interpreter_ft = ModelInterpreter(model_ft, device=DEVICE)
         
         print("Extracting fine-tuned embeddings and predictions...")
-        res_ft = interpreter_ft.get_embeddings_and_predictions(loader)
+        res_ft = interpreter_ft.get_embeddings_and_predictions(loader_test)
         embeddings_ft = res_ft["embeddings"]
-        probs_ft = 1 / (1 + np.exp(-res_ft["logits"][:, target_idx]))  
+        
+        # Define y_test_true here
+        y_test_true = res_ft["labels"][:, target_idx]
+        raw_probs_test = 1 / (1 + np.exp(-res_ft["logits"][:, target_idx]))  
         patient_ids = base_test_ds["patientid"]
+
+        # Post-hoc calibration using validation set at base FUP
+        if loader_val is not None:
+            print("Extracting validation predictions for probability calibration...")
+            res_val = interpreter_ft.get_embeddings_and_predictions(loader_val)
+            y_val_true = res_val["labels"][:, target_idx]
+            raw_probs_val = 1 / (1 + np.exp(-res_val["logits"][:, target_idx]))
+            
+            _, probs_ft = calibrate_array_pair(
+                y_val_true=y_val_true,
+                y_val_prob=raw_probs_val,
+                y_test_prob=raw_probs_test,
+            )
+            print("Post-hoc Platt scaling calibration applied successfully.")
+            
+            # Plot and save the test set reliability diagram
+            plot_test_calibration_curve(
+                y_test_true=y_test_true,
+                raw_probs=raw_probs_test,
+                cal_probs=probs_ft,
+                task_key=task_key,
+                output_dir=OUTPUT_DIR,
+            )
+            
+        else:
+            print("[Warning] Validation set empty at base FUP. Falling back to uncalibrated probabilities.")
+            probs_ft = raw_probs_test
 
         del model_ft, interpreter_ft
         gc.collect()
@@ -192,6 +230,9 @@ def main():
             base_test_ds, labels_ft, res_ft["labels"][:, target_idx], vocab,
         )
         save_cluster_profiles_report(ft_profiles, global_stats, task_key, space_type="fine_tuned")
+        
+        # Save exact side-by-side CSV comparison table without missing value artifacts
+        export_exact_cluster_comparison_csv(base_test_ds, labels_ft, vocab, global_stats, task_key, space_type="fine_tuned")
 
         # ---------------------------------------------------------------------------------
         # Build unified cluster color map ahead of generation to secure synergy
@@ -214,7 +255,7 @@ def main():
         plot_combined_stratification_grid(
             test_ds=test_ds,
             patient_ids=patient_ids,
-            probs=probs_ft,
+            probs=raw_probs_test,  # probs_ft,
             reduced_pt=reduced_pt,
             reduced_ft=reduced_ft,
             labels_pt=labels_pt,
@@ -222,7 +263,7 @@ def main():
             cluster_color_map=cluster_color_map, 
             true_labels_horizon=res_ft["labels"][:, target_idx],
             task_key=task_key,
-            label_key=label_key
+            label_key=label_key,
         )
 
 
@@ -267,7 +308,8 @@ def plot_scatter_unsupervised(ax, reduced, hue_labels, style_labels, cluster_col
 
 
 def plot_combined_stratification_grid(
-    test_ds, patient_ids, probs, reduced_pt, reduced_ft, labels_pt, labels_ft, cluster_color_map, true_labels_horizon, task_key, label_key
+    test_ds, patient_ids, probs, reduced_pt, reduced_ft, labels_pt, labels_ft,
+    cluster_color_map, true_labels_horizon, task_key, label_key,
 ):
     df_long = test_ds.to_pandas()
     target_pids = set(patient_ids)
@@ -299,9 +341,8 @@ def plot_combined_stratification_grid(
         })
 
     df_surv = pd.DataFrame(survival_data)
-
-    grey_to_red_cmap = LinearSegmentedColormap.from_list("grey_red", ["lightgrey", "tab:red"])
-    
+    blue_to_red_cmap = plt.get_cmap("coolwarm")
+    gray_to_red_cmap = LinearSegmentedColormap.from_list(name="blue_grey_red", colors=["lightgrey", "tab:red"])
     fig, axes = plt.subplots(3, 2, figsize=(20, 22))
 
     s_censored = 90
@@ -317,50 +358,77 @@ def plot_combined_stratification_grid(
         axes[0, 1], reduced_ft, labels_ft, true_labels_horizon, cluster_color_map, "Fine-tuned UMAP: discovered clusters"
     )
 
-    # Fine-tuned UMAP colored by model predicted risk
-    ax = axes[1, 0]
-    vmin_risk, vmax_risk = df_surv["risk_score"].min(), df_surv["risk_score"].max()
+    # -------------------------------------------------------------------------
+    # Subplot 1: Fine-tuned UMAP - Model risk score
+    # -------------------------------------------------------------------------
+    ax = axes[1, 0]    
+    max_risk_val = df_surv["risk_score"].max()
+    
     ax.scatter(
         reduced_ft[censored_mask, 0], reduced_ft[censored_mask, 1],
-        c=df_surv[censored_mask]["risk_score"], cmap="coolwarm", vmin=vmin_risk, vmax=vmax_risk,
-        marker="o", s=s_censored, edgecolor="black", linewidth=0.8, label="No event (censored)", zorder=2, alpha=0.4  
+        c=df_surv[censored_mask]["risk_score"], cmap=blue_to_red_cmap, vmin=0.0, vmax=max_risk_val,
+        marker="o", s=s_censored, edgecolor="black", linewidth=0.5, zorder=2, alpha=0.65  
     )
     if event_mask.sum() > 0:
         sc2 = ax.scatter(
             reduced_ft[event_mask, 0], reduced_ft[event_mask, 1],
-            c=df_surv[event_mask]["risk_score"], cmap="coolwarm", vmin=vmin_risk, vmax=vmax_risk,
-            marker="X", s=s_event, edgecolor="black", linewidth=0.8, label="Event occurred (ever)", zorder=3, alpha=0.75  
+            c=df_surv[event_mask]["risk_score"], cmap=blue_to_red_cmap, vmin=0.0, vmax=max_risk_val,
+            marker="X", s=s_event, edgecolor="black", linewidth=1.0, zorder=3, alpha=0.90  
         )
     sc2_ref = sc2 if event_mask.sum() > 0 else ax.collections[0]
-    cbar2 = plt.colorbar(sc2_ref, ax=ax)
+    cbar2 = plt.colorbar(
+        sc2_ref, 
+        ax=ax, 
+        ticks=np.arange(0.0, max_risk_val + 0.01, 0.05)  # Sets 0.00, 0.05, 0.10, ...
+    )
+    cbar2.ax.yaxis.set_major_formatter(plt.FormatStrFormatter('%.2f'))  # Force 2 decimal places
     cbar2.set_label("Predicted risk score")
     ax.set_title("Fine-tuned UMAP: model risk score")
     ax.set_xlabel("UMAP 1")
     ax.set_ylabel("UMAP 2")
-    ax.legend(loc="upper right")
 
-    # Fine-tuned UMAP with event imminence
-    ax = axes[2, 0]
+    # Custom legend with gray markers
+    risk_legend_elements = [
+        Line2D([0], [0], marker='o', color='w', label="No event (censored)",
+               markerfacecolor='gray', markersize=10, alpha=0.65, markeredgecolor='black', markeredgewidth=0.5),
+        Line2D([0], [0], marker='X', color='w', label="Event occurred (ever)",
+               markerfacecolor='gray', markersize=12, alpha=0.90, markeredgecolor='black', markeredgewidth=1.0)
+    ]
+    ax.legend(handles=risk_legend_elements, loc="upper right")
+
+    # -------------------------------------------------------------------------
+    # Subplot 2: Fine-tuned UMAP - Event imminence
+    # -------------------------------------------------------------------------
+    ax = axes[1, 1]
     ax.scatter(
         reduced_ft[censored_mask, 0], reduced_ft[censored_mask, 1],
         c="lightgrey", marker="o", s=s_censored, edgecolor="black", linewidth=0.8,
-        label="No event (censored)", zorder=2, alpha=0.4  
+        zorder=2, alpha=0.4  
     )
     if event_mask.sum() > 0:
         sc1 = ax.scatter(
             reduced_ft[event_mask, 0], reduced_ft[event_mask, 1],
-            c=df_surv[event_mask]["true_imminence"], cmap=grey_to_red_cmap, vmin=0.0, vmax=1.0,
-            marker="X", s=s_event, edgecolor="black", linewidth=0.8, label="Event occurred (ever)", zorder=3, alpha=0.75  
+            c=df_surv[event_mask]["true_imminence"], cmap=gray_to_red_cmap, vmin=0.0, vmax=1.0,
+            marker="X", s=s_event, edgecolor="black", linewidth=0.8, zorder=3, alpha=0.75  
         )
-        cbar1 = plt.colorbar(sc1, ax=ax)
+        cbar1 = plt.colorbar(sc1, ax=ax, ticks=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+        cbar1.ax.yaxis.set_major_formatter(plt.FormatStrFormatter('%.1f'))
         cbar1.set_label("Event imminence (exponential decay)")
     ax.set_title("Fine-tuned UMAP: event imminence")
     ax.set_xlabel("UMAP 1")
     ax.set_ylabel("UMAP 2")
-    ax.legend(loc="upper right")
+
+    # Custom legend with gray markers
+    imminence_legend_elements = [
+        Line2D([0], [0], marker='o', color='w', label="No event (censored)",
+               markerfacecolor='gray', markersize=10, alpha=0.4, markeredgecolor='black', markeredgewidth=0.8),
+        Line2D([0], [0], marker='X', color='w', label="Event occurred (ever)",
+               markerfacecolor='gray', markersize=12, alpha=0.75, markeredgecolor='black', markeredgewidth=0.8)
+    ]
+    ax.legend(handles=imminence_legend_elements, loc="upper right")
 
     # Stratified Kaplan-Meier discovered cluster curves
-    ax = axes[1, 1]
+    ax = axes[2, 0]
     kmf = KaplanMeierFitter()
     
     unique_clusters = sorted(df_surv["cluster_ft"].unique())
@@ -402,7 +470,6 @@ def plot_combined_stratification_grid(
         rotation=90, va='center', ha='center', color='#333333', zorder=2,
         fontweight='bold', transform=ax.get_xaxis_transform()
     )
-    # Preservation of your interactive runtime text label updates wrapper style
     ax.set_title(f"Longitudinal risk stratification ({p_val_text})")
     ax.set_xlabel("Days since transplantation")
     ax.set_ylabel("Probability of remaining event-free")
@@ -428,6 +495,38 @@ def plot_combined_stratification_grid(
     plt.close()
     print(f"Saved optimized stratification summary to {out_path.name}")
     
+    
+def plot_test_calibration_curve(y_test_true, raw_probs, cal_probs, task_key, output_dir, n_bins=10):
+    """
+    Generates and saves a reliability diagram comparing uncalibrated vs calibrated probabilities.
+    """
+    fig, ax = plt.subplots(figsize=(8, 8))
+    
+    # Perfect calibration reference line
+    ax.plot([0, 1], [0, 1], linestyle="--", color="gray", label="Perfect Calibration")
+    
+    # Uncalibrated (Raw) curve
+    prob_true_raw, prob_pred_raw = calibration_curve(y_test_true, raw_probs, n_bins=n_bins)
+    ax.plot(prob_pred_raw, prob_true_raw, marker="o", linewidth=2, color="tab:red", label="Uncalibrated (Raw)")
+    
+    # Calibrated (Platt Scaling) curve
+    prob_true_cal, prob_pred_cal = calibration_curve(y_test_true, cal_probs, n_bins=n_bins)
+    ax.plot(prob_pred_cal, prob_true_cal, marker="s", linewidth=2, color="tab:blue", label="Calibrated (Platt)")
+    
+    ax.set_title(f"Calibration Diagram: {task_key.replace('_', ' ').title()}", fontsize=18, fontweight="bold", pad=15)
+    ax.set_xlabel("Mean Predicted Probability", fontsize=15)
+    ax.set_ylabel("Fraction of Positives (Observed)", fontsize=15)
+    ax.set_xlim([0.0, 1.0])
+    ax.set_ylim([0.0, 1.05])
+    ax.grid(True, linestyle=":", alpha=0.6)
+    ax.legend(loc="upper left", fontsize=13, frameon=True)
+    
+    plt.tight_layout()
+    out_path = output_dir / f"calibration_curve_{task_key}.png"
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"Saved calibration curve to {out_path.name}")
+
 
 def compute_cluster_enrichment_profiles(base_test_ds, cluster_labels, true_labels, vocab, top_k_features=100):
     print("\n>>> Computing cluster enrichment profiles...")
@@ -514,7 +613,7 @@ def compute_cluster_enrichment_profiles(base_test_ds, cluster_labels, true_label
         bg_feat_counts = pd.Series([f for pid in bg_pids for f in patient_features.get(pid, [])]).value_counts()
         
         enrichment_results = []
-        candidates = cluster_feat_counts[cluster_feat_counts > (n_cluster * 0.05)].index
+        candidates = cluster_feat_counts[cluster_feat_counts > (n_cluster * 0.01)].index
         
         for feat in candidates:
             a = cluster_feat_counts.get(feat, 0)
@@ -547,6 +646,149 @@ def compute_cluster_enrichment_profiles(base_test_ds, cluster_labels, true_label
         
     return cluster_summaries, global_stats
 
+
+def export_exact_cluster_comparison_csv(base_test_ds, cluster_labels, vocab, global_stats, task_key, space_type="fine_tuned"):
+    """
+    Computes exact cluster counts directly across ALL patients and features to avoid missing-value artifacts
+    and explicitly inserts target infection outcomes across all horizons (30, 60, 90 days) as the first 3 rows.
+    """
+    out_csv = OUTPUT_DIR / f"cluster_comparison_{space_type}_{task_key}.csv"
+    id2token = {v: k for k, v in vocab.items()}
+    
+    df_patients = pd.DataFrame({
+        "patientid": base_test_ds["patientid"],
+        "cluster": cluster_labels
+    })
+    
+    total_patients = len(df_patients)
+    c0_pids = set(df_patients[df_patients["cluster"] == 0]["patientid"])
+    c1_pids = set(df_patients[df_patients["cluster"] == 1]["patientid"])
+    
+    n_c0 = len(c0_pids)
+    n_c1 = len(c1_pids)
+    
+    patient_features = {}
+    all_unique_features = set()
+    
+    for sample in base_test_ds:
+        pid = sample["patientid"]
+        ent_ids  = sample.get("entity_id", [])
+        attr_ids = sample.get("attribute_id", [])
+        val_ids  = sample.get("value_id", [])
+        
+        f_set = set()
+        for e_id, a_id, v_id in zip(ent_ids, attr_ids, val_ids):
+            if a_id == 0: continue
+            
+            ent_name  = id2token.get(e_id, f"Ent_{e_id}")
+            attr_name = id2token.get(a_id, f"Attr_{a_id}")
+            val_name  = id2token.get(v_id, f"Val_{v_id}")
+            
+            if "infection" in ent_name.lower():
+                if ent_name.strip().lower() == "infection":
+                    ent_name = "Previous infection"
+                elif not ent_name.lower().startswith("previous"):
+                    ent_name = f"Previous {ent_name.lower()}"
+            
+            full_feature_name = f"{ent_name} - {attr_name} : {val_name}"
+            f_set.add(full_feature_name)
+            all_unique_features.add(full_feature_name)
+            
+        patient_features[pid] = f_set
+
+    rows = []
+
+    # -------------------------------------------------------------------------
+    # 1. Insert Target Infection Outcomes for Horizons 30, 60, 90 as Rows #1-3
+    # -------------------------------------------------------------------------
+    formatted_task_title = task_key.replace('_', ' ').capitalize()
+    horizons_to_check = [30, 60, 90]
+    
+    # Restrict to base FUP to guarantee 1 trajectory snapshot per patient
+    df_test_full = base_test_ds.to_pandas()
+    if "fup" in df_test_full.columns:
+        df_test_base = df_test_full[df_test_full["fup"] == BASE_FUP_FOR_PREDICTION].drop_duplicates("patientid")
+    else:
+        df_test_base = df_test_full.drop_duplicates("patientid")
+
+    for idx, h in enumerate(horizons_to_check):
+        lbl_col = f"label_{task_key}_{h:04d}d"
+        
+        if lbl_col in df_test_base.columns:
+            # Filter out missing/sentinel label values (< 0)
+            df_valid_c0 = df_test_base[(df_test_base["patientid"].isin(c0_pids)) & (df_test_base[lbl_col] >= 0)]
+            df_valid_c1 = df_test_base[(df_test_base["patientid"].isin(c1_pids)) & (df_test_base[lbl_col] >= 0)]
+            
+            n_c0_valid = len(df_valid_c0)
+            n_c1_valid = len(df_valid_c1)
+            
+            c0_events = int(df_valid_c0[lbl_col].sum()) if n_c0_valid > 0 else 0
+            c1_events = int(df_valid_c1[lbl_col].sum()) if n_c1_valid > 0 else 0
+            total_events = c0_events + c1_events
+            
+            pct_c0 = (c0_events / n_c0_valid) * 100.0 if n_c0_valid > 0 else 0.0
+            pct_c1 = (c1_events / n_c1_valid) * 100.0 if n_c1_valid > 0 else 0.0
+            pct_cohort = (total_events / (n_c0_valid + n_c1_valid)) * 100.0 if (n_c0_valid + n_c1_valid) > 0 else 0.0
+            
+            non_c0 = max(0, n_c0_valid - c0_events)
+            non_c1 = max(0, n_c1_valid - c1_events)
+            
+            table = [[c0_events, non_c0], [c1_events, non_c1]]
+            _, p_val = fisher_exact(table, alternative='two-sided')
+            p_val_str = f"{p_val:.2e}" if p_val < 1e-2 else f"{p_val:.4f}"
+            
+            rows.append({
+                "Feature": f"{formatted_task_title} within {h} days",
+                "Value": "Yes",
+                "Cohort %": f"{pct_cohort:.2f}%",
+                f"Cluster 0 % (N={n_c0})": f"{pct_c0:.2f}%",
+                f"Cluster 1 % (N={n_c1})": f"{pct_c1:.2f}%",
+                "Fisher Exact P-value": p_val_str,
+                "_raw_p": -3.0 + idx  # Preserves chronological top-3 order
+            })
+
+    # -------------------------------------------------------------------------
+    # 2. Add baseline / trajectory features sorted by statistical significance
+    # -------------------------------------------------------------------------
+    for feat_str in all_unique_features:
+        count_c0 = sum(1 for pid in c0_pids if feat_str in patient_features.get(pid, set()))
+        count_c1 = sum(1 for pid in c1_pids if feat_str in patient_features.get(pid, set()))
+        count_total = count_c0 + count_c1
+        
+        # Calculate exact percentages
+        pct_c0 = (count_c0 / n_c0) * 100 if n_c0 > 0 else 0.0
+        pct_c1 = (count_c1 / n_c1) * 100 if n_c1 > 0 else 0.0
+        pct_cohort = (count_total / total_patients) * 100 if total_patients > 0 else 0.0
+        
+        # Filter out features with negligible overall presence (< 1% across dataset)
+        if pct_cohort < 1.0 and pct_c0 < 1.0 and pct_c1 < 1.0:
+            continue
+            
+        non_c0_feat = max(0, n_c0 - count_c0)
+        non_c1_feat = max(0, n_c1 - count_c1)
+        
+        # Two-tailed Fisher exact test between Cluster 0 and Cluster 1
+        table = [[count_c0, non_c0_feat], [count_c1, non_c1_feat]]
+        _, p_val = fisher_exact(table, alternative='two-sided')
+        
+        if " : " in feat_str:
+            feat_name, val_name = feat_str.split(" : ", 1)
+        else:
+            feat_name, val_name = feat_str, ""
+
+        rows.append({
+            "Feature": feat_name,
+            "Value": val_name,
+            "Cohort %": f"{pct_cohort:.2f}%",
+            f"Cluster 0 % (N={n_c0})": f"{pct_c0:.2f}%",
+            f"Cluster 1 % (N={n_c1})": f"{pct_c1:.2f}%",
+            "Fisher Exact P-value": f"{p_val:.2e}",
+            "_raw_p": p_val
+        })
+
+    df_merged = pd.DataFrame(rows).sort_values("_raw_p").drop(columns=["_raw_p"])
+    df_merged.to_csv(out_csv, index=False)
+    print(f"Saved exact side-by-side cluster comparison CSV table to: {out_csv.name}")
 
 def save_cluster_profiles_report(cluster_profiles, global_stats, task_key, space_type="fine-tuned"):
     out_file = OUTPUT_DIR / f"cluster_profiles_{space_type}_{task_key}.txt"
