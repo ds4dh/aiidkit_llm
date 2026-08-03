@@ -5,6 +5,7 @@ import argparse
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
 from pathlib import Path
 from datasets import load_from_disk
 from statsmodels.stats.contingency_tables import mcnemar
@@ -30,8 +31,8 @@ parser.add_argument(
 parser.add_argument(
     "--target_recall",
     type=int,
-    default=70,
-    help="Target minimal recall used for tuning model decision threshold (e.g., 70).",
+    default=80,
+    help="Target minimal recall used for tuning model decision threshold (e.g., 80).",
 )
 args = parser.parse_args()
 
@@ -39,18 +40,18 @@ THRESHOLD_MODE = args.threshold_mode
 TARGET_RECALL_INPUT = args.target_recall
 TARGET_RECALL_ANCHOR = float(TARGET_RECALL_INPUT) / 100.0
 USE_CALIBRATED_PROBS = {
-    "Transformer": True,  # trained with CE, so no need for calibration?
+    "Transformer": True,
     "logistic_regression": True,
     "random_forest": True,
     "xgboost": True,
 }
-THRESHOLD_TUNING_SET = "validation"  # validation (standard), test (sanity checking)
+THRESHOLD_TUNING_SET = "validation"
 THRESHOLD_SUBFOLDER = f"rec-{TARGET_RECALL_INPUT}"
 CALIB_SUBFOLDER = f"calib-{int(USE_CALIBRATED_PROBS['Transformer'])}"
 
 BASE_DATA_PATH = Path("/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6_old/teav")
 RESULTS_DIR = Path("results_final")
-ANALYSIS_DIR = RESULTS_DIR / "analysis" / "comparison_lt-1-3_vlt-3-10"
+ANALYSIS_DIR = RESULTS_DIR / "analysis" / "comparison_lt-1-3_vlt-3-10_rec-80"
 ANALYSIS_SUBDIR = ANALYSIS_DIR / THRESHOLD_MODE / THRESHOLD_SUBFOLDER / CALIB_SUBFOLDER
 CACHE_DIR = ANALYSIS_DIR / "cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -83,7 +84,6 @@ METRIC_MAPPING = [
     ("Sensitivity (recall)", "↑"), ("Precision", "↑"), ("Specificity", "↑")
 ]
 
-# Create a unique parameter signature token for parameter-dependent caching
 PARAM_SIGNATURE = {
     "THRESHOLD_MODE": THRESHOLD_MODE,
     "TARGET_RECALL_ANCHOR": TARGET_RECALL_ANCHOR,
@@ -134,8 +134,7 @@ def load_transformer_flat_dataframe(task: str, split: str, dataset_split: str, t
         return pd.DataFrame()
        
     candidates = [p for p in task_base_dir.iterdir() if p.is_dir() and p.name.startswith("hrz(")]
-    matched_dir = None
-    target_idx = None
+    matched_dir, target_idx, horizons = None, None, []
    
     for c in candidates:
         match = re.search(r"hrz\(([\d-]+)\)", c.name)
@@ -152,17 +151,17 @@ def load_transformer_flat_dataframe(task: str, split: str, dataset_split: str, t
     npz_data = np.load(matched_dir / file_name, allow_pickle=True)
     prefix = f"{dataset_split}_" if dataset_split == "validation" else "test_"
     fup_pattern = re.compile(rf"^{prefix}fup_(\d+)_labels$")
+    fup_days = sorted({int(fup_pattern.match(k).group(1)) for k in npz_data.files if fup_pattern.match(k)})
    
     flat_records = []
-    fup_days = {int(fup_pattern.match(k).group(1)) for k in npz_data.files if fup_pattern.match(k)}
-   
     prob_template = f"{prefix}fup_%04d_probs"
    
-    for fup_day in sorted(fup_days):
-        if f"{prefix}fup_{fup_day:04d}_labels" not in npz_data.files:
+    for fup_day in fup_days:
+        lbl_key = f"{prefix}fup_{fup_day:04d}_labels"
+        if lbl_key not in npz_data.files:
             continue
-        y_true_all = npz_data[f"{prefix}fup_{fup_day:04d}_labels"]
-       
+            
+        y_true_all = npz_data[lbl_key]
         target_prob_str = prob_template % fup_day
         if target_prob_str not in npz_data.files:
             target_prob_str = f"{prefix}fup_{fup_day:04d}_probs"
@@ -180,14 +179,28 @@ def load_transformer_flat_dataframe(task: str, split: str, dataset_split: str, t
         raw_ds = load_from_disk(str(raw_fup_dir))[dataset_split]
         raw_keys = raw_ds["patientkey"]
        
-        for idx in range(len(y_prob)):
-            if int(y_true[idx]) == -100:
+        # FIX 1: Reconstruct Transformer's keep_mask (.any(axis=1) across trained multi-label horizons)
+        label_cols = [f"label_{task}_{h:04d}d" for h in horizons if f"label_{task}_{h:04d}d" in raw_ds.column_names]
+        if label_cols:
+            label_matrix = np.stack([raw_ds[col] for col in label_cols], axis=1)
+            keep_mask = (label_matrix != -100).any(axis=1)
+        else:
+            keep_mask = np.ones(len(raw_keys), dtype=bool)
+
+        valid_indices = np.where(keep_mask)[0]
+        eval_len = min(len(valid_indices), len(y_prob), len(y_true))
+       
+        for idx in range(eval_len):
+            true_label = int(y_true[idx])
+            if true_label == -100:
                 continue
+                
+            raw_ds_idx = valid_indices[idx]
             flat_records.append({
-                "patientkey": raw_keys[idx],
+                "patientkey": raw_keys[raw_ds_idx],
                 "time_step": fup_day,
                 "horizon": int(target_horizon),
-                "y_true": int(y_true[idx]),
+                "y_true": true_label,
                 "y_prob": float(y_prob[idx])
             })
            
@@ -226,17 +239,17 @@ def load_classic_ml_flat_dataframe(model_name: str, task: str, split: str, datas
     npz_data = np.load(matched_dir / file_name, allow_pickle=True)
     prefix = f"{dataset_split}_" if dataset_split == "validation" else "test_"
     fup_pattern = re.compile(rf"^{prefix}fup_(\d+)_labels$")
+    fup_days = sorted({int(fup_pattern.match(k).group(1)) for k in npz_data.files if fup_pattern.match(k)})
    
     flat_records = []
-    fup_days = {int(fup_pattern.match(k).group(1)) for k in npz_data.files if fup_pattern.match(k)}
-   
     prob_template = f"{prefix}fup_%04d_probs"
    
-    for fup_day in sorted(fup_days):
-        if f"{prefix}fup_{fup_day:04d}_labels" not in npz_data.files:
+    for fup_day in fup_days:
+        lbl_key = f"{prefix}fup_{fup_day:04d}_labels"
+        if lbl_key not in npz_data.files:
             continue
-        y_true = npz_data[f"{prefix}fup_{fup_day:04d}_labels"].flatten()
-       
+            
+        y_true = npz_data[lbl_key].flatten()
         target_prob_str = prob_template % fup_day
         if target_prob_str not in npz_data.files:
             target_prob_str = f"{prefix}fup_{fup_day:04d}_probs"
@@ -251,14 +264,27 @@ def load_classic_ml_flat_dataframe(model_name: str, task: str, split: str, datas
         raw_ds = load_from_disk(str(raw_fup_dir))[dataset_split]
         raw_keys = raw_ds["patientkey"]
        
-        for idx in range(len(y_prob)):
-            if int(y_true[idx]) == -100:
+        # FIX 2: Reconstruct Classic ML's keep_mask (single target column != -100)
+        target_col = f"label_{task}_{target_horizon:04d}d"
+        if target_col in raw_ds.column_names:
+            keep_mask = np.array(raw_ds[target_col]) != -100
+        else:
+            keep_mask = np.ones(len(raw_keys), dtype=bool)
+
+        valid_indices = np.where(keep_mask)[0]
+        eval_len = min(len(valid_indices), len(y_prob), len(y_true))
+       
+        for idx in range(eval_len):
+            true_label = int(y_true[idx])
+            if true_label == -100:
                 continue
+                
+            raw_ds_idx = valid_indices[idx]
             flat_records.append({
-                "patientkey": raw_keys[idx],
+                "patientkey": raw_keys[raw_ds_idx],
                 "time_step": fup_day,
                 "horizon": int(target_horizon),
-                "y_true": int(y_true[idx]),
+                "y_true": true_label,
                 "y_prob": float(y_prob[idx])
             })
            
@@ -356,11 +382,9 @@ def calculate_strict_threshold(df: pd.DataFrame, low: int, high: int, target_rec
 # REPORT STRUCTURING & CLEANING BREAKDOWNS
 # ==========================================
 def build_report_layout_and_mapping() -> tuple:
-    METRIC_SORT_ORDER = ["Total evaluation frames", "Primary analysis"]
+    METRIC_SORT_ORDER = ["Total evaluation frames"]
     ROW_CLEANING_MAP = {
-        "Total evaluation frames": "Total evaluation frames",
-        "Primary analysis": "Primary analysis",
-        "Post-hoc analysis": "Post-hoc analysis"
+        "Total evaluation frames": "Total evaluation frames"
     }
    
     for m in CLASSIC_MODELS:
@@ -382,20 +406,7 @@ def build_report_layout_and_mapping() -> tuple:
         for internal_key, clean_name in sub_metrics:
             METRIC_SORT_ORDER.append(internal_key)
             ROW_CLEANING_MAP[internal_key] = clean_name
-           
-    METRIC_SORT_ORDER.append("Post-hoc analysis")
-   
-    for metric_prefix, arrow in METRIC_MAPPING:
-        head_lbl = f"{metric_prefix} ({arrow})"
-        METRIC_SORT_ORDER.append(head_lbl)
-        ROW_CLEANING_MAP[head_lbl] = head_lbl
-       
-        for model in ["logistic_regression", "random_forest", "xgboost", "Transformer"]:
-            disp = MODEL_DISPLAY_MAP[model]
-            internal_key = f"  {metric_prefix} ({arrow}) ({disp})"
-            METRIC_SORT_ORDER.append(internal_key)
-            ROW_CLEANING_MAP[internal_key] = f"  {disp}"
-           
+
     return METRIC_SORT_ORDER, ROW_CLEANING_MAP
 
 
@@ -403,13 +414,6 @@ def build_report_layout_and_mapping() -> tuple:
 # FDR CORRECTION & TABLE EXPORT HELPER
 # ==========================================
 def apply_fdr_and_export_tables(split_results: dict, analysis_dir: Path, split: str, horizon_str: str):
-    """
-    Applies global Benjamini-Hochberg FDR correction across all p-values in split_results,
-    updates statistical winner declarations using q-values (q < 0.05), and exports two CSVs:
-    1. Detailed head-to-head report (with both raw p-values and FDR q-values)
-    2. Main summary report (reporting q-value annotated winner calls)
-    """
-    # 1. Collect all raw p-values across comparisons and clinical windows
     p_entries = []
     for window_name, record in split_results.items():
         for m in CLASSIC_MODELS:
@@ -431,7 +435,6 @@ def apply_fdr_and_export_tables(split_results: dict, analysis_dir: Path, split: 
             except ValueError:
                 pass
 
-    # 2. Compute FDR-adjusted q-values (Benjamini-Hochberg)
     q_map = {}
     if p_entries:
         raw_pvals = [item['p_val'] for item in p_entries]
@@ -451,15 +454,19 @@ def apply_fdr_and_export_tables(split_results: dict, analysis_dir: Path, split: 
             return "NaN"
         return f"{val:.3e}"
 
-    # 3. Populate q-values and update winner declarations
     main_table_data = {}
+
+    # MAIN SUMMARY METRICS
+    MAIN_METRIC_MAPPING = [
+        ("ROC-AUC", "↑"), ("PR-AUC", "↑"), ("ECE", "↓"), 
+        ("Sensitivity (recall)", "↑"), ("Specificity", "↑")
+    ]
 
     for window_name, record in split_results.items():
         main_win_record = {}
         main_win_record["N frames"] = record["Total evaluation frames"]
 
-        # FIXED BUG: Use unique keys for each model AND metric combination
-        for metric_prefix, arrow in METRIC_MAPPING:
+        for metric_prefix, arrow in MAIN_METRIC_MAPPING:
             head_lbl = f"{metric_prefix} ({arrow})"
             main_win_record[head_lbl] = ""
             for model in ["logistic_regression", "random_forest", "xgboost", "Transformer"]:
@@ -497,7 +504,7 @@ def apply_fdr_and_export_tables(split_results: dict, analysis_dir: Path, split: 
 
         main_table_data[window_name] = main_win_record
 
-    # 4. Save Detailed Table b)
+    # --- HEAD-TO-HEAD STATS-ONLY REPORT EXPORT ---
     METRIC_SORT_ORDER, ROW_CLEANING_MAP = build_report_layout_and_mapping()
     df_detailed = pd.DataFrame(split_results).reindex(METRIC_SORT_ORDER)
     df_detailed.index = df_detailed.index.map(ROW_CLEANING_MAP)
@@ -507,11 +514,11 @@ def apply_fdr_and_export_tables(split_results: dict, analysis_dir: Path, split: 
     detailed_out_path = analysis_dir / f"{split}_{horizon_str}_head_to_head_report.csv"
     df_detailed.to_csv(detailed_out_path)
 
-    # 5. Save Main Summary Table a)
+    # --- MAIN SUMMARY REPORT EXPORT ---
     main_rows_order = ["N frames"]
     main_row_clean_map = {"N frames": "N frames"}
 
-    for metric_prefix, arrow in METRIC_MAPPING:
+    for metric_prefix, arrow in MAIN_METRIC_MAPPING:
         head_lbl = f"{metric_prefix} ({arrow})"
         main_rows_order.append(head_lbl)
         main_row_clean_map[head_lbl] = head_lbl
@@ -538,7 +545,7 @@ def apply_fdr_and_export_tables(split_results: dict, analysis_dir: Path, split: 
     for window_name, win_dict in main_table_data.items():
         col_data = {}
         col_data["N frames"] = win_dict["N frames"]
-        for metric_prefix, arrow in METRIC_MAPPING:
+        for metric_prefix, arrow in MAIN_METRIC_MAPPING:
             head_lbl = f"{metric_prefix} ({arrow})"
             col_data[head_lbl] = ""
             for model in ["logistic_regression", "random_forest", "xgboost", "Transformer"]:
@@ -683,7 +690,7 @@ def process_split_strategy(task: str, split: str, horizon, analysis_dir: Path) -
     plotted_window_cache = {}
     npz_save_payload = {}
    
-    for w_idx, (window_name, (low, high)) in enumerate(CLINICAL_WINDOWS.items()):
+    for window_name, (low, high) in CLINICAL_WINDOWS.items():
         sub_test_df = test_dfs["Transformer"][
             (test_dfs["Transformer"]['time_step'] >= low) & 
             ((test_dfs["Transformer"]['time_step'] + test_dfs["Transformer"]['horizon']) <= high)
@@ -699,10 +706,9 @@ def process_split_strategy(task: str, split: str, horizon, analysis_dir: Path) -
 
         if sub_test_df.empty:
             continue
-           
+        
         y_true = sub_test_df['y_true'].values
-        window_record = {"Total evaluation frames": len(sub_test_df), "Primary analysis": "", "Post-hoc analysis": ""}
-       
+        window_record = {"Total evaluation frames": len(sub_test_df)}
         preds_map = {}
         thresholds_resolved = {}
        
@@ -803,7 +809,6 @@ def process_split_strategy(task: str, split: str, horizon, analysis_dir: Path) -
     if not split_results:
         return None
 
-    # Apply FDR correction, update winner calls based on q-values, and export both tables:
     df_main, df_detailed = apply_fdr_and_export_tables(split_results, analysis_dir, split, horizon_str)
    
     np.savez(cache_data_path, **npz_save_payload)
@@ -821,11 +826,11 @@ def process_split_strategy(task: str, split: str, horizon, analysis_dir: Path) -
 def render_matrix_visualization_grids(plotted_data_cache: dict, analysis_dir: Path, horizon_suffix: str):
     n_splits = len(SPLIT_TYPES)
     n_windows = len(CLINICAL_WINDOWS)
-   
-    fig_roc, axes_roc = plt.subplots(n_windows, n_splits, figsize=(7.5 * n_splits, 6.5 * n_windows), squeeze=False)
-    fig_pr, axes_pr = plt.subplots(n_windows, n_splits, figsize=(7.5 * n_splits, 6.5 * n_windows), squeeze=False)
-    fig_dca, axes_dca = plt.subplots(n_windows, n_splits, figsize=(7.5 * n_splits, 6.5 * n_windows), squeeze=False)
-   
+    
+    fig_roc, axes_roc = plt.subplots(n_windows, n_splits, figsize=(7.5 * n_splits, 5 * n_windows), squeeze=False)
+    fig_pr, axes_pr = plt.subplots(n_windows, n_splits, figsize=(7.5 * n_splits, 5 * n_windows), squeeze=False)
+    fig_dca, axes_dca = plt.subplots(n_windows, n_splits, figsize=(7.5 * n_splits, 5 * n_windows), squeeze=False)
+    
     model_fullname_map = {
         "logistic_regression": "Logistic regression",
         "random_forest": "Random forest",
@@ -850,21 +855,27 @@ def render_matrix_visualization_grids(plotted_data_cache: dict, analysis_dir: Pa
 
             if split not in plotted_data_cache or window_name not in plotted_data_cache[split]:
                 for ax in [ax_roc, ax_pr, ax_dca]:
-                    ax.text(0.5, 0.5, "(Not Applicable for this Horizon)", 
-                            fontsize=18, color="darkred", ha='center', va='center', weight='bold')
+                    ax.text(
+                        0.5, 0.5, "Not applicable for this horizon", fontsize=20,
+                        color="darkred", ha='center', va='center', weight='bold',
+                    )
                     ax.set_xlim([0.0, 1.0])
                     ax.set_ylim([0.0, 1.0])
                     ax.grid(False)
-                    if w_idx == 0: ax.set_title(split_title, fontsize=24, fontweight='bold', pad=18)
+                    ax.tick_params(
+                        left=False, bottom=False, 
+                        labelleft=False, labelbottom=False
+                    )
+                    if w_idx == 0: ax.set_title(split_title, fontsize=26, fontweight='bold', pad=18)
                     if s_idx == 0: 
                         lbl = "Sensitivity" if ax == ax_roc else ("Precision" if ax == ax_pr else "Net benefit")
-                        ax.set_ylabel(f"{window_name}\n\n{lbl}", fontsize=22, fontweight='bold', labelpad=16)
+                        ax.set_ylabel(f"{window_name}\n\n{lbl}", fontsize=26, fontweight='bold', labelpad=16)
                 continue
 
             sub_df, thresholds_resolved = plotted_data_cache[split][window_name]
             y_true = sub_df['y_true'].values
 
-            # --- ROC CURVES ---
+            # --- ROC Plot ---
             for m_idx, m in enumerate(["logistic_regression", "random_forest", "xgboost", "Transformer"]):
                 p_arr = sub_df[f'y_prob_{m}'].values
                 full_label = model_fullname_map[m]
@@ -876,14 +887,15 @@ def render_matrix_visualization_grids(plotted_data_cache: dict, analysis_dir: Pa
             ax_roc.set_xlim([0.0, 1.0])
             ax_roc.set_ylim([0.0, 1.05])
             ax_roc.grid(True, linestyle=":", alpha=0.5)
-            ax_roc.tick_params(labelsize=18)
-            if w_idx == 0: ax_roc.set_title(split_title, fontsize=24, fontweight='bold', pad=18)
-            if s_idx == 0: ax_roc.set_ylabel(f"{window_name}\n\nSensitivity", fontsize=22, fontweight='bold', labelpad=16)
-            if w_idx == n_windows - 1: ax_roc.set_xlabel("1.0 - Specificity", fontsize=22, fontweight='bold', labelpad=14)
-            leg_roc = ax_roc.legend(loc="lower right", fontsize=20, frameon=True, framealpha=0.9)
+            ax_roc.tick_params(labelsize=20)
+            if w_idx == 0: ax_roc.set_title(split_title, fontsize=26, fontweight='bold', pad=18)
+            if s_idx == 0: ax_roc.set_ylabel(f"{window_name}\n\nSensitivity", fontsize=26, fontweight='bold', labelpad=16)
+            if w_idx == n_windows - 1: ax_roc.set_xlabel("1.0 - Specificity", fontsize=24, fontweight='bold', labelpad=14)
+            # Reduced labelspacing from 0.5 to 0.35
+            leg_roc = ax_roc.legend(loc="lower right", fontsize=22, frameon=True, framealpha=0.9, labelspacing=0.35)
             for handle in leg_roc.legend_handles: handle.set_linewidth(4.5)
 
-            # --- PR CURVES ---
+            # --- PR Plot ---
             for m_idx, m in enumerate(["logistic_regression", "random_forest", "xgboost", "Transformer"]):
                 p_arr = sub_df[f'y_prob_{m}'].values
                 full_label = model_fullname_map[m]
@@ -894,18 +906,18 @@ def render_matrix_visualization_grids(plotted_data_cache: dict, analysis_dir: Pa
             ax_pr.set_xlim([0.0, 1.0])
             ax_pr.set_ylim([0.0, 1.05])
             ax_pr.grid(True, linestyle=":", alpha=0.5)
-            ax_pr.tick_params(labelsize=18)
-            if w_idx == 0: ax_pr.set_title(split_title, fontsize=24, fontweight='bold', pad=18)
-            if s_idx == 0: ax_pr.set_ylabel(f"{window_name}\n\nPrecision", fontsize=22, fontweight='bold', labelpad=16)
-            if w_idx == n_windows - 1: ax_pr.set_xlabel("Recall", fontsize=22, fontweight='bold', labelpad=14)
-            leg_pr = ax_pr.legend(loc="upper right", fontsize=20, frameon=True, framealpha=0.9)
+            ax_pr.tick_params(labelsize=20)
+            if w_idx == 0: ax_pr.set_title(split_title, fontsize=26, fontweight='bold', pad=18)
+            if s_idx == 0: ax_pr.set_ylabel(f"{window_name}\n\nPrecision", fontsize=26, fontweight='bold', labelpad=16)
+            if w_idx == n_windows - 1: ax_pr.set_xlabel("Recall", fontsize=24, fontweight='bold', labelpad=14)
+            # Reduced labelspacing from 0.5 to 0.35
+            leg_pr = ax_pr.legend(loc="upper right", fontsize=22, frameon=True, framealpha=0.9, labelspacing=0.35)
             for handle in leg_pr.legend_handles: handle.set_linewidth(4.5)
 
-            # --- DCA CURVES ---
+            # --- DCA Plot ---
             dca_thresh = np.linspace(0.01, 0.50, 50)
             prevalence = np.sum(y_true == 1) / len(y_true)
 
-            # Plot Treat none and Treat all baseline curves first
             ax_dca.plot(dca_thresh, np.zeros_like(dca_thresh), color="#1a1a1a", linestyle="--", lw=3.5, label="Treat none")
             ax_dca.plot(dca_thresh, prevalence - (1.0 - prevalence) * (dca_thresh / (1.0 - dca_thresh)), color="#a0a0a0", linestyle="--", lw=3.5, label="Treat all")
 
@@ -922,13 +934,22 @@ def render_matrix_visualization_grids(plotted_data_cache: dict, analysis_dir: Pa
 
             ax_dca.set_xlim([0.0, 0.5])
             ax_dca.set_ylim([-0.005 if max_dca_y_limit < 0.1 else -0.03, max_dca_y_limit])
+            
+            ax_dca.yaxis.set_major_locator(ticker.MaxNLocator(nbins=6))
+            ax_dca.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.2f'))
+
             ax_dca.grid(True, linestyle=":", alpha=0.5)
-            ax_dca.tick_params(labelsize=18)
-            if w_idx == 0: ax_dca.set_title(split_title, fontsize=24, fontweight='bold', pad=18)
-            if s_idx == 0: ax_dca.set_ylabel(f"{window_name}\n\nNet benefit", fontsize=22, fontweight='bold', labelpad=16)
-            if w_idx == n_windows - 1: ax_dca.set_xlabel("Threshold probability", fontsize=22, fontweight='bold', labelpad=14)
-            leg_dca = ax_dca.legend(loc="upper right", fontsize=20, frameon=True, framealpha=0.9)
+            ax_dca.tick_params(labelsize=20)
+            if w_idx == 0: ax_dca.set_title(split_title, fontsize=26, fontweight='bold', pad=18)
+            if s_idx == 0: ax_dca.set_ylabel(f"{window_name}\n\nNet benefit", fontsize=26, fontweight='bold', labelpad=16)
+            if w_idx == n_windows - 1: ax_dca.set_xlabel("Threshold probability", fontsize=24, fontweight='bold', labelpad=14)
+            # Reduced labelspacing from 0.5 to 0.35
+            leg_dca = ax_dca.legend(loc="upper right", fontsize=22, frameon=True, framealpha=0.9, labelspacing=0.35)
             for handle in leg_dca.legend_handles: handle.set_linewidth(4.5)
+
+    fig_roc.align_ylabels(axes_roc[:, 0])
+    fig_pr.align_ylabels(axes_pr[:, 0])
+    fig_dca.align_ylabels(axes_dca[:, 0])
 
     fig_roc.tight_layout()
     fig_roc.savefig(analysis_dir / f"matrix_roc_comparison_curves_{horizon_suffix}.png", dpi=200, bbox_inches='tight')
@@ -941,8 +962,8 @@ def render_matrix_visualization_grids(plotted_data_cache: dict, analysis_dir: Pa
     fig_dca.tight_layout()
     fig_dca.savefig(analysis_dir / f"matrix_dca_comparison_curves_{horizon_suffix}.png", dpi=200, bbox_inches='tight')
     plt.close(fig_dca)
-
-
+ 
+    
 # ============================================
 # CENTRAL CORE EXECUTIVE PIPELINE ORCHESTRATOR
 # ============================================

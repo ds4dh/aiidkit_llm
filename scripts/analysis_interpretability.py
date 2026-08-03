@@ -1,5 +1,6 @@
-import yaml
 import gc
+import re
+import yaml
 import torch
 import numpy as np
 import pandas as pd
@@ -42,7 +43,7 @@ OUTPUT_DIR_BASE_NAME = RESULTS_DIR / "analysis" / "interpretability"
 DATA_DIR = Path("/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6_old/teav")
 CONFIG_PATH = Path("configs/discriminative_training.yaml")
 FROM_OPTUNA = "optuna" in TRANSFORMER_BASE_DIR.name
-DATA_SPLIT_TYPE = "random_split"  # "temporal_split"
+DATA_SPLIT_TYPE = "temporal_split"  # "temporal_split"
 PLOT_ONLY = False  # run downstream plots directly from cache
 MAX_LEGEND_VALUES_TO_SHOW = 5  # threshold capping distinct legend item limits
 
@@ -62,10 +63,11 @@ NUM_CAPTUM_STEPS = 200
 # -------------------------------------------------------------------------------------------------------
 ATTRIBUTIONS_TO_VALUES_ONLY = True
 USE_TIME_NEUTRAL_BASELINE = True
-OUTPUT_SUBDIR = f"{NUM_CAPTUM_STEPS}-steps_{int(100 * MAX_DELTA):03d}-delta_{ATTRIBUTIONS_TO_VALUES_ONLY}-values"
+OUTPUT_SUBDIR = f"{DATA_SPLIT_TYPE}-{NUM_CAPTUM_STEPS}-steps_{int(100 * MAX_DELTA):03d}-delta_{ATTRIBUTIONS_TO_VALUES_ONLY}-values"
 OUTPUT_DIR = OUTPUT_DIR_BASE_NAME / OUTPUT_SUBDIR
 
 # Task configuration
+MAX_FUP = 2400 if DATA_SPLIT_TYPE == "temporal_split" else 3570
 TASK_CONFIG = {
     "bacteria_perioperative": {
         "task": "infection_bacteria",
@@ -85,7 +87,7 @@ TASK_CONFIG = {
     },
     "bacteria_very_long_term": {
         "task": "infection_bacteria",
-        "horizon": 30, "fup_min": 1080, "fup_max": 3570, "fup_step": 30,
+        "horizon": 30, "fup_min": 1080, "fup_max": MAX_FUP, "fup_step": 30,
     },
 }
 
@@ -648,6 +650,34 @@ def get_deterministic_color_with_context(feature_name: str, string_value: str, p
     return palette_list[palette_index]
 
 
+def abbreviate_feature_name(text: str) -> str:
+    """Replaces full clinical terms with concise abbreviations while preserving original casing."""
+    replacements = {
+        "patient": "pt.",
+        "transplant": "tpx.",
+        "immunology": "immu.",
+        "medication": "med.",
+        "hemoglobin": "hgb.",
+        "previous": "prev.",
+        "infection": "inf.",
+    }
+    
+    def replace_match(match):
+        word = match.group(0)
+        lower_word = word.lower()
+        replacement = replacements.get(lower_word, word)
+        
+        # Preserve Titlecase / UPPERCASE formatting
+        if word.istitle():
+            return replacement.capitalize()
+        elif word.isupper():
+            return replacement.upper()
+        return replacement
+
+    pattern = re.compile(r'\b(' + '|'.join(replacements.keys()) + r')\b', re.IGNORECASE)
+    return pattern.sub(replace_match, text)
+
+
 def plot_feature_value_impact(
     df, OUTPUT_DIR, label_name, fup_max, max_delta=None, top_k=20, min_freq=50,
 ):
@@ -663,8 +693,16 @@ def plot_feature_value_impact(
     df_filtered["Abs_Score"] = df_filtered["Score"].abs()
     feature_importance = df_filtered.groupby("Feature")["Abs_Score"].mean().sort_values(ascending=False)
     
-    top_features = feature_importance.head(top_k).index.tolist()[::-1]
-    df_plot = df[df["Feature"].isin(top_features)].copy()
+    # Extract top feature names
+    top_features_raw = feature_importance.head(top_k).index.tolist()[::-1]
+    
+    # Filter original dataframe using raw feature names
+    df_plot = df[df["Feature"].isin(top_features_raw)].copy()
+
+    # --- APPLY WORD ABBREVIATIONS ---
+    # Apply abbreviation to the DataFrame feature column and map the feature list
+    df_plot["Feature"] = df_plot["Feature"].apply(abbreviate_feature_name)
+    top_features = [abbreviate_feature_name(f) for f in top_features_raw]
 
     group_definitions = {
         **MED_ROLES, **CLINICAL_ROLES, **INFECTION_ROLES,
@@ -722,7 +760,6 @@ def plot_feature_value_impact(
     ord_colors = {lvl: mcolors.to_hex(vir_cmap(i)) for i, lvl in enumerate(ORDINAL_LEVELS_LIST)}
     unknown_color = "#333333"
 
-    # Contextual multi-index master palette to ensure uniqueness across variables inside a single row legend box
     master_palette = {}
     for feature in top_features:
         subset = df_plot[df_plot["Feature"] == feature]
@@ -739,7 +776,6 @@ def plot_feature_value_impact(
                 color = unknown_color
             else:
                 color = get_deterministic_color_with_context(feature, entry_value, categorical_colors_pool)
-                # Resolve intra-row matching color collisions through deterministic rotation shifts
                 if color in used_colors_in_row:
                     try:
                         start_idx = categorical_colors_pool.index(color)
@@ -765,8 +801,8 @@ def plot_feature_value_impact(
     markers_map = {"Ordinal": "o", "Numeric/Bool": "D", "Categorical": "s", "Other": "X"}
 
     # --- ROW SPACING CONFIGURATION ---
-    ROW_HEIGHT = 1.25
-    ROW_PADDING = 0.65
+    ROW_HEIGHT = 1.55 
+    ROW_PADDING = 0.70 
     
     feature_y_map = {}
     row_heights = {}
@@ -795,14 +831,13 @@ def plot_feature_value_impact(
     y_min_limit = bottom_line_y - SYMMETRY_PADDING
     total_y_max = top_line_y + SYMMETRY_PADDING
     
-    fig_height = max(5, total_y_max * 0.40) 
-    fig = plt.figure(figsize=(10.5, fig_height))
+    fig_height = max(6, total_y_max * 0.48) 
+    fig = plt.figure(figsize=(11.5, fig_height))
     
-    gs = fig.add_gridspec(1, 1, left=0.55, right=0.85, top=0.98, bottom=0.14)
+    gs = fig.add_gridspec(1, 1, left=0.55, right=0.88, top=0.98, bottom=0.12)
     ax = fig.add_subplot(gs[0, 0])
     ax.set_ylim(y_min_limit, total_y_max)
     
-    # Map multi-index key coordinates configuration to extract distinct labels
     df_plot["Color_Key"] = list(zip(df_plot["Feature"], df_plot["Value"]))
     
     sizes_map_scatter = {"Ordinal": 45, "Numeric/Bool": 35, "Categorical": 40, "Other": 50}
@@ -821,7 +856,7 @@ def plot_feature_value_impact(
     ax.set_yticklabels([]) 
     ax.set_ylabel("")
     ax.tick_params(axis='y', left=False)
-    ax.set_xlabel(_score_label(), fontsize=11, labelpad=4)
+    ax.set_xlabel(_score_label(), fontsize=13.0, labelpad=6)
     
     for f_idx, f in enumerate(top_features):
         y_center = feature_y_map[f]
@@ -854,11 +889,10 @@ def plot_feature_value_impact(
             group_name = val_to_group.get(item, item)
             g_type = get_value_type(group_name)
             
-            # Fetch context isolated identifier coordinate
             color = master_palette.get((feature, item), unknown_color)
             
             marker_char = markers_map.get(g_type, "X")
-            da = DrawingArea(14, 10, 0, 0)
+            da = DrawingArea(16, 12, 0, 0)
             marker_style = MarkerStyle(marker_char)
             transformed_path = marker_style.get_path().transformed(marker_style.get_transform())
             bbox = transformed_path.get_extents()
@@ -866,37 +900,38 @@ def plot_feature_value_impact(
             true_center_x = (bbox.x0 + bbox.x1) / 2.0
             true_center_y = (bbox.y0 + bbox.y1) / 2.0
                                             
-            scale_factor = 7.0 if marker_char in ['s', 'D'] else 8.0
+            scale_factor = 7.5 if marker_char in ['s', 'D'] else 8.5
             final_transform = (
                 transforms.Affine2D()
                 .translate(-true_center_x, -true_center_y)
                 .scale(scale_factor)
-                .translate(7.0, 5.5)
+                .translate(8.0, 6.0)
             )
             
             patch = PathPatch(transformed_path.transformed(final_transform), facecolor=color, edgecolor='white', linewidth=0.5)
             da.add_artist(patch)
             
-            ta = TextArea(f" {str(item)}", textprops=dict(fontsize=8.5, color='#444'))
+            ta = TextArea(f" {str(item)}", textprops=dict(fontsize=10.5, color='#444'))
             legend_boxes.append(HPacker(children=[da, ta], align="center", pad=0, sep=0))
             
         if has_leftovers:
-            da = DrawingArea(14, 10, 0, 0)
-            final_transform = transforms.Affine2D().translate(-0.0, -0.0).scale(7.0).translate(7.0, 5.5)
+            da = DrawingArea(16, 12, 0, 0)
+            final_transform = transforms.Affine2D().translate(-0.0, -0.0).scale(7.5).translate(8.0, 6.0)
             patch = PathPatch(MarkerStyle("X").get_path().transformed(final_transform), facecolor="#777777", edgecolor='white', linewidth=0.5)
             da.add_artist(patch)
-            ta = TextArea(" Other / Unknown", textprops=dict(fontsize=8.5, color='#666', fontstyle='italic'))
+            ta = TextArea(" Other / Unknown", textprops=dict(fontsize=10.5, color='#666', fontstyle='italic'))
             legend_boxes.append(HPacker(children=[da, ta], align="center", pad=0, sep=0))
 
         rows_children = []
         n_elements = len(legend_boxes)
-        
+        N_SUBROWS = 3 
+
         if n_elements > 0:
-            base_items_per_row = n_elements // 2
-            rem = n_elements % 2
+            base_items_per_row = n_elements // N_SUBROWS
+            rem = n_elements % N_SUBROWS
             
             idx_ptr = 0
-            for r_sub in range(2):
+            for r_sub in range(N_SUBROWS):
                 allocated_size = base_items_per_row + (1 if r_sub < rem else 0)
                 if allocated_size == 0:
                     continue
@@ -905,10 +940,10 @@ def plot_feature_value_impact(
                 idx_ptr += allocated_size
                 rows_children.append(HPacker(children=sub_row_chunk, align="center", pad=0, sep=10))
                 
-        while len(rows_children) < 2:
+        while len(rows_children) < N_SUBROWS:
             rows_children.append(HPacker(children=[], align="center", pad=0, sep=0))
             
-        title_box = TextArea(feature, textprops=dict(fontsize=10.5, fontweight='bold', color='#111'))
+        title_box = TextArea(feature, textprops=dict(fontsize=13.0, fontweight='bold', color='#111'))
         content_box = VPacker(children=[title_box] + rows_children, align="right", pad=0, sep=3)
         
         blended_legend_transform = transforms.blended_transform_factory(ax.transAxes, ax.transData)
@@ -921,8 +956,8 @@ def plot_feature_value_impact(
     
     plt.savefig(OUTPUT_DIR / f"drivers_shap_{label_name}.png", dpi=300)
     plt.close()
-
-
+    
+    
 def compute_feature_enrichment(target_indices, background_indices, dataset, top_k=20):
     print(f"   -> Analyzing features for {len(target_indices)} vs {len(background_indices)} samples...")
     
