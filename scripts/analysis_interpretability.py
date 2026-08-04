@@ -50,7 +50,7 @@ MAX_LEGEND_VALUES_TO_SHOW = 5  # threshold capping distinct legend item limits
 # Captum configuration
 TOP_K = 15
 MIN_FREQ = 20
-MAX_DELTA = 0.10
+MAX_DELTA = 0.05
 AGG_METHOD = "mean"
 NUM_CAPTUM_SAMPLES = 1000
 NUM_CAPTUM_STEPS = 200

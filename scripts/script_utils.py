@@ -7,6 +7,7 @@ from datasets import Dataset, load_from_disk
 from scipy.special import logit
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score
+from concurrent.futures import ThreadPoolExecutor
 
 
 def scan_all_fups(data_dir: Path) -> list[int]:
@@ -77,12 +78,63 @@ def extract_horizons_from_path(checkpoint_path: Path) -> list[int]:
     return [int(h) for h in match.group(1).split("-")] 
 
 
+# def paired_bootstrap_pr_auc_pvalue(
+#     y_true: np.ndarray, 
+#     p_tf: np.ndarray, 
+#     p_base: np.ndarray, 
+#     n_bootstraps: int = 1000, 
+#     seed: int = 42
+# ) -> float:
+#     """
+#     Computes a one-tailed paired bootstrap p-value testing if Transformer PR-AUC
+#     is significantly higher than a baseline model's PR-AUC on the exact same test samples.
+#     """
+#     if len(np.unique(y_true)) < 2:
+#         return np.nan
+        
+#     n_samples = len(y_true)
+#     rng = np.random.default_rng(seed)
+#     boot_indices = rng.choice(n_samples, size=(n_bootstraps, n_samples), replace=True)
+    
+#     diffs = []
+#     for idx in boot_indices:
+#         yt_b = y_true[idx]
+#         if len(np.unique(yt_b)) < 2:
+#             continue
+#         auc_tf = average_precision_score(yt_b, p_tf[idx])
+#         auc_base = average_precision_score(yt_b, p_base[idx])
+#         diffs.append(auc_tf - auc_base)
+        
+#     if not diffs:
+#         return np.nan
+        
+#     # Empirical p-value for the hypothesis: Transformer PR-AUC > Baseline PR-AUC
+#     p_value = np.mean(np.array(diffs) <= 0)
+#     return float(p_value)
+def _pr_auc_diff_chunk(y_true, p_tf, p_base, index_chunk):
+    """Compute PR-AUC diffs for a chunk of bootstrap index arrays.
+
+    Standalone helper (not a closure) so it can be reused across threads
+    without re-creating the function object on every call.
+    """
+    chunk_diffs = []
+    for idx in index_chunk:
+        yt_b = y_true[idx]
+        if len(np.unique(yt_b)) < 2:
+            continue
+        auc_tf = average_precision_score(yt_b, p_tf[idx])
+        auc_base = average_precision_score(yt_b, p_base[idx])
+        chunk_diffs.append(auc_tf - auc_base)
+    return chunk_diffs
+
+
 def paired_bootstrap_pr_auc_pvalue(
-    y_true: np.ndarray, 
-    p_tf: np.ndarray, 
-    p_base: np.ndarray, 
-    n_bootstraps: int = 1000, 
-    seed: int = 42
+    y_true: np.ndarray,
+    p_tf: np.ndarray,
+    p_base: np.ndarray,
+    n_bootstraps: int = 1000,
+    seed: int = 42,
+    max_workers: int = 4,
 ) -> float:
     """
     Computes a one-tailed paired bootstrap p-value testing if Transformer PR-AUC
@@ -90,23 +142,29 @@ def paired_bootstrap_pr_auc_pvalue(
     """
     if len(np.unique(y_true)) < 2:
         return np.nan
-        
+
     n_samples = len(y_true)
     rng = np.random.default_rng(seed)
     boot_indices = rng.choice(n_samples, size=(n_bootstraps, n_samples), replace=True)
-    
+
+    max_workers = max(1, max_workers)
+    chunks = np.array_split(boot_indices, max_workers) if max_workers > 1 else [boot_indices]
+
     diffs = []
-    for idx in boot_indices:
-        yt_b = y_true[idx]
-        if len(np.unique(yt_b)) < 2:
-            continue
-        auc_tf = average_precision_score(yt_b, p_tf[idx])
-        auc_base = average_precision_score(yt_b, p_base[idx])
-        diffs.append(auc_tf - auc_base)
-        
+    if max_workers > 1 and len(chunks) > 1:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(_pr_auc_diff_chunk, y_true, p_tf, p_base, c)
+                for c in chunks
+            ]
+            for f in futures:
+                diffs.extend(f.result())
+    else:
+        diffs = _pr_auc_diff_chunk(y_true, p_tf, p_base, boot_indices)
+
     if not diffs:
         return np.nan
-        
+
     # Empirical p-value for the hypothesis: Transformer PR-AUC > Baseline PR-AUC
     p_value = np.mean(np.array(diffs) <= 0)
     return float(p_value)
