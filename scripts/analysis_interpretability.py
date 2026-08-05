@@ -43,14 +43,14 @@ OUTPUT_DIR_BASE_NAME = RESULTS_DIR / "analysis" / "interpretability"
 DATA_DIR = Path("/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6_old/teav")
 CONFIG_PATH = Path("configs/discriminative_training.yaml")
 FROM_OPTUNA = "optuna" in TRANSFORMER_BASE_DIR.name
-DATA_SPLIT_TYPE = "temporal_split"  # "temporal_split"
+DATA_SPLIT_TYPE = "temporal"  # "temporal_split"
 PLOT_ONLY = False  # run downstream plots directly from cache
 MAX_LEGEND_VALUES_TO_SHOW = 5  # threshold capping distinct legend item limits
 
 # Captum configuration
 TOP_K = 15
 MIN_FREQ = 20
-MAX_DELTA = 0.05
+MAX_DELTA = 0.10
 AGG_METHOD = "mean"
 NUM_CAPTUM_SAMPLES = 1000
 NUM_CAPTUM_STEPS = 200

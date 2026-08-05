@@ -37,11 +37,15 @@ parser.add_argument(
     choices=["global", "window_specific"],
     default="window_specific",
 )
-parser.add_argument("--target_recall", type=int, default=80)
+parser.add_argument(
+    "--target_recall",
+    type=int,
+    default=80,
+)
 parser.add_argument(
     "--workers",
     type=int,
-    default=os.cpu_count() or 4,
+    default=14,
     help="Number of threads used for bootstrap resampling (does not affect results).",
 )
 args = parser.parse_args()
@@ -95,7 +99,7 @@ MODEL_DISPLAY_MAP = {
     "xgboost": "XGB",
 }
 MODEL_FULLNAME_MAP = {
-    "Transformer": "Transformer",
+    "Transformer": "t-EAV-Transformer",
     "logistic_regression": "Logistic regression",
     "random_forest": "Random forest",
     "xgboost": "XGBoost",
@@ -563,20 +567,26 @@ def process(task, split, horizon, outdir):
                 payload = {k: z[k] for k in z.files}
             cache = {}
             for w in CLINICAL_WINDOWS:
-                req = [
-                    f"{w}_time_step", f"{w}_horizon", f"{w}_y_true", f"{w}_thresholds_json",
-                    *[f"{w}_y_prob_{m}" for m in ALL_MODELS],
-                ]
-                missing = [k for k in req if k not in payload]
-                if missing:
-                    raise KeyError(f"{w}: missing {missing}")
-                df = pd.DataFrame({
-                    "time_step": payload[f"{w}_time_step"],
-                    "horizon": payload[f"{w}_horizon"],
-                    "y_true": payload[f"{w}_y_true"],
-                    **{f"y_prob_{m}": payload[f"{w}_y_prob_{m}"] for m in ALL_MODELS},
-                })
-                cache[w] = (df, json.loads(str(payload[f"{w}_thresholds_json"])))
+                # Check whether the window was skipped when building the cache
+                if payload.get(f"{w}_is_empty", False):
+                    continue
+
+                # Check window keys dynamically only if samples existed
+                if f"{w}_time_step" in payload:
+                    req = [
+                        f"{w}_time_step", f"{w}_horizon", f"{w}_y_true", f"{w}_thresholds_json",
+                        *[f"{w}_y_prob_{m}" for m in ALL_MODELS],
+                    ]
+                    missing = [k for k in req if k not in payload]
+                    if missing:
+                        raise KeyError(f"{w}: missing {missing}")
+                    df = pd.DataFrame({
+                        "time_step": payload[f"{w}_time_step"],
+                        "horizon": payload[f"{w}_horizon"],
+                        "y_true": payload[f"{w}_y_true"],
+                        **{f"y_prob_{m}": payload[f"{w}_y_prob_{m}"] for m in ALL_MODELS},
+                    })
+                    cache[w] = (df, json.loads(str(payload[f"{w}_thresholds_json"])))
             print(f"[CACHE HIT] split={split}, horizon={hs}, hash={PARAM_HASH}")
             return cache, pd.read_csv(main, index_col="Evaluation metric")
         except Exception as exc:
@@ -629,6 +639,7 @@ def process(task, split, horizon, outdir):
 
         if sub.empty or sub.y_true.nunique() != 2:
             print(f"[WINDOW SKIP] {split}/{hs}/{w}: empty or single-class test set")
+            payload[f"{w}_is_empty"] = np.array(True)
             continue
 
         ts = {}
@@ -703,6 +714,7 @@ def process(task, split, horizon, outdir):
         results[w] = rec
         cache[w] = (sub, ts)
         payload.update({
+            f"{w}_is_empty": np.array(False),
             f"{w}_time_step": sub.time_step.values,
             f"{w}_horizon": sub.horizon.values,
             f"{w}_y_true": sub.y_true.values,
@@ -736,21 +748,28 @@ def process(task, split, horizon, outdir):
 
 
 # ==========================================
-# Visualization Functions (restored layout)
+# Visualization Functions
 # ==========================================
 
 def render_bars(task, horizon, outdir, hs, csv_summaries_in_memory=None):
     """Render grouped bar charts (rows 1-4) + statistical test matrix rows (5-6),
-    matching the original figure layout exactly.
+    strictly locking y-tick locations across all subplots in every row.
     """
     metrics_to_plot = [("ROC-AUC", "↑"), ("PR-AUC", "↑"), ("Sensitivity", "↑"), ("Specificity", "↑")]
+    
+    metric_yticks_map = {
+        "ROC-AUC": np.arange(0.5, 0.95, 0.1),
+        "PR-AUC": np.arange(0.0, 0.45, 0.1),
+        "Sensitivity": np.arange(0.0, 1.1, 0.2),
+        "Specificity": np.arange(0.0, 1.1, 0.2),
+    }
     metric_ylim_map = {"ROC-AUC": (0.5, 0.9), "PR-AUC": (0.0, 0.4), "Sensitivity": (0.0, 1.0), "Specificity": (0.0, 1.0)}
 
     n_windows = len(CLINICAL_WINDOWS)
     n_splits = len(SPLIT_TYPES)
     n_metrics = len(metrics_to_plot)
     total_rows = n_metrics + 2
-    row_height_ratios = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    row_height_ratios = [1.0, 1.0, 1.0, 1.0, 0.8, 0.8]
 
     fig, axes = plt.subplots(
         total_rows, n_splits, figsize=(8.5 * n_splits, 25),
@@ -775,9 +794,13 @@ def render_bars(task, horizon, outdir, hs, csv_summaries_in_memory=None):
     for m_idx, (metric_prefix, arrow) in enumerate(metrics_to_plot):
         metric_label = f"{metric_prefix} ({arrow})"
         ylim = metric_ylim_map.get(metric_prefix, (0.0, 1.0))
+        yticks = metric_yticks_map[metric_prefix]
 
         for s_idx, split in enumerate(SPLIT_TYPES):
             ax = axes[m_idx, s_idx]
+            ax.set_axisbelow(True)
+            ax.minorticks_off()
+
             split_title = split.replace("_", " ").capitalize()
             x_group_centers = np.arange(n_windows)
             n_models = len(MODEL_PLOT_ORDER)
@@ -808,25 +831,30 @@ def render_bars(task, horizon, outdir, hs, csv_summaries_in_memory=None):
                 ax.bar(
                     x_group_centers + offsets[m_model_idx], pes, width=bar_width,
                     yerr=[yerr_low, yerr_high], capsize=4,
-                    error_kw={"elinewidth": 1.8, "capthick": 1.5},
-                    color=c_hex, edgecolor="black", linewidth=1.0, alpha=0.85,
+                    error_kw={"elinewidth": 1.8, "capthick": 1.5, "zorder": 3},
+                    color=c_hex, edgecolor="black", linewidth=1.0, alpha=0.85, zorder=2,
                     label=MODEL_FULLNAME_MAP[m] if (m_idx == 0 and s_idx == 0) else "",
                 )
 
             ax.set_xticks(x_group_centers)
             ax.set_xticklabels(CONCISE_WINDOW_LABELS, fontsize=20, fontweight="bold")
+            
             ax.set_ylim(ylim)
-            ax.grid(True, linestyle=":", alpha=0.5, axis="y")
+            ax.set_yticks(yticks)
+
+            ax.grid(True, which="major", linestyle=":", color="#eeeeee", linewidth=1.0, alpha=0.9, axis="y", zorder=0)
+            ax.grid(False, which="minor")
             
             if m_idx == 0:
                 ax.set_title(split_title, fontsize=26, fontweight="bold", pad=18)
                 
-            # Ticks only on the leftmost plot column
             if s_idx == 0:
                 ax.set_ylabel(metric_label, fontsize=26, fontweight="bold", labelpad=22)
-                ax.tick_params(axis="y", labelsize=20, length=6, width=1.5, left=True, labelleft=True)
+                ax.tick_params(axis="y", labelsize=20, length=6, width=1.0, left=True, labelleft=True, which="both")
+                ax.tick_params(axis="x", length=6, width=1.0)
             else:
-                ax.tick_params(axis="y", left=True, labelleft=False, length=6, width=1.5)
+                ax.tick_params(axis="y", left=False, labelleft=False, which="both")
+                ax.tick_params(axis="x", length=6, width=1.0)
 
     test_rows_info = [("PR-AUC test", "PR-AUC"), ("McNemar test", "McNemar")]
     sub_baselines = ["LR", "RF", "XGB"]
@@ -836,16 +864,18 @@ def render_bars(task, horizon, outdir, hs, csv_summaries_in_memory=None):
         ax_row = n_metrics + test_idx
         for s_idx, split in enumerate(SPLIT_TYPES):
             ax = axes[ax_row, s_idx]
+            ax.set_axisbelow(True)
+            ax.minorticks_off()
             ax.set_xlim([-0.5, n_windows - 0.5])
             ax.set_ylim([-1.1, 1.1])
             
-            # Configure standard y-ticks matching the metric plots (at y_positions)
             ax.set_yticks(y_positions)
             ax.set_yticklabels(["", "", ""])
             
             if s_idx == 0:
                 ax.set_ylabel(test_row_label, fontsize=26, fontweight="bold", labelpad=22)
-                ax.tick_params(axis="y", length=6, width=1.5, left=True, labelleft=False)
+                ax.tick_params(axis="y", length=6, width=1.0, left=True, labelleft=False, which="both")
+                ax.tick_params(axis="x", length=6, width=1.0)
                 for b_idx, base_disp in enumerate(sub_baselines):
                     ax.text(
                         -0.03, y_positions[b_idx], f"vs\n{base_disp}",
@@ -853,10 +883,14 @@ def render_bars(task, horizon, outdir, hs, csv_summaries_in_memory=None):
                         fontsize=20, color="#222222",
                     )
             else:
-                ax.tick_params(axis="y", length=6, width=1.5, left=True, labelleft=False)
+                ax.tick_params(axis="y", left=False, labelleft=False, which="both")
+                ax.tick_params(axis="x", length=6, width=1.0)
 
             ax.set_xticks(np.arange(n_windows))
             ax.set_xticklabels(CONCISE_WINDOW_LABELS, fontsize=20, fontweight="bold")
+
+            for y_pos in y_positions:
+                ax.axhline(y_pos, color="#eeeeee", linestyle=":", linewidth=1.0, zorder=0)
 
             df_summary = csv_summary_by_split.get(split, pd.DataFrame())
             cache_dict = npz_data_by_split.get(split, {})
@@ -892,30 +926,27 @@ def render_bars(task, horizon, outdir, hs, csv_summaries_in_memory=None):
 
                     ax.add_patch(plt.Rectangle(
                         (w_idx - 0.38, y_positions[b_idx] - 0.25), 0.76, 0.50,
-                        facecolor=face_c, edgecolor=edge_c, linewidth=1.0, alpha=alpha_v,
+                        facecolor=face_c, edgecolor=edge_c, linewidth=1.0, alpha=alpha_v, zorder=2,
                     ))
                     ax.text(w_idx, y_positions[b_idx], winner_token, ha="center", va="center",
-                            fontsize=16, fontweight="bold", color="#000000")
+                            fontsize=16, fontweight="bold", color="#000000", zorder=3)
 
             for k in range(n_windows - 1):
-                ax.axvline(k + 0.5, color="#dddddd", linestyle="--", linewidth=1.0)
-                
-            # Consistent bright gray horizontal guide lines for each tick level across all subplots
-            for y_pos in y_positions:
-                ax.axhline(y_pos, color="#eeeeee", linestyle=":", linewidth=1.0)
-                
-            ax.axhline(0.32, color="#eeeeee", linestyle=":", linewidth=0.8)
-            ax.axhline(-0.32, color="#eeeeee", linestyle=":", linewidth=0.8)
+                ax.axvline(k + 0.5, color="#dddddd", linestyle="--", linewidth=1.0, zorder=1)
 
     fig.align_ylabels(axes[:, 0])
     handles, labels = axes[0, 0].get_legend_handles_labels()
     if handles:
-        fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 1.025),
-                   ncol=len(MODEL_PLOT_ORDER), fontsize=22, frameon=True, framealpha=0.9, borderpad=0.25)
+        fig.legend(
+            handles, labels, loc="upper center", bbox_to_anchor=(0.5, 1.014),
+            ncol=len(MODEL_PLOT_ORDER), fontsize=22, frameon=True, framealpha=0.9, borderpad=0.25,
+        )
 
     acronym_explanation = "Clinical phases:  POP = Perioperative  |  OPT = Opportunistic  |  MTN = Maintenance  |  LT = Long-term  |  VLT = Very long-term"
-    fig.text(0.5, 0.98, acronym_explanation, ha="center", va="center", fontsize=22, color="black",
-              bbox=dict(boxstyle="round,pad=0.25", facecolor="#f8f8f8", edgecolor="#cccccc", alpha=0.9))
+    fig.text(
+        0.5, 0.973, acronym_explanation, ha="center", va="center", fontsize=22, color="black",
+        bbox=dict(boxstyle="round,pad=0.25", facecolor="#f8f8f8", edgecolor="#cccccc", alpha=0.9),
+    )
 
     plt.subplots_adjust(top=0.935, hspace=0.25, wspace=0.06)
     fig.savefig(outdir / f"matrix_bar_performance_comparison_{hs}.png", dpi=200, bbox_inches="tight")
@@ -923,13 +954,13 @@ def render_bars(task, horizon, outdir, hs, csv_summaries_in_memory=None):
 
 
 def render_curves(cache, outdir, hs):
-    """Render ROC, PR, and Decision Curve Analysis (DCA) grids with the original per-window labeling."""
+    """Render ROC, PR, and Decision Curve Analysis (DCA) grids with synchronized y-ticks across all columns."""
     n_windows = len(CLINICAL_WINDOWS)
     n_splits = len(SPLIT_TYPES)
 
-    fig_roc, axes_roc = plt.subplots(n_windows, n_splits, figsize=(7.5 * n_splits, 5 * n_windows), squeeze=False)
-    fig_pr, axes_pr = plt.subplots(n_windows, n_splits, figsize=(7.5 * n_splits, 5 * n_windows), squeeze=False)
-    fig_dca, axes_dca = plt.subplots(n_windows, n_splits, figsize=(7.5 * n_splits, 5 * n_windows), squeeze=False)
+    fig_roc, axes_roc = plt.subplots(n_windows, n_splits, figsize=(7.5 * n_splits, 4.5 * n_windows), squeeze=False)
+    fig_pr, axes_pr = plt.subplots(n_windows, n_splits, figsize=(7.5 * n_splits, 4.5 * n_windows), squeeze=False)
+    fig_dca, axes_dca = plt.subplots(n_windows, n_splits, figsize=(7.5 * n_splits, 4.5 * n_windows), squeeze=False)
 
     for w_idx, window_name in enumerate(CLINICAL_WINDOWS):
         max_dca_y_limit = 0.02
@@ -939,9 +970,15 @@ def render_curves(cache, outdir, hs):
                 prevalence = np.sum(sub_df.y_true.values == 1) / len(sub_df)
                 max_dca_y_limit = max(max_dca_y_limit, prevalence * 1.05)
 
+        dca_yticks = np.linspace(0.0, max_dca_y_limit, 5)
+
         for s_idx, split in enumerate(SPLIT_TYPES):
             ax_roc, ax_pr, ax_dca = axes_roc[w_idx, s_idx], axes_pr[w_idx, s_idx], axes_dca[w_idx, s_idx]
             split_title = split.replace("_", " ").capitalize()
+
+            for ax in (ax_roc, ax_pr, ax_dca):
+                ax.set_axisbelow(True)
+                ax.minorticks_off()
 
             if split not in cache or window_name not in cache[split]:
                 for ax, lbl in [(ax_roc, "Sensitivity"), (ax_pr, "Precision"), (ax_dca, "Net benefit")]:
@@ -958,43 +995,66 @@ def render_curves(cache, outdir, hs):
             sub_df, _ = cache[split][window_name]
             y_true = sub_df.y_true.values
 
+            # --- ROC Curves ---
             for m in MODEL_PLOT_ORDER:
                 p_arr = sub_df[f"y_prob_{m}"].values
                 c_hex = COLORS[m]
                 label = MODEL_FULLNAME_MAP[m] if (w_idx == 0 and s_idx == 0) else ""
                 fpr, tpr, _ = roc_curve(y_true, p_arr)
-                ax_roc.plot(fpr, tpr, label=label, color=c_hex, lw=3.5)
-            ax_roc.plot([0, 1], [0, 1], linestyle="--", color="gray", alpha=0.5)
-            ax_roc.set_xlim([0.0, 1.0]); ax_roc.set_ylim([0.0, 1.05])
-            ax_roc.grid(True, linestyle=":", alpha=0.5); ax_roc.tick_params(labelsize=20)
+                ax_roc.plot(fpr, tpr, label=label, color=c_hex, lw=3.5, zorder=2)
+            ax_roc.plot([0, 1], [0, 1], linestyle="--", color="gray", alpha=0.5, zorder=1)
+            ax_roc.set_xlim([0.0, 1.0])
+            ax_roc.set_ylim([0.0, 1.05])
+            
+            ax_roc.set_yticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+            ax_roc.grid(True, which="major", linestyle=":", color="#eeeeee", linewidth=1.0, alpha=0.9, axis="y", zorder=0)
+            ax_roc.grid(False, which="minor")
+            
             if w_idx == 0:
                 ax_roc.set_title(split_title, fontsize=26, fontweight="bold", pad=18)
             if s_idx == 0:
                 ax_roc.set_ylabel(f"{window_name}\n\nSensitivity", fontsize=26, fontweight="bold", labelpad=16)
+                ax_roc.tick_params(axis="y", labelsize=20, length=6, width=1.0, left=True, labelleft=True, which="both")
+                ax_roc.tick_params(axis="x", labelsize=20, length=6, width=1.0)
+            else:
+                ax_roc.tick_params(axis="y", left=False, labelleft=False, which="both")
+                ax_roc.tick_params(axis="x", labelsize=20, length=6, width=1.0)
             if w_idx == n_windows - 1:
                 ax_roc.set_xlabel("1.0 - Specificity", fontsize=24, fontweight="bold", labelpad=14)
 
+            # --- PR Curves ---
             for m in MODEL_PLOT_ORDER:
                 p_arr = sub_df[f"y_prob_{m}"].values
                 c_hex = COLORS[m]
                 label = MODEL_FULLNAME_MAP[m] if (w_idx == 0 and s_idx == 0) else ""
                 prec_arr, rec_arr, _ = precision_recall_curve(y_true, p_arr)
-                ax_pr.plot(rec_arr, prec_arr, label=label, color=c_hex, lw=3.5)
-            ax_pr.set_xlim([0.0, 1.0]); ax_pr.set_ylim([0.0, 1.05])
-            ax_pr.grid(True, linestyle=":", alpha=0.5); ax_pr.tick_params(labelsize=20)
+                ax_pr.plot(rec_arr, prec_arr, label=label, color=c_hex, lw=3.5, zorder=2)
+            ax_pr.set_xlim([0.0, 1.0])
+            ax_pr.set_ylim([0.0, 1.05])
+            
+            ax_pr.set_yticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+            ax_pr.grid(True, which="major", linestyle=":", color="#eeeeee", linewidth=1.0, alpha=0.9, axis="y", zorder=0)
+            ax_pr.grid(False, which="minor")
+            
             if w_idx == 0:
                 ax_pr.set_title(split_title, fontsize=26, fontweight="bold", pad=18)
             if s_idx == 0:
                 ax_pr.set_ylabel(f"{window_name}\n\nPrecision", fontsize=26, fontweight="bold", labelpad=16)
+                ax_pr.tick_params(axis="y", labelsize=20, length=6, width=1.0, left=True, labelleft=True, which="both")
+                ax_pr.tick_params(axis="x", labelsize=20, length=6, width=1.0)
+            else:
+                ax_pr.tick_params(axis="y", left=False, labelleft=False, which="both")
+                ax_pr.tick_params(axis="x", labelsize=20, length=6, width=1.0)
             if w_idx == n_windows - 1:
                 ax_pr.set_xlabel("Recall", fontsize=24, fontweight="bold", labelpad=14)
 
+            # --- DCA Curves ---
             dca_thresh = np.linspace(0.01, 0.50, 50)
             prevalence = np.sum(y_true == 1) / len(y_true)
             ax_dca.plot(dca_thresh, np.zeros_like(dca_thresh), color="#1a1a1a", linestyle="--", lw=3.5,
-                        label="Treat none" if (w_idx == 0 and s_idx == 0) else "")
+                        label="Treat none" if (w_idx == 0 and s_idx == 0) else "", zorder=1)
             ax_dca.plot(dca_thresh, prevalence - (1.0 - prevalence) * (dca_thresh / (1.0 - dca_thresh)),
-                        color="#a0a0a0", linestyle="--", lw=3.5, label="Treat all" if (w_idx == 0 and s_idx == 0) else "")
+                        color="#a0a0a0", linestyle="--", lw=3.5, label="Treat all" if (w_idx == 0 and s_idx == 0) else "", zorder=1)
             for m in MODEL_PLOT_ORDER:
                 p_arr = sub_df[f"y_prob_{m}"].values
                 c_hex = COLORS[m]
@@ -1004,25 +1064,35 @@ def render_curves(cache, outdir, hs):
                     - (np.sum((p_arr >= t) & (y_true == 0)) / len(y_true)) * (t / (1.0 - t))
                     for t in dca_thresh
                 ]
-                ax_dca.plot(dca_thresh, net_benefit, label=label, color=c_hex, lw=3.5)
+                ax_dca.plot(dca_thresh, net_benefit, label=label, color=c_hex, lw=3.5, zorder=2)
 
             ax_dca.set_xlim([0.0, 0.5])
             ax_dca.set_ylim([-0.005 if max_dca_y_limit < 0.1 else -0.03, max_dca_y_limit])
-            ax_dca.yaxis.set_major_locator(ticker.MaxNLocator(nbins=6))
+            
+            ax_dca.set_yticks(dca_yticks)
             ax_dca.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.2f"))
-            ax_dca.grid(True, linestyle=":", alpha=0.5); ax_dca.tick_params(labelsize=20)
+            ax_dca.grid(True, which="major", linestyle=":", color="#eeeeee", linewidth=1.0, alpha=0.9, axis="y", zorder=0)
+            ax_dca.grid(False, which="minor")
+            
             if w_idx == 0:
                 ax_dca.set_title(split_title, fontsize=26, fontweight="bold", pad=18)
             if s_idx == 0:
                 ax_dca.set_ylabel(f"{window_name}\n\nNet benefit", fontsize=26, fontweight="bold", labelpad=16)
+                ax_dca.tick_params(axis="y", labelsize=20, length=6, width=1.0, left=True, labelleft=True, which="both")
+                ax_dca.tick_params(axis="x", labelsize=20, length=6, width=1.0)
+            else:
+                ax_dca.tick_params(axis="y", left=False, labelleft=False, which="both")
+                ax_dca.tick_params(axis="x", labelsize=20, length=6, width=1.0)
             if w_idx == n_windows - 1:
                 ax_dca.set_xlabel("Threshold probability", fontsize=24, fontweight="bold", labelpad=14)
 
     for fig_obj, ax_grid in [(fig_roc, axes_roc), (fig_pr, axes_pr), (fig_dca, axes_dca)]:
         handles, labels = ax_grid[0, 0].get_legend_handles_labels()
         if handles:
-            fig_obj.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 1.025),
-                            ncol=len(handles), fontsize=24, frameon=True, framealpha=0.9)
+            fig_obj.legend(
+                handles, labels, loc="upper center", bbox_to_anchor=(0.544, 1.04),
+                ncol=len(handles), fontsize=24, frameon=True, framealpha=0.9,
+            )
 
     fig_roc.align_ylabels(axes_roc[:, 0])
     fig_pr.align_ylabels(axes_pr[:, 0])
