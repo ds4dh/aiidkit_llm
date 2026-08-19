@@ -50,7 +50,7 @@ MODEL_PATH: Path | None = Path(
 
 DATA_DIR: Path | None = Path(
     "/home/shares/ds4dh/aiidkit_project/data_new/"
-    "processed/v3.6/teav/temporal_split"
+    "processed/v3.6_old/teav/temporal_split"
 )
 # Set to None to force DEMO MODE regardless of whether the path exists:
 # DATA_DIR = None

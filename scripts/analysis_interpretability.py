@@ -2,6 +2,7 @@ import gc
 import re
 import yaml
 import torch
+import argparse
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -27,7 +28,6 @@ from src.model.patient_embedder import PatientEmbeddingModelFactory, PatientData
 from src.evaluation.evaluate_models import ModelInterpreter
 from scripts.script_utils import find_best_checkpoint, extract_horizons_from_path, get_best_optuna_run
 
-
 CLI_CFG = {}
 SAFE_NUM_PROC = 4
 GENERATE_SANITIZE_PLOTS = False
@@ -36,24 +36,36 @@ GENERATE_SANITIZE_PLOTS = False
 # GLOBAL MAPPINGS AND CONFIGURATION
 # =================================
 
+# Parse CLI arguments
+parser = argparse.ArgumentParser(description="Run Captum attribution analysis.")
+parser.add_argument("--results-dir", type=Path, default=Path("results_final"), help="Base directory for results")
+parser.add_argument("--data-split-type", type=str, default="temporal_split", help="Data split strategy (e.g., temporal)")
+parser.add_argument("--top-k", type=int, default=15, help="Top K features to analyze/display")
+parser.add_argument("--min-freq", type=int, default=20, help="Minimum feature frequency threshold")
+parser.add_argument("--max-delta", type=float, default=0.10, help="Maximum allowed Captum delta error")
+parser.add_argument("--agg-method", type=str, default="mean", choices=["mean", "sum"], help="Aggregation method")
+parser.add_argument("--num-samples", type=int, default=1000, help="Number of samples to analyze")
+parser.add_argument("--num-steps", type=int, default=200, help="Number of Integrated Gradients steps")
+args, _ = parser.parse_known_args()
+
 # Run configuration
-RESULTS_DIR = Path("results_final")
+RESULTS_DIR = args.results_dir
+DATA_SPLIT_TYPE = args.data_split_type
 TRANSFORMER_BASE_DIR = RESULTS_DIR / "transformer"
 OUTPUT_DIR_BASE_NAME = RESULTS_DIR / "analysis" / "interpretability"
 DATA_DIR = Path("/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6_old/teav")
 CONFIG_PATH = Path("configs/discriminative_training.yaml")
 FROM_OPTUNA = "optuna" in TRANSFORMER_BASE_DIR.name
-DATA_SPLIT_TYPE = "temporal"  # "temporal_split"
 PLOT_ONLY = False  # run downstream plots directly from cache
 MAX_LEGEND_VALUES_TO_SHOW = 5  # threshold capping distinct legend item limits
 
 # Captum configuration
-TOP_K = 15
-MIN_FREQ = 20
-MAX_DELTA = 0.10
-AGG_METHOD = "mean"
-NUM_CAPTUM_SAMPLES = 1000
-NUM_CAPTUM_STEPS = 200
+TOP_K = args.top_k
+MIN_FREQ = args.min_freq
+MAX_DELTA = args.max_delta
+AGG_METHOD = args.agg_method
+NUM_CAPTUM_SAMPLES = args.num_samples
+NUM_CAPTUM_STEPS = args.num_steps
 
 # -------------------------------------------------------------------------------------------------------
 # THEORETICAL INTERPRETABILITY FRAMEWORK CONSTANTS

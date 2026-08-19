@@ -78,39 +78,6 @@ def extract_horizons_from_path(checkpoint_path: Path) -> list[int]:
     return [int(h) for h in match.group(1).split("-")] 
 
 
-# def paired_bootstrap_pr_auc_pvalue(
-#     y_true: np.ndarray, 
-#     p_tf: np.ndarray, 
-#     p_base: np.ndarray, 
-#     n_bootstraps: int = 1000, 
-#     seed: int = 42
-# ) -> float:
-#     """
-#     Computes a one-tailed paired bootstrap p-value testing if Transformer PR-AUC
-#     is significantly higher than a baseline model's PR-AUC on the exact same test samples.
-#     """
-#     if len(np.unique(y_true)) < 2:
-#         return np.nan
-        
-#     n_samples = len(y_true)
-#     rng = np.random.default_rng(seed)
-#     boot_indices = rng.choice(n_samples, size=(n_bootstraps, n_samples), replace=True)
-    
-#     diffs = []
-#     for idx in boot_indices:
-#         yt_b = y_true[idx]
-#         if len(np.unique(yt_b)) < 2:
-#             continue
-#         auc_tf = average_precision_score(yt_b, p_tf[idx])
-#         auc_base = average_precision_score(yt_b, p_base[idx])
-#         diffs.append(auc_tf - auc_base)
-        
-#     if not diffs:
-#         return np.nan
-        
-#     # Empirical p-value for the hypothesis: Transformer PR-AUC > Baseline PR-AUC
-#     p_value = np.mean(np.array(diffs) <= 0)
-#     return float(p_value)
 def _pr_auc_diff_chunk(y_true, p_tf, p_base, index_chunk):
     """Compute PR-AUC diffs for a chunk of bootstrap index arrays.
 

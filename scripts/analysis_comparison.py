@@ -1089,8 +1089,9 @@ def render_curves(cache, outdir, hs):
     for fig_obj, ax_grid in [(fig_roc, axes_roc), (fig_pr, axes_pr), (fig_dca, axes_dca)]:
         handles, labels = ax_grid[0, 0].get_legend_handles_labels()
         if handles:
+            bbox_x = 0.5 if fig_obj is fig_dca else 0.544
             fig_obj.legend(
-                handles, labels, loc="upper center", bbox_to_anchor=(0.544, 1.04),
+                handles, labels, loc="upper center", bbox_to_anchor=(bbox_x, 1.04),
                 ncol=len(handles), fontsize=24, frameon=True, framealpha=0.9,
             )
 
