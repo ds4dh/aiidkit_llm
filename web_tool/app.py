@@ -89,6 +89,63 @@ def _get_event_info_from_row(row, task_key):
         return None, 0.0
 
 
+def parse_clusters_into_risk_groups(cluster_rates: list) -> dict:
+    """
+    Optimally partitions K clusters ordered by aggregated model risk into
+    High risk (0), Low risk (1), and Medium risk (2) tiers.
+
+    Uses 1D Fisher-Jenks Natural Breaks optimization (minimizing intra-tier variance
+    and maximizing inter-tier separation) for K >= 3 clusters.
+    """
+    if not cluster_rates:
+        return {}
+
+    sorted_clusters = sorted(cluster_rates, key=lambda x: x[1], reverse=True)
+    K = len(sorted_clusters)
+    label_map = {}
+
+    if K == 1:
+        label_map[sorted_clusters[0][0]] = 0  # High risk
+        return label_map
+
+    if K == 2:
+        label_map[sorted_clusters[0][0]] = 0  # High risk
+        label_map[sorted_clusters[1][0]] = 1  # Low risk
+        return label_map
+
+    # K >= 3: 1D Fisher-Jenks Natural Breaks Optimization
+    risks = [r for _, r in sorted_clusters]
+    best_loss = float('inf')
+    best_split = (1, K - 1)
+
+    for i in range(1, K - 1):
+        for j in range(i + 1, K):
+            g_high = risks[:i]
+            g_med  = risks[i:j]
+            g_low  = risks[j:]
+
+            var_high = sum((x - sum(g_high)/len(g_high))**2 for x in g_high) if g_high else 0
+            var_med  = sum((x - sum(g_med)/len(g_med))**2 for x in g_med) if g_med else 0
+            var_low  = sum((x - sum(g_low)/len(g_low))**2 for x in g_low) if g_low else 0
+
+            total_loss = var_high + var_med + var_low
+            if total_loss < best_loss:
+                best_loss = total_loss
+                best_split = (i, j)
+
+    split_high, split_low = best_split
+
+    for rank, (cid, rate) in enumerate(sorted_clusters):
+        if rank < split_high:
+            label_map[cid] = 0  # High risk
+        elif rank < split_low:
+            label_map[cid] = 2  # Medium risk
+        else:
+            label_map[cid] = 1  # Low risk
+
+    return label_map
+
+
 def _generate_real_cohort_data(test_dir_path) -> dict:
     """
     Load the real test split, run the real model over it to compute risk scores,
@@ -213,47 +270,67 @@ def _generate_real_cohort_data(test_dir_path) -> dict:
     _REAL_UMAP_REDUCER = umap.UMAP(n_components=2, random_state=42)
     coords_2d = _REAL_UMAP_REDUCER.fit_transform(embeddings)
 
-    cluster_colors = {0: "#FF4757", 1: "#00C9A7"}
-    cluster_names = {0: "High risk", 1: "Low risk"}
-
     horizon_idx = CONFIG.AVAILABLE_HORIZONS.index(CONFIG.DEFAULT_HORIZON)
+
+    # Helper mapping functions
+    def _get_cluster_name(cid: int) -> str:
+        names = {0: "High risk", 1: "Low risk", 2: "Medium risk"}
+        return names.get(cid, "Medium risk")
+
+    def _get_cluster_color(cid: int) -> str:
+        colors = {0: "#FF4757", 1: "#00C9A7", 2: "#FFA502"}
+        return colors.get(cid, "#FFA502")
 
     # Run clustering depending on CONFIG.CLUSTERING_METHOD
     if getattr(CONFIG, "CLUSTERING_METHOD", "model_risk") == "clusterer":
-        print("[AIIDKIT] Running HDBSCAN clustering...")
+        print("[AIIDKIT] Running HDBSCAN clustering (matching analysis_stratification.py)...")
         
-        # Reduce embeddings specifically for clustering (independent of visualization UMAP)
-        n_comp = getattr(CONFIG, "CLUSTERING_UMAP_COMPONENTS", 15)
+        # Match analysis_stratification.py: n_components=2, min_cluster_size=15, min_samples=5
+        n_comp = getattr(CONFIG, "CLUSTERING_UMAP_COMPONENTS", 2)
+        min_c_size = getattr(CONFIG, "HDBSCAN_MIN_CLUSTER_SIZE", 15)
+        min_samp = getattr(CONFIG, "HDBSCAN_MIN_SAMPLES", 5)
+
         if n_comp > 0 and n_comp < embeddings.shape[1]:
-            print(f"[AIIDKIT] Reducing embeddings to {n_comp} dimensions via UMAP before clustering...")
             reducer = umap.UMAP(n_components=n_comp, random_state=42)
             cluster_input = reducer.fit_transform(embeddings)
         else:
-            cluster_input = coords_2d  # fallback to 2D UMAP coordinates
+            cluster_input = coords_2d
             
-        clusterer = hdbscan.HDBSCAN(min_cluster_size=15, min_samples=5)
+        clusterer = hdbscan.HDBSCAN(min_cluster_size=min_c_size, min_samples=min_samp)
         cluster_labels = clusterer.fit_predict(cluster_input)
         
         unique_labels = [l for l in np.unique(cluster_labels) if l != -1]
-        label_map = {}
+        
+        # Rank clusters by aggregated model risk (mean predicted risk score across cluster)
+        cluster_rates = []
         for l in unique_labels:
             mask_l = cluster_labels == l
-            mean_risk = float(probs[mask_l, horizon_idx].mean())
-            if mean_risk >= CONFIG.RISK_THRESHOLD:
-                label_map[l] = 0
-            else:
-                label_map[l] = 1
+            mean_model_risk = float(probs[mask_l, horizon_idx].mean())
+            cluster_rates.append((l, mean_model_risk))
+        
+        label_map = parse_clusters_into_risk_groups(cluster_rates)
         
         ui_cluster_labels = []
+        non_noise_mask = cluster_labels != -1
         for i, l in enumerate(cluster_labels):
             if l == -1:
-                ui_cluster_labels.append(0 if probs[i, horizon_idx] >= CONFIG.RISK_THRESHOLD else 1)
+                if non_noise_mask.any():
+                    dists = np.linalg.norm(cluster_input[non_noise_mask] - cluster_input[i], axis=1)
+                    nearest_idx = np.where(non_noise_mask)[0][np.argmin(dists)]
+                    ui_cluster_labels.append(label_map[cluster_labels[nearest_idx]])
+                else:
+                    ui_cluster_labels.append(0 if probs[i, horizon_idx] >= 0.50 else 1)
             else:
                 ui_cluster_labels.append(label_map[l])
     else:
-        # model_risk mode: partition cohort purely based on risk threshold
-        print("[AIIDKIT] Clustering defined by model risk score threshold...")
-        ui_cluster_labels = [0 if probs[i, horizon_idx] >= CONFIG.RISK_THRESHOLD else 1 for i in range(n_patients)]
+        # model_risk mode: partition cohort purely based on risk score rank
+        print("[AIIDKIT] Clustering defined by model risk score rank...")
+        ui_cluster_labels = [0 if probs[i, horizon_idx] >= 0.50 else 1 for i in range(n_patients)]
+
+    # Dynamic cluster names and colors for all active cluster IDs
+    unique_cids = sorted(list(set(ui_cluster_labels)))
+    cluster_names = {cid: _get_cluster_name(cid) for cid in unique_cids}
+    cluster_colors = {cid: _get_cluster_color(cid) for cid in unique_cids}
 
     # Generate clinical summaries
     id2vocab = {v: k for k, v in _REAL_VOCAB.items()}
@@ -369,12 +446,12 @@ def _generate_real_cohort_data(test_dir_path) -> dict:
         }
 
         # Count patient-level features in each cluster for prevalence calculations
-        cluster_sizes = {0: 0, 1: 0}
+        cluster_sizes = defaultdict(int)
         for label in ui_cluster_labels:
-            cluster_sizes[label] = cluster_sizes.get(label, 0) + 1
+            cluster_sizes[label] += 1
             
-        static_counts = {0: defaultdict(int), 1: defaultdict(int)}
-        recent_counts = {0: defaultdict(int), 1: defaultdict(int)}
+        static_counts = defaultdict(lambda: defaultdict(int))
+        recent_counts = defaultdict(lambda: defaultdict(int))
         all_static_features = set()
         all_recent_features = set()
         
@@ -435,24 +512,35 @@ def _generate_real_cohort_data(test_dir_path) -> dict:
 
         cluster_profiles = {}
         for c_id in [0, 1]:
-            other_c_id = 1 - c_id
+            if c_id not in unique_cids:
+                continue
+            opp_id = 1 - c_id  # 0 (High) vs 1 (Low), or 1 (Low) vs 0 (High)
             c_size = cluster_sizes.get(c_id, 0)
-            other_size = cluster_sizes.get(other_c_id, 0)
+            opp_size = cluster_sizes.get(opp_id, 0)
             
             c_labels = [h_patients[i]["true_label"] for i in range(n_patients) if ui_cluster_labels[i] == c_id]
             event_rate = float(np.mean(c_labels)) if c_labels else 0.0
             
-            # Static diffs
+            # Static differential features (enriched in current cluster vs opposite cluster)
             static_diffs = []
             for feat in all_static_features:
                 p_c = (static_counts[c_id][feat] / c_size) if c_size > 0 else 0.0
-                p_other = (static_counts[other_c_id][feat] / other_size) if other_size > 0 else 0.0
-                diff = p_c - p_other
-                if diff > 0.0:
-                    static_diffs.append((feat, diff))
-            sorted_static = sorted(static_diffs, key=lambda x: x[1], reverse=True)[:10]
+                p_opp = (static_counts[opp_id][feat] / opp_size) if opp_size > 0 else 0.0
+                
+                # Exclude ubiquitous features present in > 85% of all cohort patients
+                p_global = (static_counts[c_id][feat] + static_counts[opp_id][feat]) / float(n_patients)
+                if p_global > 0.85:
+                    continue
+                    
+                diff = p_c - p_opp
+                # Only include feature if significantly more prevalent in current cluster vs opposite cluster
+                if diff >= 0.04 and (p_opp == 0 or (p_c / p_opp) >= 1.15):
+                    enrichment_score = diff * (p_c / (p_opp + 0.05))
+                    static_diffs.append((feat, diff, enrichment_score))
+                    
+            sorted_static = sorted(static_diffs, key=lambda x: x[2], reverse=True)[:10]
             top_static = []
-            for (ent, attr, val), diff in sorted_static:
+            for (ent, attr, val), diff, _ in sorted_static:
                 score = diff if c_id == 0 else -diff
                 top_static.append({
                     "feature": f"{ent} - {attr}",
@@ -460,17 +548,26 @@ def _generate_real_cohort_data(test_dir_path) -> dict:
                     "score": score
                 })
 
-            # Recent diffs
+            # Recent differential features (enriched in current cluster vs opposite cluster)
             recent_diffs = []
             for feat in all_recent_features:
                 p_c = (recent_counts[c_id][feat] / c_size) if c_size > 0 else 0.0
-                p_other = (recent_counts[other_c_id][feat] / other_size) if other_size > 0 else 0.0
-                diff = p_c - p_other
-                if diff > 0.0:
-                    recent_diffs.append((feat, diff))
-            sorted_recent = sorted(recent_diffs, key=lambda x: x[1], reverse=True)[:10]
+                p_opp = (recent_counts[opp_id][feat] / opp_size) if opp_size > 0 else 0.0
+                
+                # Exclude ubiquitous features present in > 85% of all cohort patients
+                p_global = (recent_counts[c_id][feat] + recent_counts[opp_id][feat]) / float(n_patients)
+                if p_global > 0.85:
+                    continue
+                    
+                diff = p_c - p_opp
+                # Only include feature if significantly more prevalent in current cluster vs opposite cluster
+                if diff >= 0.04 and (p_opp == 0 or (p_c / p_opp) >= 1.15):
+                    enrichment_score = diff * (p_c / (p_opp + 0.05))
+                    recent_diffs.append((feat, diff, enrichment_score))
+                    
+            sorted_recent = sorted(recent_diffs, key=lambda x: x[2], reverse=True)[:10]
             top_recent = []
-            for (ent, attr, val), diff in sorted_recent:
+            for (ent, attr, val), diff, _ in sorted_recent:
                 score = diff if c_id == 0 else -diff
                 top_recent.append({
                     "feature": f"{ent} - {attr}",
@@ -808,23 +905,13 @@ def _real_predict(events: list[dict], horizon: int, cohort: dict) -> dict:
         for i, h in enumerate(CONFIG.AVAILABLE_HORIZONS)
     }
 
-    from mock_data import _risk_category, CLUSTER_PROFILES
-    category, color = _risk_category(selected_risk)
-
-    # UMAP projection
+    # UMAP projection for new patient
     umap_x, umap_y = 0.0, 0.0
-    # Assign cluster based on risk threshold from config
-    if selected_risk >= CONFIG.RISK_THRESHOLD:
-        best_cluster = CLUSTER_PROFILES[0]
-    else:
-        best_cluster = CLUSTER_PROFILES[1]
-    
     if _REAL_UMAP_REDUCER is not None:
         try:
-            # Get the pooled embedding of this new patient sequence
             last_hidden = outputs.hidden_states[-1] if hasattr(outputs, "hidden_states") else None
             if last_hidden is None:
-                last_hidden = inputs_embeds # approximation
+                last_hidden = inputs_embeds
             mask = attn_mask.unsqueeze(-1)
             sum_embeddings = (last_hidden * mask).sum(dim=1)
             sum_mask = mask.sum(dim=1).clamp(min=1e-9)
@@ -839,21 +926,34 @@ def _real_predict(events: list[dict], horizon: int, cohort: dict) -> dict:
             import random
             seed_val = _deterministic_seed(events)
             local_random = random.Random(seed_val)
-            cx, cy = best_cluster["umap_center"]
-            umap_x = round(cx + local_random.gauss(0, 0.3), 3)
-            umap_y = round(cy + local_random.gauss(0, 0.3), 3)
+            umap_x = round(local_random.gauss(0, 0.3), 3)
+            umap_y = round(local_random.gauss(0, 0.3), 3)
     else:
         import random
         seed_val = _deterministic_seed(events)
         local_random = random.Random(seed_val)
-        cx, cy = best_cluster["umap_center"]
-        umap_x = round(cx + local_random.gauss(0, 0.3), 3)
-        umap_y = round(cy + local_random.gauss(0, 0.3), 3)
+        umap_x = round(local_random.gauss(0, 0.3), 3)
+        umap_y = round(local_random.gauss(0, 0.3), 3)
 
-    # Find the cluster of the patient in the cohort
-    assigned_cluster_id = best_cluster["id"]
-    assigned_cluster_name = best_cluster["name"]
-    assigned_cluster_color = best_cluster["color"]
+    # Match nearest cluster from active cohort based on embedding/UMAP proximity
+    active_cohort = cohort["horizons"][str(horizon)]
+    cohort_pts = active_cohort.get("patients", [])
+    
+    if cohort_pts:
+        nearest_pt = min(
+            cohort_pts,
+            key=lambda p: (p["umap_x"] - umap_x)**2 + (p["umap_y"] - umap_y)**2
+        )
+        assigned_cluster_id = nearest_pt["cluster"]
+        assigned_cluster_name = nearest_pt["cluster_name"]
+        assigned_cluster_color = nearest_pt["cluster_color"]
+    else:
+        assigned_cluster_id = 0 if selected_risk >= 0.50 else 1
+        assigned_cluster_name = "High risk" if assigned_cluster_id == 0 else "Low risk"
+        assigned_cluster_color = "#FF4757" if assigned_cluster_id == 0 else "#00C9A7"
+
+    category = assigned_cluster_name
+    color = assigned_cluster_color
     
     # Calculate similar patients and cohort percentile
     active_cohort = cohort["horizons"][str(horizon)]
@@ -903,32 +1003,36 @@ def _real_predict(events: list[dict], horizon: int, cohort: dict) -> dict:
         
     attributions = sorted(attributions, key=lambda x: abs(x["score"]), reverse=True)[:15]
 
-    # Generate detailed narrative based on attributions and assigned cluster
-    pos_feats = [a for a in attributions if a["score"] > 0.0]
-    neg_feats = [a for a in attributions if a["score"] < 0.0]
+    # Extract risk scores and calibrated risks across horizons
+    h30_score = int(round(risk_scores.get("30d", selected_risk) * 100))
+    h60_score = int(round(risk_scores.get("60d", selected_risk) * 100))
+    h90_score = int(round(risk_scores.get("90d", selected_risk) * 100))
+    
+    h30_calib = int(round(calibrated_risks.get("30d", selected_calibrated_risk) * 100))
+    h60_calib = int(round(calibrated_risks.get("60d", selected_calibrated_risk) * 100))
+    h90_calib = int(round(calibrated_risks.get("90d", selected_calibrated_risk) * 100))
 
-    risk_txt = (
-        f"This patient's predicted {horizon}-day infection score is "
-        f"{selected_risk*100:.1f}/100 ({category}), placing them at the "
-        f"{percentile}th percentile of the reference cohort."
-    )
-    if pos_feats:
-        names = ", ".join(
-            f"{f['feature'].replace('Infection', 'Previous infection')}: {f['value']}" for f in pos_feats[:3]
+    if horizon == 90:
+        risk_txt = (
+            f"The patient's predicted 90-day infection score is {h90_score}/100 (calibrated risk: {h90_calib}%), "
+            f"placing them in the '{assigned_cluster_name}' risk group. "
+            f"Shorter-term 30-day and 60-day infection scores are {h30_score}/100 ({h30_calib}%) and {h60_score}/100 ({h60_calib}%), respectively. "
+            f"Overall, the patient is categorized as {category} for post-transplant bacterial infection."
         )
-        risk_txt += f" Key risk drivers: {names}."
-    if neg_feats:
-        names = ", ".join(
-            f"{f['feature'].replace('Infection', 'Previous infection')}: {f['value']}" for f in neg_feats[:2]
+    elif horizon == 60:
+        risk_txt = (
+            f"The patient's predicted 60-day infection score is {h60_score}/100 (calibrated risk: {h60_calib}%), "
+            f"placing them in the '{assigned_cluster_name}' risk group. "
+            f"Corresponding 30-day and 90-day infection scores are {h30_score}/100 ({h30_calib}%) and {h90_score}/100 ({h90_calib}%), respectively. "
+            f"Overall, the patient is categorized as {category} for post-transplant bacterial infection."
         )
-        risk_txt += f" Protective factors present: {names}."
-
-    matched_profile = next((p for p in CLUSTER_PROFILES if str(p["id"]) == str(assigned_cluster_id)), best_cluster)
-    event_rate_pct = int(matched_profile.get("event_rate", 0) * 100)
-    risk_txt += (
-        f" The patient clusters with the '{assigned_cluster_name}' phenotype "
-        f"(event rate ≈ {event_rate_pct}%)."
-    )
+    else:
+        risk_txt = (
+            f"The patient's predicted 30-day infection score is {h30_score}/100 (calibrated risk: {h30_calib}%), "
+            f"placing them in the '{assigned_cluster_name}' risk group. "
+            f"Longer-term 60-day and 90-day infection scores are {h60_score}/100 ({h60_calib}%) and {h90_score}/100 ({h90_calib}%), respectively. "
+            f"Overall, the patient is categorized as {category} for post-transplant bacterial infection."
+        )
 
     return {
         "risk_scores":       risk_scores,
@@ -994,11 +1098,10 @@ def _enrich_vocabulary_from_synthetic(vocab):
                     attribute = row.get("attribute")
                     val = row.get("value_binned")
                     if entity and attribute and val is not None:
-                        # Ensure string keys/values
                         entity = str(entity).strip()
                         attribute = str(attribute).strip()
                         val = str(val).strip()
-                        if not entity or not attribute:
+                        if not entity or not attribute or not val:
                             continue
                         if entity not in enriched:
                             enriched[entity] = {}
@@ -1008,6 +1111,22 @@ def _enrich_vocabulary_from_synthetic(vocab):
                             enriched[entity][attribute].append(val)
         except Exception as e:
             print(f"[AIIDKIT] Failed to read {filename} for vocabulary enrichment: {e}")
+
+    # Ensure start/stop medication action pairs share complete drug option lists
+    med_pairs = [
+        ("Start (immunosuppression)", "Stop (immunosuppression)"),
+        ("Start (induction)", "Stop (induction)"),
+        ("Start (infection prophylaxis)", "Stop (infection prophylaxis)"),
+        ("Start (other)", "Stop (other)")
+    ]
+    if "Medication" in enriched:
+        for a1, a2 in med_pairs:
+            v1 = set(enriched["Medication"].get(a1, []))
+            v2 = set(enriched["Medication"].get(a2, []))
+            combined = sorted(list(v1 | v2))
+            if combined:
+                enriched["Medication"][a1] = list(combined)
+                enriched["Medication"][a2] = list(combined)
             
     # Sort values for consistency
     ordinals = ["Lowest", "Lower", "Low", "Middle", "High", "Higher", "Highest"]
@@ -1015,14 +1134,12 @@ def _enrich_vocabulary_from_synthetic(vocab):
         for attribute in enriched[entity]:
             vals = enriched[entity][attribute]
             try:
-                # check if all values can be numeric
                 if all(v.replace('.', '', 1).isdigit() or (v.startswith('-') and v[1:].replace('.', '', 1).isdigit()) for v in vals):
                     enriched[entity][attribute] = sorted(vals, key=float)
                     continue
             except Exception:
                 pass
                 
-            # Sort with ordinals custom logic
             if any(o in vals for o in ordinals):
                 enriched[entity][attribute] = sorted(vals, key=lambda x: ordinals.index(x) if x in ordinals else 99)
             else:
@@ -1126,8 +1243,6 @@ def api_example_patient(example_type):
     """Return parsed event sequence from one of the synthetic patient CSV files."""
     mapping = {
         "low": "low_risk.csv",
-        "mod": "medium_risk.csv",
-        "medium": "medium_risk.csv",
         "high": "high_risk.csv",
     }
     

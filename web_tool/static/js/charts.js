@@ -50,6 +50,8 @@ window.AIIDKIT_CHARTS = (() => {
   // UMAP SCATTER  (D3.js v7)
   // ================================================================
 
+  let _umapViewBoxW = 420;
+
   function initUMAP(cohortData) {
     const container = document.getElementById('umap-svg-container');
     if (!container) return;
@@ -58,6 +60,7 @@ window.AIIDKIT_CHARTS = (() => {
 
     const W = container.clientWidth  || 420;
     const H = container.clientHeight || 300;
+    _umapViewBoxW = W;
     // Match legend width used by _drawUMAPLegend so clip region is consistent
     const _legW = Math.round(_rootFontSize() * 7.5);
     const m = { top: 14, right: _legW + 14, bottom: 14, left: 14 };
@@ -176,6 +179,9 @@ window.AIIDKIT_CHARTS = (() => {
       });
 
     _umapPatientG = _umapG.append('g').attr('clip-path', 'url(#umap-clip)');
+    if (_lastPatientCoords) {
+      updateUMAPWithPatient();
+    }
     _drawUMAPLegend(_umapColorMode);
   }
 
@@ -187,11 +193,14 @@ window.AIIDKIT_CHARTS = (() => {
 
     svg.select('.umap-legend-group').remove();
 
-    const W = container.clientWidth  || 420;
-    const H = container.clientHeight || 300;
+    const svgNode = svg.node();
+    let viewBoxW = _umapViewBoxW || 420;
+    if (svgNode && svgNode.viewBox && svgNode.viewBox.baseVal && svgNode.viewBox.baseVal.width > 0) {
+      viewBoxW = svgNode.viewBox.baseVal.width;
+    }
+
     // Legend box width scales with root font so text never clips on 4K
     const legW = Math.round(_rootFontSize() * 7.5);
-    const m = { top: 14, right: legW + 14, bottom: 14, left: 14 };
 
     // ---- Sizing -------------------------------------------------------
     const legDotR      = _umapDotR;           // matches scatter dot size
@@ -211,10 +220,14 @@ window.AIIDKIT_CHARTS = (() => {
 
     let colorItems = [];
     if (mode === 'cluster') {
+      const hasMedium = _umapData && _umapData.some(d => d.cluster === 2 || d.cluster_name === 'Medium risk');
       colorItems = [
         { label: 'High risk', color: '#FF4757' },
-        { label: 'Low risk',  color: '#00C9A7' },
       ];
+      if (hasMedium) {
+        colorItems.push({ label: 'Medium risk', color: '#FFA502' });
+      }
+      colorItems.push({ label: 'Low risk',  color: '#00C9A7' });
     } else if (mode === 'risk') {
       colorItems = [
         { label: 'High risk', color: '#FF4757' },
@@ -230,10 +243,10 @@ window.AIIDKIT_CHARTS = (() => {
     const numRows   = colorItems.length + 2;  // + "Event observed" + "New patient"
     const legHeight = numRows * rowH + 8;     // 4px top + 4px bottom padding
 
-    // ---- Legend group -------------------------------------------------
+    // ---- Legend group anchored to top-right corner of viewBox -------
     const lg = svg.append('g')
       .attr('class', 'umap-legend-group')
-      .attr('transform', `translate(${W - m.right + 6}, ${m.top + 4})`);
+      .attr('transform', `translate(${viewBoxW - legW - 10}, 18)`);
 
     // Background rect (computed height so nothing is clipped)
     lg.append('rect')
@@ -279,11 +292,26 @@ window.AIIDKIT_CHARTS = (() => {
   }
 
 
-  function updateUMAPWithPatient(umapX, umapY) {
-    if (!_umapPatientG || !_umapScaleX || !_umapScaleY) return;
-    const px = _umapScaleX(umapX);
-    const py = _umapScaleY(umapY);
+  let _lastPatientData   = null;
+  let _lastPatientCoords = null;
+
+  function updateUMAPWithPatient(umapX, umapY, patientData) {
+    if (umapX != null && umapY != null) {
+      _lastPatientCoords = { umapX, umapY };
+    }
+    if (patientData) {
+      _lastPatientData = patientData;
+    }
+    
+    const activeCoords = _lastPatientCoords || (patientData ? { umapX: patientData.umap_x, umapY: patientData.umap_y } : null);
+    const activeData   = patientData || _lastPatientData;
+
+    if (!activeCoords || !_umapPatientG || !_umapScaleX || !_umapScaleY) return;
+
+    const px = _umapScaleX(activeCoords.umapX);
+    const py = _umapScaleY(activeCoords.umapY);
     _umapPatientG.selectAll('*').remove();
+    _umapPatientG.raise();
 
     // Scale pulse circle and star with canvas-derived sizes stored at initUMAP
     const pulseR   = _umapStarOuter * 1.08;
@@ -299,13 +327,78 @@ window.AIIDKIT_CHARTS = (() => {
     const isLight = document.documentElement.getAttribute('data-theme') === 'light';
     const starStroke = isLight ? '#475569' : '#ffffff';
 
-    _umapPatientG.append('path')
-      .attr('d', _starPath(px, py, _umapStarOuter, _umapStarInner, 5))
+    const starGroup = _umapPatientG.append('g')
+      .style('cursor', 'pointer')
+      .attr('pointer-events', 'all');
+
+    // Generous invisible hit target circle (r = 22px) for smooth hover detection
+    starGroup.append('circle')
+      .attr('cx', px)
+      .attr('cy', py)
+      .attr('r', 22)
+      .attr('fill', 'transparent')
+      .attr('pointer-events', 'all');
+
+    const starNode = starGroup.append('path')
+      .attr('d', _starPath(px, py, _umapStarOuter * 1.4, _umapStarInner * 1.4, 5))
       .attr('fill', '#FFD700')
-      .attr('stroke', starStroke).attr('stroke-width', 1.8)
+      .attr('stroke', starStroke)
+      .attr('stroke-width', 2)
       .attr('opacity', 0)
-      .transition().duration(450)
-      .attr('opacity', 1);
+      .attr('pointer-events', 'none');
+
+    starNode.transition().duration(450).attr('opacity', 1);
+
+    const container = document.getElementById('umap-svg-container');
+    if (!container) return;
+    let tip = d3.select(container).select('.umap-tooltip');
+    if (tip.empty()) {
+      tip = d3.select(container).append('div').attr('class', 'umap-tooltip');
+    }
+
+    starGroup
+      .on('mouseenter mouseover', function(ev) {
+        starNode.attr('stroke-width', 3.5);
+        const bx = container.getBoundingClientRect();
+        const tipW = 230;
+        const ex = ev.clientX - bx.left;
+        const ey = ev.clientY - bx.top;
+
+        const pData = activeData || {};
+        const activeHorizon = pData.selected_horizon || 90;
+        const horizonKey = `${activeHorizon}d`;
+        const scoreVal = pData.risk_scores?.[horizonKey] ?? pData.risk_score ?? 0;
+        const scoreInt = Math.round(scoreVal * 100);
+        const catName = pData.risk_category || pData.cluster_name || 'Active Patient';
+        const catColor = pData.risk_color || pData.cluster_color || (catName === 'Medium risk' ? '#FFA502' : catName === 'Low risk' ? '#00C9A7' : '#FF4757');
+        const horizonLabel = `${activeHorizon}-day`;
+        
+        let nextEv = 'Stable course (no imminent event)';
+        if (pData.days_to_event != null) {
+          nextEv = `Next event: ~${pData.days_to_event} days`;
+        }
+
+        let summaryHtml = '';
+        if (pData.events_with_scores && pData.events_with_scores.length > 0) {
+          const topEvs = pData.events_with_scores.slice(0, 3).map(e => `${e.entity || ''}: ${e.attribute || ''} (${e.value || ''})`).join('<br>');
+          summaryHtml = `<div class="tooltip-features" style="font-size:0.65rem;color:var(--text-muted);margin-top:4px;line-height:1.3;"><strong>Key events:</strong><br>${topEvs}</div>`;
+        }
+
+        tip.classed('visible', true)
+          .style('left', `${ex + tipW > bx.width ? ex - tipW - 10 : ex + 12}px`)
+          .style('top', `${ey - 15}px`)
+          .html(`
+            <div class="tooltip-id" style="color:#FFD700; font-weight:700; font-size:0.78rem;">★ Active Patient</div>
+            <div class="tooltip-risk" style="font-size:0.74rem;">Infection Score: <strong style="color:${catColor}">${scoreInt}/100</strong> <span style="font-size:0.68rem; opacity:0.8;">(${horizonLabel})</span></div>
+            <div class="tooltip-cluster" style="color:${catColor}; font-weight:600; font-size:0.72rem;">Subgroup: ${catName}</div>
+            <div class="tooltip-summary" style="font-weight:600; margin-top:2px; font-size:0.70rem;">${nextEv}</div>
+            ${summaryHtml}
+          `);
+      })
+      .on('mouseleave mouseout', function() {
+        starNode.attr('stroke-width', 2);
+        tip.classed('visible', false);
+      });
   }
 
   function _starPath(cx, cy, outerR, innerR, pts) {
@@ -604,6 +697,25 @@ window.AIIDKIT_CHARTS = (() => {
     }
 
     const formatFeat = feat => feat.replace(/^Infection\b/, 'Previous infection');
+    const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+
+    const renderTraitCard = (f) => {
+      const fullFeat = formatFeat(f.feature);
+      const parts = fullFeat.split(' - ');
+      const entity = parts[0] || 'Feature';
+      const attr = parts.slice(1).join(' - ') || fullFeat;
+      const val = f.value;
+      const isPos = f.score >= 0;
+      const cardClass = isPos ? 'pos' : 'neg';
+
+      return `<div class="profile-trait-card ${cardClass}" title="${entity} &ndash; ${attr}: ${val}">
+        <div class="trait-header">
+          <span class="trait-entity" title="${entity}">${entity}</span>
+          <span class="trait-val" title="${val}">${val}</span>
+        </div>
+        <div class="trait-attr" title="${attr}">${attr}</div>
+      </div>`;
+    };
 
     try {
       Object.entries(profiles)
@@ -614,25 +726,12 @@ window.AIIDKIT_CHARTS = (() => {
 
           if (Array.isArray(prof.top_features)) {
             // Backward compatibility for old flat array format
-            staticTags = prof.top_features
-              .map(f => {
-                const cls = f.score >= 0 ? 'pos' : 'neg';
-                return `<div class="top-feature-tag ${cls}">${formatFeat(f.feature)}: ${f.value}</div>`;
-              }).join('') || '<span style="color:#3D4F72">—</span>';
+            staticTags = prof.top_features.map(renderTraitCard).join('') || '<span style="color:#3D4F72">—</span>';
             recentTags = '<span style="color:#3D4F72">—</span>';
           } else if (prof.top_features && typeof prof.top_features === 'object') {
             // New dictionary format with static and recent subsets
-            staticTags = (prof.top_features.static || [])
-              .map(f => {
-                const cls = f.score >= 0 ? 'pos' : 'neg';
-                return `<div class="top-feature-tag ${cls}">${formatFeat(f.feature)}: ${f.value}</div>`;
-              }).join('') || '<span style="color:#3D4F72">—</span>';
-
-            recentTags = (prof.top_features.recent || [])
-              .map(f => {
-                const cls = f.score >= 0 ? 'pos' : 'neg';
-                return `<div class="top-feature-tag ${cls}">${formatFeat(f.feature)}: ${f.value}</div>`;
-              }).join('') || '<span style="color:#3D4F72">—</span>';
+            staticTags = (prof.top_features.static || []).map(renderTraitCard).join('') || '<span style="color:#3D4F72">—</span>';
+            recentTags = (prof.top_features.recent || []).map(renderTraitCard).join('') || '<span style="color:#3D4F72">—</span>';
           } else {
             staticTags = '<span style="color:#3D4F72">—</span>';
             recentTags = '<span style="color:#3D4F72">—</span>';
@@ -743,6 +842,708 @@ window.AIIDKIT_CHARTS = (() => {
   }
 
   // ================================================================
+  // RISK TIMELINE GRAPH (MODE 2)
+  // ================================================================
+
+  function drawRiskTimelineGraph(eventsWithScores, finalScore) {
+    const container = document.getElementById('timeline-graph-svg');
+    if (!container) return;
+
+    // Clear SVG container
+    d3.select(container).selectAll('*').remove();
+    
+    // Track active pinned node for toggle-off re-clicking
+    let activePinnedData = null;
+
+    // Append compact interactive popover card to document.body (always centered at left:50%)
+    d3.select('body').selectAll('.timeline-graph-tooltip').remove();
+    const tip = d3.select('body').append('div')
+      .attr('class', 'umap-tooltip timeline-graph-tooltip')
+      .style('position', 'fixed')
+      .style('z-index', '999999')
+      .style('pointer-events', 'auto')
+      .style('left', '50%')
+      .style('transform', 'translateX(-50%)')
+      .style('min-width', '320px')
+      .style('max-width', '450px')
+      .style('width', 'max-content')
+      .style('max-height', '220px')
+      .style('overflow-y', 'auto')
+      .style('transition', 'all 0.22s cubic-bezier(0.16, 1, 0.3, 1)')
+      .style('box-shadow', '0 12px 32px rgba(0,0,0,0.3)');
+
+    if (!eventsWithScores || eventsWithScores.length === 0) {
+      d3.select(container).append('div')
+        .style('padding', '40px 16px')
+        .style('text-align', 'center')
+        .style('color', 'var(--text-muted)')
+        .style('font-style', 'italic')
+        .style('font-size', '0.78rem')
+        .text('Submit a patient to view the cumulative risk timeline graph.');
+      return;
+    }
+
+    // Target Final Risk Score (e.g. 51 for 51/100) shown in Risk Assessment panel
+    const endScore = Math.round((finalScore || 0.5) * 100);
+
+    // Helper: identify baseline/static events
+    const isStaticEvent = ev => {
+      const d = ev.days_since_tpx ?? 0;
+      return d <= 0 || ['Patient info', 'Donor info', 'Mismatch info', 'Transplant info', 'Patient'].includes(ev.entity);
+    };
+
+    const postBaselineEvents = eventsWithScores.filter(ev => !isStaticEvent(ev));
+
+    // Sum of raw attribution deltas
+    let totalRawDeltaSum = 0;
+    postBaselineEvents.forEach(ev => { totalRawDeltaSum += (ev.score || 0) * 100; });
+
+    // Determine realistic baseline risk R0 (0-100 scale)
+    let baseRisk;
+    const rawBaseline = Math.round(endScore - totalRawDeltaSum);
+
+    if (rawBaseline >= 10 && rawBaseline <= 85) {
+      baseRisk = rawBaseline;
+    } else {
+      baseRisk = endScore >= 50
+        ? Math.max(15, Math.min(45, Math.round(endScore * 0.4)))
+        : Math.max(10, Math.min(35, Math.round(endScore * 0.6 + 5)));
+    }
+
+    // Required total delta sum across post-baseline timeline to hit endScore
+    const reqTotalDelta = endScore - baseRisk;
+
+    // Normalization / Scaling factor kScale
+    const kScale = Math.abs(totalRawDeltaSum) > 1e-4
+      ? (reqTotalDelta / totalRawDeltaSum)
+      : 1.0;
+
+    // Attach normalized/scaled scores to all events
+    const eventsWithScaledScores = eventsWithScores.map(ev => {
+      const isPost = !isStaticEvent(ev);
+      const rawSc = (ev.score || 0) * 100;
+      const scaledSc = isPost ? rawSc * kScale : rawSc;
+      return {
+        ...ev,
+        scaled_score: scaledSc / 100,
+        scaled_delta: scaledSc
+      };
+    });
+
+    // Group events chronologically by days_since_tpx
+    const daysMap = new Map();
+    eventsWithScaledScores.forEach(ev => {
+      const d = isStaticEvent(ev) ? 0 : ev.days_since_tpx;
+      if (!daysMap.has(d)) daysMap.set(d, []);
+      daysMap.get(d).push(ev);
+    });
+
+    const sortedDays = Array.from(daysMap.keys()).sort((a, b) => a - b);
+    const postDays = sortedDays.filter(d => d > 0);
+
+    // Construct timeline points with guaranteed convergence to endScore
+    const timelineData = [];
+    let currentRisk = baseRisk;
+
+    const minDay = sortedDays[0];
+    const startDay = minDay <= 0 ? minDay - 6 : -6;
+
+    // Baseline point (day 0)
+    timelineData.push({
+      day: startDay,
+      riskBefore: baseRisk,
+      riskAfter: baseRisk,
+      delta: 0,
+      events: daysMap.get(0) || [],
+      isBaseline: true
+    });
+
+    let runningAccumulator = baseRisk;
+    postDays.forEach((day, dayIdx) => {
+      const evs = daysMap.get(day);
+      let dayDelta = 0;
+      evs.forEach(e => { dayDelta += e.scaled_delta; });
+
+      const riskBefore = currentRisk;
+      let riskAfter;
+      if (dayIdx === postDays.length - 1) {
+        // Guarantee EXACT convergence to endScore on final timeline point!
+        riskAfter = endScore;
+      } else {
+        runningAccumulator += dayDelta;
+        riskAfter = Math.max(1, Math.min(99, Math.round(runningAccumulator)));
+      }
+      currentRisk = riskAfter;
+
+      let mainEv = evs[0];
+      let maxAbs = Math.abs(mainEv.scaled_delta || 0);
+      evs.forEach(e => {
+        if (Math.abs(e.scaled_delta || 0) > maxAbs) {
+          maxAbs = Math.abs(e.scaled_delta || 0);
+          mainEv = e;
+        }
+      });
+
+      timelineData.push({
+        day: day,
+        riskBefore: Math.round(riskBefore),
+        riskAfter: Math.round(riskAfter),
+        delta: dayDelta,
+        events: evs,
+        mainEvent: mainEv,
+        isBaseline: false
+      });
+    });
+
+    // Proportional Linear X-Scale based on Calendar Days — Twice as dense (8px per day)
+    const maxDay = sortedDays[sortedDays.length - 1];
+    const daySpan = Math.max(30, maxDay - startDay);
+    const containerW = container.clientWidth || 550;
+    const containerH = 340;
+    const pxPerDay  = 8;
+    const calculatedW = Math.max(containerW, Math.round(daySpan * pxPerDay + 120));
+
+    const m = { top: 56, right: 60, bottom: 48, left: 24 };
+    const iW = calculatedW - m.left - m.right;
+    const iH = containerH - m.top - m.bottom;
+
+    const svg = d3.select(container)
+      .append('svg')
+      .attr('width', calculatedW)
+      .attr('height', containerH);
+
+    const g = svg.append('g').attr('transform', `translate(${m.left},${m.top})`);
+
+    // Range starts at 14px so Baseline dot sits clear of the Y-axis sticky white gutter bar
+    const xScale = d3.scaleLinear()
+      .domain([startDay, maxDay])
+      .range([14, iW]);
+
+    const yScale = d3.scaleLinear()
+      .domain([0, 100])
+      .range([iH, 0]);
+
+    const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+    const gridColor = isLight ? 'rgba(0,0,0,0.06)' : 'rgba(255,255,255,0.05)';
+    const textColor = isLight ? '#475569' : '#94A3B8';
+
+    // Horizontal Y Gridlines (spanning full chart width iW)
+    const yTicks = [0, 25, 50, 75, 100];
+    yTicks.forEach(tickVal => {
+      const yPos = yScale(tickVal);
+      g.append('line')
+        .attr('x1', 0).attr('x2', iW)
+        .attr('y1', yPos).attr('y2', yPos)
+        .attr('stroke', gridColor)
+        .attr('stroke-dasharray', tickVal === 50 ? '4,4' : 'none')
+        .attr('stroke-width', tickVal === 50 ? 1.5 : 1);
+    });
+
+    // Sticky Y-Axis Group (follows horizontal scroll right at the left border frame)
+    const yAxisG = svg.append('g')
+      .attr('class', 'y-axis-group')
+      .attr('transform', `translate(${m.left},${m.top})`);
+
+    const bgGutterFill = isLight ? '#ffffff' : '#1A2C42';
+    yAxisG.append('rect')
+      .attr('x', -m.left - 60)
+      .attr('y', -m.top)
+      .attr('width', m.left + 68)
+      .attr('height', containerH)
+      .attr('fill', bgGutterFill);
+
+    yTicks.forEach(tickVal => {
+      const yPos = yScale(tickVal);
+      yAxisG.append('text')
+        .attr('x', -4).attr('y', yPos)
+        .attr('dominant-baseline', 'central')
+        .attr('text-anchor', 'end')
+        .attr('fill', textColor)
+        .attr('font-size', '0.66rem')
+        .attr('font-weight', tickVal === 50 ? '700' : '400')
+        .text(`${tickVal}`);
+    });
+
+    // Attach horizontal scroll listener to keep y-axis pinned to left frame
+    const wrapper = document.getElementById('timeline-graph-wrapper');
+    if (wrapper && !wrapper.dataset.hasScrollListener) {
+      wrapper.dataset.hasScrollListener = 'true';
+      wrapper.addEventListener('scroll', () => {
+        const sl = wrapper.scrollLeft;
+        d3.select(container).select('.y-axis-group')
+          .attr('transform', `translate(${m.left + sl}, ${m.top})`);
+      });
+    }
+
+    // 50 Risk Threshold Line (Dashed reference line)
+    g.append('line')
+      .attr('x1', 0).attr('x2', iW)
+      .attr('y1', yScale(50)).attr('y2', yScale(50))
+      .attr('stroke', '#FF4757')
+      .attr('stroke-dasharray', '3,3')
+      .attr('stroke-width', 1);
+
+    // ----------------------------------------------------------------
+    // Vertical Faint Grid Lines & Regular 7-Day X Axis Ticks
+    // ----------------------------------------------------------------
+    const gGridVertical = g.append('g').attr('class', 'timeline-grid-vertical');
+
+    const weeklyTicks = [startDay]; // Always include Baseline
+    for (let day = 0; day <= maxDay + 7; day += 7) {
+      if (day >= startDay) {
+        weeklyTicks.push(day);
+      }
+    }
+
+    let lastTickX = -999;
+    weeklyTicks.forEach(tickDay => {
+      const xPos = xScale(tickDay);
+      if (xPos >= 0 && xPos <= iW) {
+        // Draw faint vertical grid line spanning full plot height from y=0 to y=iH
+        gGridVertical.append('line')
+          .attr('x1', xPos).attr('x2', xPos)
+          .attr('y1', 0).attr('y2', iH)
+          .attr('stroke', gridColor)
+          .attr('stroke-width', 1)
+          .attr('stroke-dasharray', '2,2')
+          .attr('opacity', 0.6);
+
+        if (xPos - lastTickX >= 32 || tickDay === startDay || tickDay === 0) {
+          lastTickX = xPos;
+          g.append('line')
+            .attr('x1', xPos).attr('x2', xPos)
+            .attr('y1', iH).attr('y2', iH + 6)
+            .attr('stroke', gridColor);
+
+          const textG = g.append('text')
+            .attr('x', xPos).attr('y', iH + 18)
+            .attr('text-anchor', 'middle')
+            .attr('fill', textColor)
+            .attr('font-size', '0.66rem')
+            .attr('font-weight', '600');
+
+          if (tickDay === startDay) {
+            textG.text('Baseline');
+          } else {
+            textG.text(`Day ${tickDay > 0 ? '+' : ''}${tickDay}`);
+          }
+        }
+      }
+    });
+
+    // Build Staircase Path Points
+    const stepPoints = [];
+    timelineData.forEach((d, i) => {
+      if (i === 0) {
+        stepPoints.push({ x: xScale(d.day), y: yScale(d.riskBefore) });
+      } else {
+        stepPoints.push({ x: xScale(d.day), y: yScale(d.riskBefore) });
+        stepPoints.push({ x: xScale(d.day), y: yScale(d.riskAfter) });
+      }
+    });
+
+    // Dedicated SVG layer groups for proper z-ordering:
+    // Area -> Staircase Line -> Stems -> Callout Badges -> Interactive Dots (on top!)
+    const gArea          = g.append('g').attr('class', 'timeline-area-layer');
+    const gLines         = g.append('g').attr('class', 'timeline-line-layer');
+    const gCalloutStems  = g.append('g').attr('class', 'timeline-stems-layer');
+    const gCalloutBadges = g.append('g').attr('class', 'timeline-badges-layer');
+    const gNodes         = g.append('g').attr('class', 'timeline-nodes-layer');
+
+    // Gradient Area Fill under Staircase
+    const areaDef = svg.append('defs').append('linearGradient')
+      .attr('id', 'risk-timeline-grad')
+      .attr('x1', '0').attr('y1', '0')
+      .attr('x2', '0').attr('y2', '1');
+
+    areaDef.append('stop').attr('offset', '0%').attr('stop-color', '#FF4757').attr('stop-opacity', '0.22');
+    areaDef.append('stop').attr('offset', '100%').attr('stop-color', '#2D6BE4').attr('stop-opacity', '0.02');
+
+    const areaPath = d3.area()
+      .x(pt => pt.x)
+      .y0(iH)
+      .y1(pt => pt.y);
+
+    gArea.append('path')
+      .datum(stepPoints)
+      .attr('fill', 'url(#risk-timeline-grad)')
+      .attr('d', areaPath);
+
+    // Staircase Line Path
+    const linePath = d3.line()
+      .x(pt => pt.x)
+      .y(pt => pt.y);
+
+    gLines.append('path')
+      .datum(stepPoints)
+      .attr('fill', 'none')
+      .attr('stroke', '#2D6BE4')
+      .attr('stroke-width', 2.8)
+      .attr('stroke-linejoin', 'miter')
+      .attr('d', linePath);
+
+    // Collect all node dots for dot-clearing checks
+    const allDots = timelineData.map(d => ({
+      cx: xScale(d.day),
+      cy: yScale(d.riskBefore),
+      r: d.isBaseline ? 5.0 : 6.5
+    }));
+
+    // ----------------------------------------------------------------
+    // Collect & Resolve Callout Annotations (User Strategy + 2D Anti-Collision)
+    // ----------------------------------------------------------------
+    const calloutCandidates = [];
+
+    timelineData.forEach((d, idx) => {
+      const cx = xScale(d.day);
+      const cy = yScale(d.riskBefore);
+      const absDelta = Math.abs(d.delta);
+      const dotR = d.isBaseline ? 5.0 : 6.5;
+
+      if (!d.isBaseline && absDelta >= 2.5 && d.mainEvent) {
+        const sign = d.delta > 0 ? '+' : '';
+        const entityLabel = d.mainEvent.entity === 'Infection' ? 'Previous infection' : d.mainEvent.entity;
+        const calloutText = `${sign}${d.delta.toFixed(1)}%: ${entityLabel}`;
+
+        let calloutTextColor, calloutBorder, calloutBg;
+        if (d.delta > 0) {
+          calloutTextColor = isLight ? '#B32431' : '#FF8A95';
+          calloutBorder    = isLight ? '#EF4444' : '#FF4757';
+          calloutBg        = isLight ? '#FFF1F2' : 'rgba(255, 71, 87, 0.25)';
+        } else {
+          calloutTextColor = isLight ? '#1D4ED8' : '#93C5FD';
+          calloutBorder    = isLight ? '#3B82F6' : '#5B9BF8';
+          calloutBg        = isLight ? '#EFF6FF' : 'rgba(37, 99, 235, 0.25)';
+        }
+
+        // Measure text dimensions
+        const dummyG = gCalloutBadges.append('g').style('visibility', 'hidden');
+        const dummyText = dummyG.append('text')
+          .attr('font-size', '0.64rem')
+          .attr('font-weight', '700')
+          .text(calloutText);
+        const bbox = dummyText.node().getBBox();
+        dummyG.remove();
+
+        const padX = 6;
+        const padY = 4;
+        const boxW = bbox.width + padX * 2;
+        const boxH = bbox.height + padY * 2;
+
+        const isRed = d.delta > 0;
+        let targetSide = isRed ? 'below' : 'above';
+
+        if (targetSide === 'below' && cy > iH - 35) {
+          targetSide = 'above';
+        } else if (targetSide === 'above' && cy < 25) {
+          targetSide = 'below';
+        }
+
+        const clampedX = Math.max(boxW / 2 + 4, Math.min(iW - boxW / 2 - 4, cx));
+        // Generous initial vertical gap (longer dashed connecting lines)
+        const idealY   = targetSide === 'above' ? (cy - 58) : (cy + 58);
+
+        calloutCandidates.push({
+          idx,
+          d,
+          cx,
+          cy,
+          dotR,
+          calloutText,
+          calloutTextColor,
+          calloutBorder,
+          calloutBg,
+          boxW,
+          boxH,
+          x: clampedX,
+          y: idealY,
+          targetSide
+        });
+      }
+    });
+
+    calloutCandidates.sort((a, b) => a.cx - b.cx || a.cy - b.cy);
+
+    // Initial separation pass: push overlapping boxes further vertically (support long stems!)
+    for (let i = 0; i < calloutCandidates.length; i++) {
+      for (let j = i + 1; j < calloutCandidates.length; j++) {
+        const c1 = calloutCandidates[i];
+        const c2 = calloutCandidates[j];
+        const dx = Math.abs(c1.x - c2.x);
+        const reqX = (c1.boxW + c2.boxW) / 2 + 6;
+
+        if (dx < reqX) {
+          const dy = Math.abs(c1.y - c2.y);
+          const reqY = (c1.boxH + c2.boxH) / 2 + 6;
+          if (dy < reqY) {
+            const pushDist = reqY - dy;
+            if (c2.targetSide === 'above') {
+              c2.y -= pushDist;
+            } else if (c2.targetSide === 'below') {
+              c2.y += pushDist;
+            } else {
+              if (c2.y >= c1.y) c2.y += pushDist; else c2.y -= pushDist;
+            }
+          }
+        }
+      }
+    }
+
+    // Dot-clearing pass: ensure NO speech bubble box overlaps ANY dot on the chart!
+    calloutCandidates.forEach(c => {
+      allDots.forEach(dot => {
+        const dx = Math.abs(c.x - dot.cx);
+        const dy = Math.abs(c.y - dot.cy);
+        const clearMarginX = c.boxW / 2 + dot.r + 10;
+        const clearMarginY = c.boxH / 2 + dot.r + 14;
+
+        if (dx < clearMarginX && dy < clearMarginY) {
+          // Push box vertically clear of this dot!
+          if (c.targetSide === 'above') {
+            c.y = Math.min(c.y, dot.cy - clearMarginY - 8);
+          } else {
+            c.y = Math.max(c.y, dot.cy + clearMarginY + 8);
+          }
+        }
+      });
+    });
+
+    // Multi-pass relaxation solver to finalize 2D spacing
+    for (let iter = 0; iter < 12; iter++) {
+      let moved = false;
+      for (let i = 0; i < calloutCandidates.length; i++) {
+        for (let j = i + 1; j < calloutCandidates.length; j++) {
+          const c1 = calloutCandidates[i];
+          const c2 = calloutCandidates[j];
+          const dx = Math.abs(c1.x - c2.x);
+          const dy = Math.abs(c1.y - c2.y);
+          const reqX = (c1.boxW + c2.boxW) / 2 + 6;
+          const reqY = (c1.boxH + c2.boxH) / 2 + 6;
+
+          if (dx < reqX && dy < reqY) {
+            const overlapY = reqY - dy;
+            if (c2.targetSide === 'above') {
+              c2.y -= overlapY;
+            } else {
+              c2.y += overlapY;
+            }
+            moved = true;
+          }
+        }
+      }
+      if (!moved) break;
+    }
+
+    // Clamp final positions to plot bounds
+    calloutCandidates.forEach(c => {
+      c.y = Math.max(-20, Math.min(iH - 12, c.y));
+      c.x = Math.max(c.boxW / 2 + 4, Math.min(iW - c.boxW / 2 - 4, c.x));
+    });
+
+    // Render resolved callout badges and leader stems
+    calloutCandidates.forEach(c => {
+      const annoG = gCalloutBadges.append('g')
+        .attr('transform', `translate(${c.x}, ${c.y})`)
+        .style('pointer-events', 'none');
+
+      annoG.append('text')
+        .attr('text-anchor', 'middle')
+        .attr('dominant-baseline', 'central')
+        .attr('font-size', '0.64rem')
+        .attr('font-weight', '700')
+        .attr('fill', c.calloutTextColor)
+        .text(c.calloutText);
+
+      annoG.insert('rect', 'text')
+        .attr('x', -c.boxW / 2)
+        .attr('y', -c.boxH / 2)
+        .attr('width', c.boxW)
+        .attr('height', c.boxH)
+        .attr('rx', 5)
+        .attr('fill', c.calloutBg)
+        .attr('stroke', c.calloutBorder)
+        .attr('stroke-width', 1.2)
+        .attr('opacity', 0.96);
+
+      // Long vertical leader stem line: connecting dot (cx, cy) to badge (x, y)
+      const isAbove = c.y < c.cy;
+      const stemYStart = isAbove ? c.cy - c.dotR - 1 : c.cy + c.dotR + 1;
+      const stemYEnd   = isAbove ? c.y + c.boxH / 2 : c.y - c.boxH / 2;
+
+      gCalloutStems.append('line')
+        .attr('x1', c.cx).attr('y1', stemYStart)
+        .attr('x2', c.x).attr('y2', stemYEnd)
+        .attr('stroke', c.calloutBorder)
+        .attr('stroke-width', 1.2)
+        .attr('stroke-dasharray', '2,2')
+        .attr('opacity', 0.75);
+    });
+
+    // Render Day Node Circle Groups (rendered on top layer gNodes!)
+    timelineData.forEach((d, idx) => {
+      const cx = xScale(d.day);
+      const cy = yScale(d.riskBefore);
+      const absDelta = Math.abs(d.delta);
+      const dotR = d.isBaseline ? 5.0 : 6.5;
+
+      let dotColor;
+      if (d.isBaseline) {
+        dotColor = '#7C8DB5';
+      } else if (d.delta > 0) {
+        dotColor = '#FF4757'; // Red
+      } else if (d.delta < 0) {
+        dotColor = isLight ? '#1D4ED8' : '#3B82F6'; // Blue
+      } else {
+        dotColor = '#7C8DB5';
+      }
+
+      const nodeG = gNodes.append('g')
+        .attr('class', 'timeline-node-group')
+        .style('cursor', 'pointer')
+        .attr('pointer-events', 'all');
+
+      nodeG.append('circle')
+        .attr('cx', cx).attr('cy', cy).attr('r', 16)
+        .attr('fill', 'transparent');
+
+      const circle = nodeG.append('circle')
+        .attr('class', 'timeline-node-dot')
+        .attr('cx', cx).attr('cy', cy)
+        .attr('r', dotR)
+        .attr('fill', dotColor)
+        .attr('stroke', isLight ? '#ffffff' : '#101F30')
+        .attr('stroke-width', 2);
+
+      let isPinned = false;
+
+      // Helper function to position tip dead-center in Panel 2
+      function positionTipInPanelCenter() {
+        const panelEl = document.querySelector('.panel-timeline');
+        if (!panelEl) return;
+        const panelRect = panelEl.getBoundingClientRect();
+        const panelCenterX = panelRect.left + (panelRect.width / 2);
+        const headerEl = panelEl.querySelector('.panel-header');
+        const topY = headerEl ? headerEl.getBoundingClientRect().bottom + 8 : panelRect.top + 52;
+
+        tip.style('left', `${panelCenterX}px`)
+           .style('top', `${topY}px`)
+           .style('transform', 'translateX(-50%)');
+      }
+
+      // Function to open / unfold Click-to-Open Popover Card with Close Button (✕)
+      function openPopoverCard() {
+        const headerTitleText = d.isBaseline ? 'Baseline Profile' : `Day ${d.day > 0 ? '+' + d.day : d.day}`;
+
+        let contentHtml = `
+          <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--border); padding-bottom:5px; margin-bottom:6px;">
+            <span style="font-weight:700; color:var(--text); font-size:0.82rem;">${headerTitleText}</span>
+            <button class="popover-close-btn" style="background:transparent; border:none; color:var(--text-muted); font-size:1.15rem; font-weight:700; cursor:pointer; padding:0 4px; line-height:1; transition:color 0.2s;" title="Close popover">&times;</button>
+          </div>
+        `;
+
+        if (d.isBaseline) {
+          const baselineEvs = eventsWithScores.filter(e => (e.days_since_tpx ?? 0) <= 0);
+          const sortedBaseline = [...baselineEvs].sort((a, b) => Math.abs(b.score || 0) - Math.abs(a.score || 0));
+          const evRows = sortedBaseline.map(e => {
+            const sc = (e.score || 0) * 100;
+            const sign = sc >= 0 ? '+' : '';
+            const color = sc > 0 ? '#FF4757' : (sc < 0 ? '#2563EB' : 'var(--text-muted)');
+            const valPart = (e.value !== undefined && e.value !== null && e.value !== '') ? `: <strong>${e.value}</strong>` : '';
+            return `<div style="display:flex; justify-content:space-between; margin-top:3px; font-size:0.7rem; gap:12px; align-items:baseline;">
+              <span style="color:var(--text); line-height:1.35; word-break:break-word;"><strong>${e.entity}</strong> &ndash; ${e.attribute}${valPart}</span>
+              <strong style="color:${color}; flex-shrink:0; font-size:0.72rem;">${sign}${sc.toFixed(1)}%</strong>
+            </div>`;
+          }).join('');
+
+          contentHtml += `
+            <div style="font-size:0.75rem; margin-bottom:4px;">Initial Infection Score: <strong style="color:${dotColor};">${d.riskBefore}/100</strong></div>
+            <div style="margin-top:4px; border-top:1px dashed var(--border); padding-top:4px;">${evRows}</div>
+          `;
+        } else {
+          const sortedEvents = [...d.events].sort((a, b) => Math.abs(b.scaled_delta ?? (b.score || 0) * 100) - Math.abs(a.scaled_delta ?? (a.score || 0) * 100));
+          const evRows = sortedEvents.map(e => {
+            const sc = e.scaled_delta !== undefined ? e.scaled_delta : (e.score || 0) * 100;
+            const sign = sc >= 0 ? '+' : '';
+            const color = sc > 0 ? '#FF4757' : (sc < 0 ? '#2563EB' : 'var(--text-muted)');
+            const valPart = (e.value !== undefined && e.value !== null && e.value !== '') ? `: <strong>${e.value}</strong>` : '';
+            return `<div style="display:flex; justify-content:space-between; margin-top:3px; font-size:0.7rem; gap:12px; align-items:baseline;">
+              <span style="color:var(--text); line-height:1.35; word-break:break-word;"><strong>${e.entity}</strong> &ndash; ${e.attribute}${valPart}</span>
+              <strong style="color:${color}; flex-shrink:0; font-size:0.72rem;">${sign}${sc.toFixed(1)}%</strong>
+            </div>`;
+          }).join('');
+
+          const deltaSign = d.delta >= 0 ? '+' : '';
+          contentHtml += `
+            <div style="font-size:0.75rem;">Cumulated Risk: <strong style="color:${dotColor};">${d.riskBefore}/100 &rarr; ${d.riskAfter}/100</strong> (${deltaSign}${d.delta.toFixed(1)}%)</div>
+            <div style="margin-top:4px; border-top:1px dashed var(--border); padding-top:4px;">${evRows}</div>
+          `;
+        }
+
+        setTimeout(() => {
+          tip.classed('visible', true)
+            .style('pointer-events', 'auto')
+            .html(contentHtml);
+          positionTipInPanelCenter();
+
+          tip.select('.popover-close-btn').on('click', (evBtn) => {
+            evBtn.stopPropagation();
+            tip.classed('visible', false).style('pointer-events', 'none');
+            activePinnedData = null;
+            circle.attr('r', dotR).attr('stroke-width', 2);
+          });
+        }, 10);
+      }
+
+      // Click event handler: Toggle OFF if clicking active dot, otherwise unfold info popover!
+      nodeG
+        .on('click', function(ev) {
+          ev.stopPropagation();
+
+          if (activePinnedData === d && tip.classed('visible')) {
+            // Clicking active dot again closes popover and toggles OFF!
+            tip.classed('visible', false).style('pointer-events', 'none');
+            activePinnedData = null;
+            circle.attr('r', dotR).attr('stroke-width', 2);
+          } else {
+            // Unfold into full info popover!
+            activePinnedData = d;
+            g.selectAll('circle.timeline-node-dot').attr('r', dNode => dNode?.isBaseline ? 5.0 : 6.5).attr('stroke-width', 2);
+            circle.attr('r', dotR + 3).attr('stroke-width', 3.5);
+            openPopoverCard();
+          }
+        })
+        .on('mouseenter mouseover', function() {
+          if (!activePinnedData) {
+            circle.attr('r', dotR + 2.5).attr('stroke-width', 3);
+            tip.classed('visible', true)
+              .style('pointer-events', 'none')
+              .html(`<div style="font-size:0.72rem; font-weight:600; text-align:center; padding:2px 12px;">Click to pin details 🔍</div>`);
+            positionTipInPanelCenter();
+          }
+        })
+        .on('mouseleave mouseout', function() {
+          if (!activePinnedData) {
+            circle.attr('r', dotR).attr('stroke-width', 2);
+            tip.classed('visible', false).style('pointer-events', 'none');
+          }
+        });
+    });
+
+    // Cleanly register document click handler without duplicating listeners
+    if (window._timelineClosePopoverHandler) {
+      document.removeEventListener('click', window._timelineClosePopoverHandler);
+    }
+    window._timelineClosePopoverHandler = function closeTimelinePopover(ev) {
+      if (!ev.target.closest('.timeline-graph-tooltip') && !ev.target.closest('.timeline-node-group')) {
+        tip.classed('visible', false).style('pointer-events', 'none');
+        activePinnedData = null;
+        g.selectAll('circle.timeline-node-dot').attr('r', dNode => dNode?.isBaseline ? 5.0 : 6.5).attr('stroke-width', 2);
+      }
+    };
+    document.addEventListener('click', window._timelineClosePopoverHandler);
+  }
+
+  // ================================================================
   // PUBLIC
   // ================================================================
   return {
@@ -750,5 +1551,6 @@ window.AIIDKIT_CHARTS = (() => {
     initAttributionChart, updateAttributionChart,
     initHistogram, updateHistogramWithPatient, updateHistogramData,
     initClusterProfiles, updateClusterProfiles: initClusterProfiles, highlightCluster, resizeCharts, updateThemeColors,
+    drawRiskTimelineGraph,
   };
 })();

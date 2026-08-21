@@ -494,17 +494,21 @@ def generate_cohort_data(fup: int = 90, seed: int = 42) -> dict:
             c_event_rate = float(np.mean(c_labels)) if c_labels else profile["event_rate"] * (1.25 if h==60 else 1.45 if h==90 else 1.0)
             c_event_rate = min(0.99, c_event_rate)
             
-            # Static diffs
+            # Static differential features (enriched in current cluster vs opposite cluster)
             static_diffs = []
             for feat in all_static_features:
                 p_c = (static_counts[c_id][feat] / c_size) if c_size > 0 else 0.0
-                p_other = (static_counts[other_c_id][feat] / other_size) if other_size > 0 else 0.0
-                diff = p_c - p_other
-                if diff > 0.0:
-                    static_diffs.append((feat, diff))
-            sorted_static = sorted(static_diffs, key=lambda x: x[1], reverse=True)[:10]
+                p_opp = (static_counts[other_c_id][feat] / other_size) if other_size > 0 else 0.0
+                p_global = (static_counts[c_id][feat] + static_counts[other_c_id][feat]) / float(len(h_patients))
+                if p_global > 0.85:
+                    continue
+                diff = p_c - p_opp
+                if diff >= 0.04 and (p_opp == 0 or (p_c / p_opp) >= 1.15):
+                    enrichment_score = diff * (p_c / (p_opp + 0.05))
+                    static_diffs.append((feat, diff, enrichment_score))
+            sorted_static = sorted(static_diffs, key=lambda x: x[2], reverse=True)[:10]
             top_static = []
-            for (ent, attr, val), diff in sorted_static:
+            for (ent, attr, val), diff, _ in sorted_static:
                 score = diff if c_id == 0 else -diff
                 top_static.append({
                     "feature": f"{ent} - {attr}",
@@ -512,17 +516,21 @@ def generate_cohort_data(fup: int = 90, seed: int = 42) -> dict:
                     "score": score
                 })
 
-            # Recent diffs
+            # Recent differential features (enriched in current cluster vs opposite cluster)
             recent_diffs = []
             for feat in all_recent_features:
                 p_c = (recent_counts[c_id][feat] / c_size) if c_size > 0 else 0.0
-                p_other = (recent_counts[other_c_id][feat] / other_size) if other_size > 0 else 0.0
-                diff = p_c - p_other
-                if diff > 0.0:
-                    recent_diffs.append((feat, diff))
-            sorted_recent = sorted(recent_diffs, key=lambda x: x[1], reverse=True)[:10]
+                p_opp = (recent_counts[other_c_id][feat] / other_size) if other_size > 0 else 0.0
+                p_global = (recent_counts[c_id][feat] + recent_counts[other_c_id][feat]) / float(len(h_patients))
+                if p_global > 0.85:
+                    continue
+                diff = p_c - p_opp
+                if diff >= 0.04 and (p_opp == 0 or (p_c / p_opp) >= 1.15):
+                    enrichment_score = diff * (p_c / (p_opp + 0.05))
+                    recent_diffs.append((feat, diff, enrichment_score))
+            sorted_recent = sorted(recent_diffs, key=lambda x: x[2], reverse=True)[:10]
             top_recent = []
-            for (ent, attr, val), diff in sorted_recent:
+            for (ent, attr, val), diff, _ in sorted_recent:
                 score = diff if c_id == 0 else -diff
                 top_recent.append({
                     "feature": f"{ent} - {attr}",
@@ -665,24 +673,17 @@ def mock_predict(events: list[dict], horizon: int, cohort: dict) -> dict:
 
     # Detect synthetic patients to calibrate their mock risk score in DEMO MODE
     is_synth_low = False
-    is_synth_mod = False
     is_synth_high = False
     if events:
-        first_attr = events[0].get("attribute", "") or ""
-        if len(events) > 500:
-            if "myocardial" in first_attr.lower() or "contusion" in first_attr.lower():
-                # Synthetic low risk (patient 1) -> target ~10%
-                raw_score += -0.73
-                is_synth_low = True
-            elif "cause of death" in first_attr.lower() or first_attr.lower() == "cause of death":
-                # Synthetic moderate risk (patient 2) -> target ~32%
-                raw_score += -0.25
-                is_synth_mod = True
-        elif 250 < len(events) < 400:
-            if "twin" in first_attr.lower():
-                # Synthetic high risk (patient 3) -> target ~65%
-                raw_score += 0.21
-                is_synth_high = True
+        event_str = " ".join([f"{e.get('entity','')} {e.get('attribute','')} {e.get('value','') or e.get('value_binned','')}" for e in events]).lower()
+        if "pyelonephritis" in event_str or "graft pyelonephritis" in event_str:
+            # Synthetic high risk -> target high risk (~65%+)
+            raw_score += 0.21
+            is_synth_high = True
+        elif "quinolone" in event_str or "pckd" in event_str:
+            # Synthetic low risk -> target low risk (~10%)
+            raw_score += -0.73
+            is_synth_low = True
 
     # Map raw attributions to [0.05, 0.95] via sigmoid
     base_risk_30d = float(np.clip(expit(raw_score * 3.0), 0.05, 0.95))
@@ -702,42 +703,23 @@ def mock_predict(events: list[dict], horizon: int, cohort: dict) -> dict:
         calibrated_risks[k] = round(float(np.clip(expit(logit_v - 1.5), 0.01, 0.95)), 4)
         
     selected_calibrated_risk = calibrated_risks[f"{horizon}d"]
-    category, color = _risk_category(selected_risk)
+    # --- Assign cluster based on profile risk proximity ---
+    best_cluster = min(
+        CLUSTER_PROFILES,
+        key=lambda p: abs(p["base_risk"] - selected_risk),
+    )
+    cluster_id    = best_cluster["id"]
+    cluster_name  = best_cluster["name"]
+    cluster_color = best_cluster["color"]
+    category      = cluster_name
+    color         = cluster_color
 
-    # Mock days_to_event and event_imminence based on synthetic detection or risk
-    if is_synth_low:
-        q_t_event = None
-        q_imminence = 0.0
-    elif is_synth_mod:
-        q_t_event = 120
-        q_imminence = float(np.exp(-120.0 / 365.0))
-    elif is_synth_high:
+    if category == "High risk":
         q_t_event = 25
         q_imminence = float(np.exp(-25.0 / 365.0))
     else:
-        has_event = selected_risk >= CONFIG.RISK_THRESHOLD
-        if has_event:
-            q_t_event = int(np.clip(120 - selected_risk * 100, 10, 360))
-            q_imminence = float(np.exp(-q_t_event / 365.0))
-        else:
-            q_t_event = None
-            q_imminence = 0.0
-
-    # --- Assign cluster based on config method ---
-    if getattr(CONFIG, "CLUSTERING_METHOD", "model_risk") == "clusterer":
-        # Nearest profile by risk proximity
-        best_cluster = min(
-            CLUSTER_PROFILES,
-            key=lambda p: abs(p["base_risk"] - selected_risk),
-        )
-    else:
-        if selected_risk >= CONFIG.RISK_THRESHOLD:
-            best_cluster = CLUSTER_PROFILES[0]
-        else:
-            best_cluster = CLUSTER_PROFILES[1]
-    cluster_id   = best_cluster["id"]
-    cluster_name = best_cluster["name"]
-    cluster_color = best_cluster["color"]
+        q_t_event = None
+        q_imminence = 0.0
 
     # UMAP position near cluster center (with deterministic noise)
     import random
@@ -774,27 +756,35 @@ def mock_predict(events: list[dict], horizon: int, cohort: dict) -> dict:
         })
 
     # --- Clinical narrative ---
-    pos_feats = [a for a in attributions if a["score"] > 0.05]
-    neg_feats = [a for a in attributions if a["score"] < -0.05]
-    risk_txt  = (
-        f"This patient's predicted {horizon}-day infection score is "
-        f"{selected_risk*100:.0f}/100 ({category}), placing them at the "
-        f"{percentile}th percentile of the reference cohort."
-    )
-    if pos_feats:
-        names = ", ".join(
-            f"{f['feature']}: {f['value']}" for f in pos_feats[:3]
+    h30_score = int(round(risk_scores.get("30d", selected_risk) * 100))
+    h60_score = int(round(risk_scores.get("60d", selected_risk) * 100))
+    h90_score = int(round(risk_scores.get("90d", selected_risk) * 100))
+    
+    h30_calib = int(round(calibrated_risks.get("30d", selected_calibrated_risk) * 100))
+    h60_calib = int(round(calibrated_risks.get("60d", selected_calibrated_risk) * 100))
+    h90_calib = int(round(calibrated_risks.get("90d", selected_calibrated_risk) * 100))
+
+    if horizon == 90:
+        risk_txt = (
+            f"The patient's predicted 90-day infection score is {h90_score}/100 (calibrated risk: {h90_calib}%), "
+            f"placing them in the '{cluster_name}' risk group. "
+            f"Shorter-term 30-day and 60-day infection scores are {h30_score}/100 ({h30_calib}%) and {h60_score}/100 ({h60_calib}%), respectively. "
+            f"Overall, the patient is categorized as {category} for post-transplant bacterial infection."
         )
-        risk_txt += f" Key risk drivers: {names}."
-    if neg_feats:
-        names = ", ".join(
-            f"{f['feature']}: {f['value']}" for f in neg_feats[:2]
+    elif horizon == 60:
+        risk_txt = (
+            f"The patient's predicted 60-day infection score is {h60_score}/100 (calibrated risk: {h60_calib}%), "
+            f"placing them in the '{cluster_name}' risk group. "
+            f"Corresponding 30-day and 90-day infection scores are {h30_score}/100 ({h30_calib}%) and {h90_score}/100 ({h90_calib}%), respectively. "
+            f"Overall, the patient is categorized as {category} for post-transplant bacterial infection."
         )
-        risk_txt += f" Protective factors present: {names}."
-    risk_txt += (
-        f" The patient clusters with the '{cluster_name}' phenotype "
-        f"(event rate ≈ {int(best_cluster['event_rate']*100)}%)."
-    )
+    else:
+        risk_txt = (
+            f"The patient's predicted 30-day infection score is {h30_score}/100 (calibrated risk: {h30_calib}%), "
+            f"placing them in the '{cluster_name}' risk group. "
+            f"Longer-term 60-day and 90-day infection scores are {h60_score}/100 ({h60_calib}%) and {h90_score}/100 ({h90_calib}%), respectively. "
+            f"Overall, the patient is categorized as {category} for post-transplant bacterial infection."
+        )
 
     return {
         "risk_scores":       risk_scores,

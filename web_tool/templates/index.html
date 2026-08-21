@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -17,7 +17,7 @@
   <!-- D3.js v7 -->
   <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
 
-  <link rel="stylesheet" href="/static/css/style.css?v=1.6" />
+  <link rel="stylesheet" href="/static/css/style.css?v=1.9" />
   <link rel="icon" type="image/png" href="/static/favicon.png" />
 </head>
 <body>
@@ -42,35 +42,15 @@
 ================================================================ -->
 <header class="app-header">
   <div class="header-inner">
-    <div class="header-brand">
+    <div id="header-brand" class="header-brand" title="Return to welcome screen" role="button" tabindex="0">
       <img class="brand-logo" src="/static/logo_graphics.png" alt="AIIDKIT Logo" />
       <div class="brand-text">
         <span class="brand-title"><span class="logo-accent-blue">AIID</span><span class="logo-accent-teal">KIT</span></span>
-        <span class="brand-tagline">Artificial Intelligence for<br>Improved Infectious<br>Diseases Outcomes</span>
-      </div>
-    </div>
-
-    <div class="header-center">
-      <span class="task-label">Bacterial infection risk</span>
-      <div class="horizon-control">
-        <label for="fup-select" class="control-label">Follow-up period</label>
-        <select id="fup-select" class="horizon-select" aria-label="Select follow-up period">
-          <!-- Populated dynamically via main.js -->
-        </select>
-      </div>
-      <div class="horizon-control">
-        <label for="horizon-select" class="control-label">Prediction horizon</label>
-        <select id="horizon-select" class="horizon-select" aria-label="Select prediction horizon">
-          <option value="30" selected>30 days</option>
-          <option value="60">60 days</option>
-          <option value="90">90 days</option>
-        </select>
       </div>
     </div>
 
     <div class="header-right">
       <button id="theme-toggle" class="theme-toggle-btn" aria-label="Toggle light/dark theme"></button>
-      <span id="mock-badge" class="mode-badge badge-demo">DEMO MODE</span>
     </div>
   </div>
 </header>
@@ -81,107 +61,7 @@
 <main class="app-main">
 
   <!-- --------------------------------------------------------
-       LEFT SIDEBAR — Patient Input
-  -------------------------------------------------------- -->
-  <aside class="sidebar">
-    <div class="panel sidebar-panel">
-      <div class="panel-header">
-        <svg class="panel-icon" viewBox="0 0 20 20" fill="none"><path d="M10 2a8 8 0 100 16A8 8 0 0010 2zm0 4v4l3 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-        <h2 class="panel-title">Patient data</h2>
-      </div>
-
-      <!-- Tabs -->
-      <div class="tab-bar" role="tablist">
-        <button id="tab-btn-form" class="tab-btn" role="tab" aria-selected="false" aria-controls="tab-form">
-          <svg viewBox="0 0 16 16" fill="none"><path d="M2 4h12M2 8h8M2 12h10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-          Manual entry
-        </button>
-        <button id="tab-btn-upload" class="tab-btn active" role="tab" aria-selected="true" aria-controls="tab-upload">
-          <svg viewBox="0 0 16 16" fill="none"><path d="M8 10V3m0-1l-3 3m3-3l3 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M2 13h12" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-          File upload
-        </button>
-      </div>
-
-      <!-- TAB: Manual Entry -->
-      <div id="tab-form" class="tab-content hidden" role="tabpanel">
-        <p class="form-help">Add one row per clinical event. Events are sorted by day automatically.</p>
-
-        <div class="event-table-wrapper">
-          <table class="event-table" id="event-table">
-            <thead>
-              <tr>
-                <th>Entity</th>
-                <th>Attribute</th>
-                <th>Value</th>
-                <th>Day</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody id="patient-events-tbody">
-              <!-- Rows injected by patient_form.js -->
-            </tbody>
-          </table>
-        </div>
-
-        <button id="add-event-btn" class="btn btn-ghost btn-sm" type="button">
-          <svg viewBox="0 0 16 16" fill="none"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
-          Add Event
-        </button>
-
-        <button id="analyze-form-btn" class="btn btn-primary mt-lg" type="button">
-          <svg viewBox="0 0 20 20" fill="none"><path d="M10 2a8 8 0 100 16A8 8 0 0010 2zM10 6v4l3 2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-          Analyse patient
-        </button>
-      </div>
-
-      <!-- TAB: File Upload -->
-      <div id="tab-upload" class="tab-content active" role="tabpanel">
-        <div id="file-drop-zone" class="drop-zone" tabindex="0" role="button" aria-label="Upload patient event file">
-          <div class="drop-zone-inner">
-            <svg class="drop-icon" viewBox="0 0 48 48" fill="none">
-              <path d="M24 32V16m0-4l-8 8m8-8l8 8" stroke="#4F8EF7" stroke-width="2.5" stroke-linecap="round"/>
-              <path d="M8 38h32" stroke="#4F8EF7" stroke-width="2.5" stroke-linecap="round"/>
-            </svg>
-            <p class="drop-title">Drop CSV or JSON file here</p>
-            <p class="drop-hint">or click to browse</p>
-          </div>
-          <input id="file-input" type="file" accept=".csv,.json" class="file-input-hidden" />
-        </div>
-
-        <div class="format-info">
-          <details class="format-details">
-            <summary>Expected formats</summary>
-            <div class="format-block">
-              <p class="format-label">CSV (entity,attribute,value,days_since_tpx)</p>
-              <pre class="code-block">Medication,Tacrolimus,High,7
-Lab result,WBC,Lower,14
-Infection,CMV,1,30</pre>
-              <p class="format-label">JSON</p>
-              <pre class="code-block">{"horizon":30,"events":[
-  {"entity":"Medication","attribute":"Tacrolimus",
-   "value":"High","days_since_tpx":7}
-]}</pre>
-            </div>
-          </details>
-        </div>
-
-
-      </div>
-
-      <!-- Example patient loader -->
-      <div class="example-section">
-        <p class="example-label">Try an example patient:</p>
-        <div class="example-btns">
-          <button class="btn btn-ghost btn-xs example-btn" data-example="high">High risk</button>
-          <button class="btn btn-ghost btn-xs example-btn" data-example="mod">Moderate risk</button>
-          <button class="btn btn-ghost btn-xs example-btn" data-example="low">Low risk</button>
-        </div>
-      </div>
-    </div>
-  </aside>
-
-  <!-- --------------------------------------------------------
-       RIGHT AREA — Analysis Panels
+       LEFT RESULTS AREA (Hidden until first analysis)
   -------------------------------------------------------- -->
   <section class="results-container">
 
@@ -195,51 +75,45 @@ Infection,CMV,1,30</pre>
             <span class="empty-brand-tagline">Artificial Intelligence for<br>Improved Infectious<br>Diseases Outcomes</span>
           </div>
         </div>
-        <h3 class="empty-title">Submit a patient to begin</h3>
-        <p class="empty-body">Enter clinical events in the sidebar and click <strong>Analyse patient</strong> to predict infection risk, explore the cohort embedding space, and view feature attributions.</p>
+        <h3 class="empty-title">Welcome to AIIDKIT Decision Support</h3>
+        <p class="empty-body">An AI decision support tool that predicts post-transplant bacterial infection risk to assist clinical teams.</p>
+        
+        <div class="empty-instructions" style="margin-top: 14px; text-align: left; background: var(--surface); padding: 14px 18px; border-radius: var(--radius-sm); border: 1px solid var(--border-strong);">
+          <strong style="display: block; margin-bottom: 6px; font-size: 0.80rem; color: var(--text);">Quick Start Guide:</strong>
+          <ol style="margin: 0; padding-left: 18px; font-size: 0.76rem; color: var(--text-muted); line-height: 1.6;">
+            <li><strong>Enter Patient Data:</strong> Use the right sidebar to add clinical events or select an example patient (<em>High risk</em> / <em>Low risk</em>).</li>
+            <li><strong>Analyse Patient:</strong> Click <strong>Analyse patient</strong> to compute infection risk scores across 30, 60, and 90-day time horizons.</li>
+            <li><strong>Review Insights:</strong> Inspect clinical risk drivers, compare cohort positioning, and explore risk subgroup profiles.</li>
+          </ol>
+        </div>
       </div>
     </div>
 
     <!-- Results area (hidden until first prediction) -->
     <div id="results-area" class="results-area hidden">
 
-      <!-- ---- ROW 1: Risk Assessment & Cohort Distribution ---- -->
+      <!-- ---- ROW 1: Infection Risk Assessment & Impact of Clinical Events ---- -->
       <div class="row row-top-unified">
-        <!-- Left Panel: Infection Risk Assessment -->
+        <!-- Panel 1: Infection Risk Assessment -->
         <div class="panel panel-unified-assessment">
           <div class="panel-header">
             <svg class="panel-icon" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8" stroke="currentColor" stroke-width="1.5"/><path d="M10 6v4l2.5 2.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
             <h3 class="panel-title">Infection risk assessment</h3>
-            <button id="reset-analysis-btn" class="btn btn-ghost btn-xs" style="margin-right: 8px;">New analysis</button>
+            <span class="panel-help-btn" tabindex="0" data-tooltip="Predicts the patient's overall likelihood of developing a bacterial infection within 30, 60, or 90 days post-transplant based on their clinical history.">?</span>
+            <button id="reset-analysis-btn" class="btn btn-ghost btn-xs" style="margin-left: auto; margin-right: 8px;">New analysis</button>
             <span id="risk-badge" class="risk-badge badge-low">Low risk</span>
           </div>
           
           <!-- Top Row: Metrics side-by-side -->
           <div class="unified-metrics-row">
-            <!-- Column 1: Large Gauge -->
-            <div class="gauge-wrapper">
-              <svg class="gauge-svg" viewBox="0 0 200 140" xmlns="http://www.w3.org/2000/svg">
-                <!-- Background arc -->
-                <circle id="gauge-track" cx="100" cy="110" r="80"
-                  fill="none" stroke="var(--gauge-track)" stroke-width="14"
-                  stroke-dasharray="251 1000" stroke-dashoffset="-62"
-                  transform="rotate(0 100 110)"/>
-                <!-- Colored arc -->
-                <circle id="gauge-arc" cx="100" cy="110" r="80"
-                  fill="none" stroke="#00C9A7" stroke-width="14"
-                  stroke-linecap="round"
-                  stroke-dasharray="0 1000"
-                  stroke-dashoffset="-62"
-                  transform="rotate(180 100 110)"
-                  style="transition: stroke-dasharray 1.5s cubic-bezier(0.34,1.56,0.64,1), stroke 0.6s ease;"/>
-                <!-- Center percentage -->
-                <text id="gauge-pct" x="100" y="95" text-anchor="middle"
-                  font-family="Inter, sans-serif" font-size="26" font-weight="700"
-                  fill="#E4E8F0">0/100</text>
-                 <text id="gauge-label" x="100" y="118" text-anchor="middle"
-                  font-family="Inter, sans-serif" font-size="11" font-weight="500"
-                  fill="#7C8DB5">Infection score</text>
-              </svg>
+            <!-- Column 1: Cohort Risk Distribution Histogram -->
+            <div class="hist-wrapper">
+              <div class="hist-chart-header">
+                <span class="hist-chart-title">Cohort risk distribution</span>
+              </div>
+              <div class="chart-wrap-hist">
+                <canvas id="hist-canvas"></canvas>
+              </div>
             </div>
 
             <!-- Column 2: Vertical Horizon Breakdowns -->
@@ -252,73 +126,71 @@ Infection,CMV,1,30</pre>
                 <span class="horizon-label">60 days</span>
                 <span id="risk-60d" class="horizon-value">—</span>
               </div>
-              <div class="risk-horizon-item" id="horizon-card-90">
+              <div class="risk-horizon-item active-horizon" id="horizon-card-90">
                 <span class="horizon-label">90 days</span>
                 <span id="risk-90d" class="horizon-value">—</span>
               </div>
             </div>
-
-            <!-- Column 3: Vertically Stacked Cards -->
-            <div class="metrics-cards-stack">
-              <!-- Percentile Card -->
-              <div class="position-card position-percentile">
-                <div class="position-big">
-                  <span id="percentile-number">—</span><span id="percentile-suffix" class="position-suffix"></span>
-                </div>
-                <p class="position-label">Percentile</p>
-                <p class="position-hint">within reference cohort</p>
-              </div>
-
-              <!-- Cluster/Event Rate Card -->
-              <div class="position-card position-cluster">
-                <div class="cluster-dot-wrap">
-                  <span id="cluster-badge" class="cluster-badge" style="background:#444">—</span>
-                </div>
-                <p id="cluster-event-rate" class="position-label">Event rate: —</p>
-                <p class="position-hint">assigned risk cluster</p>
-              </div>
-            </div>
           </div> <!-- /unified-metrics-row -->
 
-          <!-- Bottom Row: Narrative spanning full width of left panel -->
-          <p id="narrative-text" class="narrative-text">Run analysis to see a clinical interpretation.</p>
+          <!-- Bottom Row: Summary narrative -->
+          <p id="narrative-text" class="narrative-text">Run analysis to see the patient summary.</p>
         </div>
 
-        <!-- Right Panel: Cohort Risk Distribution -->
-        <div class="panel panel-cohort-distribution">
+        <!-- Panel 2: Impact of Clinical Events on Risk -->
+        <div class="panel panel-timeline">
           <div class="panel-header">
-            <svg class="panel-icon" viewBox="0 0 20 20" fill="none"><rect x="3" y="10" width="3" height="6" rx="1" fill="currentColor"/><rect x="8" y="5" width="3" height="11" rx="1" fill="currentColor"/><rect x="13" y="8" width="3" height="8" rx="1" fill="currentColor"/></svg>
-            <h3 class="panel-title">Cohort risk distribution</h3>
+            <svg class="panel-icon" viewBox="0 0 20 20" fill="none"><path d="M4 4v12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="4" cy="4" r="2" fill="currentColor"/><circle cx="4" cy="10" r="2" fill="currentColor" opacity=".6"/><circle cx="4" cy="16" r="2" fill="currentColor" opacity=".4"/><path d="M7 4h10M7 10h7M7 16h9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" opacity=".6"/></svg>
+            <h3 class="panel-title">Impact of clinical events on risk</h3>
+            <span class="panel-help-btn" tabindex="0" data-tooltip="Shows how individual clinical events, laboratory findings, and medications in the patient's timeline increase (+) or decrease (-) their overall infection risk score. Switch to Risk Timeline to visualize risk evolution over time.">?</span>
+            <div class="timeline-toggle-group" style="margin-left: auto; display: flex; gap: 3px;">
+              <button id="timeline-toggle-graph" class="toggle-btn active" title="View as cumulative risk timeline graph">Timeline</button>
+              <button id="timeline-toggle-list" class="toggle-btn" title="View as structured event impact list">List</button>
+            </div>
           </div>
-          <div class="chart-wrap-hist">
-            <canvas id="hist-canvas"></canvas>
+          
+          <!-- Mode 1: Event Impact List View -->
+          <div id="timeline-list-wrapper" class="timeline-scroll hidden">
+            <ul id="timeline-list" class="timeline-list">
+              <li class="timeline-placeholder">Submit a patient to see the clinical event impact timeline.</li>
+            </ul>
+          </div>
+
+          <!-- Mode 2: Risk Timeline Graph View -->
+          <div id="timeline-graph-outer" style="position: relative; width: 100%; height: 340px; overflow: hidden;">
+            <div class="graph-center-hint">💡 Click any dot to pin details</div>
+            <div id="timeline-graph-wrapper" class="timeline-graph-container" style="position: relative; width: 100%; height: 100%; overflow-x: auto; overflow-y: hidden;">
+              <div id="timeline-graph-svg" style="min-width: 100%; height: 100%;"></div>
+            </div>
           </div>
         </div>
       </div><!-- /row-top-unified -->
 
-      <!-- ---- ROW 2: UMAP + Cluster Profiles ---- -->
+      <!-- ---- ROW 2: Patient Cohort Positioning + Risk Subgroup Profiles ---- -->
       <div class="row row-charts">
 
-        <!-- UMAP Scatter -->
+        <!-- Panel 3: Patient vs Cohort -->
         <div class="panel panel-umap">
           <div class="panel-header">
             <svg class="panel-icon" viewBox="0 0 20 20" fill="none"><circle cx="6" cy="6" r="2" fill="currentColor" opacity=".6"/><circle cx="14" cy="8" r="2" fill="currentColor" opacity=".8"/><circle cx="9" cy="14" r="2" fill="currentColor"/><circle cx="4" cy="14" r="1.5" fill="currentColor" opacity=".5"/></svg>
-            <h3 class="panel-title">Cohort embedding space (UMAP)</h3>
+            <h3 class="panel-title">Patient vs cohort</h3>
+            <span class="panel-help-btn" tabindex="0" data-tooltip="Visualizes where this patient sits relative to past transplant patients. Patients with similar clinical profiles appear closer in this representation space.">?</span>
             <div class="umap-toggle-group">
-              <button id="umap-toggle-cluster" class="toggle-btn active" title="Color by cluster">Cluster</button>
+              <button id="umap-toggle-cluster" class="toggle-btn active" title="Color by subgroup">Subgroup</button>
               <button id="umap-toggle-risk"    class="toggle-btn"        title="Color by risk score">Risk score</button>
               <button id="umap-toggle-imminence" class="toggle-btn"     title="Color by event imminence">Event imminence</button>
             </div>
           </div>
           <div id="umap-svg-container" class="umap-container"></div>
-          <p class="chart-caption">Each point is a patient in the test cohort. The new patient is shown as ★. Zoom and pan to explore.</p>
+          <p class="chart-caption">Each point represents a past transplant patient from the reference cohort. Patients with similar clinical profiles appear closer together.</p>
         </div>
 
-        <!-- Cluster Profiles -->
+        <!-- Panel 4: Risk Subgroup Profiles -->
         <div class="panel panel-clusters">
           <div class="panel-header">
             <svg class="panel-icon" viewBox="0 0 20 20" fill="none"><circle cx="6" cy="7" r="3" stroke="currentColor" stroke-width="1.5"/><circle cx="14" cy="13" r="3" stroke="currentColor" stroke-width="1.5"/><circle cx="14" cy="7" r="3" stroke="currentColor" stroke-width="1.5" opacity=".5"/></svg>
-            <h3 class="panel-title">Risk cluster profiles</h3>
+            <h3 class="panel-title">Risk subgroup profiles</h3>
+            <span class="panel-help-btn" tabindex="0" data-tooltip="Compares reference patient subgroups (High vs. Low risk) to highlight key baseline characteristics and recent clinical drivers associated with infection outcomes.">?</span>
           </div>
           <div id="cluster-profiles-container" class="cluster-profiles-container">
             <!-- Cards injected by charts.js -->
@@ -326,48 +198,102 @@ Infection,CMV,1,30</pre>
         </div>
       </div><!-- /row-charts -->
 
-      <!-- ---- ROW 3: Feature Attributions + Clinical Timeline ---- -->
-      <div class="row row-interp">
-
-        <!-- Feature Attribution -->
-        <div class="panel panel-attr">
-          <div class="panel-header">
-            <svg class="panel-icon" viewBox="0 0 20 20" fill="none"><rect x="3" y="6" width="10" height="2" rx="1" fill="currentColor" opacity=".6"/><rect x="3" y="10" width="14" height="2" rx="1" fill="currentColor"/><rect x="3" y="14" width="7" height="2" rx="1" fill="currentColor" opacity=".5"/></svg>
-            <h3 class="panel-title">Feature attributions (integrated gradients)</h3>
-          </div>
-          <div class="chart-wrap chart-wrap-tall">
-            <canvas id="attr-canvas"></canvas>
-          </div>
-          <p class="chart-caption">Bars indicate correlation with AI model risk prediction, not causative clinical patterns.</p>
-        </div>
-
-        <!-- Clinical Timeline -->
-        <div class="panel panel-timeline">
-          <div class="panel-header">
-            <svg class="panel-icon" viewBox="0 0 20 20" fill="none"><path d="M4 4v12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="4" cy="4" r="2" fill="currentColor"/><circle cx="4" cy="10" r="2" fill="currentColor" opacity=".6"/><circle cx="4" cy="16" r="2" fill="currentColor" opacity=".4"/><path d="M7 4h10M7 10h7M7 16h9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" opacity=".6"/></svg>
-            <h3 class="panel-title">Clinical timeline</h3>
-          </div>
-          <div class="timeline-scroll">
-            <ul id="timeline-list" class="timeline-list">
-              <li class="timeline-placeholder">Submit a patient to see the clinical event timeline.</li>
-            </ul>
-          </div>
-        </div>
-      </div><!-- /row-interp -->
-
-      <!-- Row 4 removed -->
-
     </div><!-- /#results-area -->
   </section><!-- /.results-container -->
+
+  <!-- --------------------------------------------------------
+       RIGHT SIDEBAR — Patient Input
+  -------------------------------------------------------- -->
+  <aside class="sidebar">
+    <div class="panel sidebar-panel">
+      <div class="panel-header">
+        <svg class="panel-icon" viewBox="0 0 20 20" fill="none"><path d="M10 2a8 8 0 100 16A8 8 0 0010 2zm0 4v4l3 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        <h2 class="panel-title">Patient data</h2>
+      </div>
+
+      <!-- Tabs -->
+      <div class="tab-bar" role="tablist">
+        <button id="tab-btn-form" class="tab-btn active" role="tab" aria-selected="true" aria-controls="tab-form">
+          <svg viewBox="0 0 16 16" fill="none"><path d="M2 4h12M2 8h8M2 12h10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+          Manual entry
+        </button>
+        <button id="tab-btn-upload" class="tab-btn" role="tab" aria-selected="false" aria-controls="tab-upload">
+          <svg viewBox="0 0 16 16" fill="none"><path d="M8 10V3m0-1l-3 3m3-3l3 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M2 13h12" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+          File upload
+        </button>
+      </div>
+
+      <!-- FIXED HEIGHT TAB VIEWPORT — guarantees 0 movement between tab bar and buttons below -->
+      <div class="sidebar-tab-viewport">
+        <!-- TAB: Manual Entry -->
+        <div id="tab-form" class="tab-content" role="tabpanel">
+          <p class="form-help">Add one row per clinical event. Events are sorted by day automatically.</p>
+
+          <div class="event-table-wrapper">
+            <table class="event-table" id="event-table">
+              <thead>
+                <tr>
+                  <th>Entity</th>
+                  <th>Attribute</th>
+                  <th>Value</th>
+                  <th>Day</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="patient-events-tbody">
+                <!-- Rows injected by patient_form.js -->
+              </tbody>
+            </table>
+          </div>
+
+          <button id="add-event-btn" class="btn btn-ghost btn-sm" type="button">
+            <svg viewBox="0 0 16 16" fill="none"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+            Add Event
+          </button>
+        </div>
+
+        <!-- TAB: File Upload -->
+        <div id="tab-upload" class="tab-content hidden" role="tabpanel">
+          <div id="file-drop-zone" class="drop-zone" tabindex="0" role="button" aria-label="Upload patient event file">
+            <div class="drop-zone-inner">
+              <svg class="drop-icon" viewBox="0 0 48 48" fill="none">
+                <path d="M24 32V16m0-4l-8 8m8-8l8 8" stroke="#4F8EF7" stroke-width="2.5" stroke-linecap="round"/>
+                <path d="M8 38h32" stroke="#4F8EF7" stroke-width="2.5" stroke-linecap="round"/>
+              </svg>
+              <p class="drop-title">Drop CSV or JSON file here</p>
+              <p class="drop-hint">or click to browse</p>
+            </div>
+            <input id="file-input" type="file" accept=".csv,.json" class="file-input-hidden" />
+          </div>
+        </div>
+      </div><!-- /.sidebar-tab-viewport -->
+
+      <!-- Synthetic patient loader (placed above Analyse patient button) -->
+      <div class="example-section">
+        <span class="example-label">Or use synthetic patient data:</span>
+        <div class="example-btns">
+          <button class="btn btn-ghost btn-xs example-btn" data-example="high">High risk</button>
+          <button class="btn btn-ghost btn-xs example-btn" data-example="low">Low risk</button>
+        </div>
+      </div>
+
+      <!-- Global Analyse patient button -->
+      <button id="analyze-form-btn" class="btn btn-primary mt-lg" type="button">
+        <svg viewBox="0 0 20 20" fill="none"><path d="M10 2a8 8 0 100 16A8 8 0 0010 2zM10 6v4l3 2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        Analyse patient
+      </button>
+
+    </div>
+  </aside>
 
 </main><!-- /.app-main -->
 
 <!-- ================================================================
      SCRIPTS
 ================================================================ -->
-<script src="/static/js/patient_form.js?v=1.2"></script>
-<script src="/static/js/charts.js?v=1.2"></script>
-<script src="/static/js/main.js?v=1.2"></script>
+<script src="/static/js/patient_form.js?v=4.4"></script>
+<script src="/static/js/charts.js?v=4.4"></script>
+<script src="/static/js/main.js?v=4.4"></script>
 <script>
   // Boot the app once DOM is ready
   document.addEventListener('DOMContentLoaded', () => {

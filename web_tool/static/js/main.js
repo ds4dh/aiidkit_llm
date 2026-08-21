@@ -15,7 +15,7 @@ window.AIIDKIT = (() => {
     config:           null,
     cohort:           null,
     prediction:       null,
-    selectedHorizon:  30,
+    selectedHorizon:  90,
     selectedFup:      90,
     chartsInitialized: false,
     currentPatientRawEvents: null,
@@ -77,7 +77,7 @@ window.AIIDKIT = (() => {
     
     if (duration > 0) {
       setTimeout(() => {
-        toast.style.cssText += 'opacity:0;transform:translateX(40px);transition:opacity 0.3s,transform 0.3s;';
+        toast.style.cssText += 'opacity:0;transform:translateY(-15px);transition:opacity 0.3s,transform 0.3s;';
         setTimeout(() => toast.remove(), 350);
       }, duration);
     }
@@ -175,7 +175,7 @@ window.AIIDKIT = (() => {
   }
 
   function _badgeClass(cat) {
-    return { 'Low risk': 'badge-low', 'Moderate risk': 'badge-mod', 'High risk': 'badge-high', 'Very high risk': 'badge-vhigh' }[cat] || 'badge-low';
+    return { 'Low risk': 'badge-low', 'Medium risk': 'badge-mod', 'Moderate risk': 'badge-mod', 'High risk': 'badge-high', 'Very high risk': 'badge-vhigh' }[cat] || 'badge-low';
   }
 
   // ================================================================
@@ -191,9 +191,9 @@ window.AIIDKIT = (() => {
       const risk = calibratedRisks?.[`${h}d`];
       
       if (score != null) {
-        let htmlVal = `<span class="horizon-score-val">${(score * 100).toFixed(1)}/100</span>`;
+        let htmlVal = `<span class="horizon-score-val">${Math.round(score * 100)}/100</span>`;
         if (risk != null) {
-          htmlVal += `<span class="horizon-risk-pct">Risk: ${(risk * 100).toFixed(1)}%</span>`;
+          htmlVal += `<span class="horizon-risk-pct">Risk: ${Math.round(risk * 100)}%</span>`;
         }
         el.innerHTML = htmlVal;
       } else {
@@ -329,29 +329,40 @@ window.AIIDKIT = (() => {
         ? `<span class="cohort-risk-badge">⚠️ Cohort Risk Driver</span>` 
         : '';
 
+      const entityLabel = ev.entity === 'Infection' ? 'Previous infection' : ev.entity;
+
       const li = document.createElement('li');
       li.className = 'timeline-item';
       li.style.animationDelay = `${i * 35}ms`;
-      li.style.cssText += `; ${bgStyle}; padding-left: 8px; padding-right: 8px; border-radius: var(--radius-sm); margin-bottom: 4px;`;
+      li.style.cssText += `; ${bgStyle}; padding: 12px 18px; border-radius: var(--radius-sm); margin-bottom: 6px; display: flex; align-items: center; gap: 14px;`;
       
       li.innerHTML = `
-        <div class="timeline-day">
+        <div class="timeline-day" style="flex-shrink: 0; margin-right: 6px;">
           <div class="timeline-day-num">${ev.days_since_tpx}</div>
           <div class="timeline-day-unit">day</div>
         </div>
-        <div class="timeline-bar" style="background:${barC}"></div>
-        <div class="timeline-content horizontal-layout">
-          <div class="timeline-details">
-            <span class="timeline-entity-tag">${ev.entity === 'Infection' ? 'Previous infection' : ev.entity}</span>
-            <span class="timeline-event-name" style="color: ${textC}"><strong>${ev.attribute}</strong>: ${ev.value}</span>
+        <div class="timeline-bar" style="background:${barC}; flex-shrink: 0; width: 4px; border-radius: 2px; align-self: stretch;"></div>
+        <div class="timeline-content-2line" style="flex: 1; display: flex; flex-direction: column; gap: 4px; min-width: 0; padding-right: 12px;">
+          <div class="timeline-row-top" style="display: flex; align-items: center; justify-content: space-between; gap: 10px;">
+            <span class="timeline-entity-tag" style="margin: 0; flex-shrink: 0;">${entityLabel}</span>
+            <span class="timeline-value-text" style="font-size: 0.76rem; font-weight: 700; color: ${textC}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-left: auto;"><strong>Value:</strong> ${ev.value}</span>
           </div>
-          <div class="timeline-badges-wrap">
-            ${scBadge}
-            ${cohortRiskBadge}
+          <div class="timeline-row-bottom" style="display: flex; align-items: center; justify-content: space-between; gap: 10px;">
+            <span class="timeline-attribute-name" style="font-size: 0.75rem; color: var(--text); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${ev.attribute}</span>
+            <div class="timeline-badges-wrap" style="display: flex; align-items: center; gap: 6px; flex-shrink: 0; margin-left: auto;">
+              ${scBadge}
+              ${cohortRiskBadge}
+            </div>
           </div>
         </div>`;
       list.appendChild(li);
     });
+
+    // Also draw cumulative Risk Timeline Graph (Mode 2)
+    window.AIIDKIT_CHARTS?.drawRiskTimelineGraph?.(
+      sorted,
+      state.prediction?.risk_score
+    );
   }
 
   // ================================================================
@@ -393,13 +404,33 @@ window.AIIDKIT = (() => {
     showToast('Ready for new analysis.', 'info');
   }
 
+  function calculateAutoFup(events) {
+    if (!events || !events.length) return 30;
+    const validDays = events
+      .map(ev => parseFloat(ev.days_since_tpx))
+      .filter(d => !isNaN(d) && d > 0);
+    if (!validDays.length) return 30;
+    const maxDay = Math.max(...validDays);
+    return Math.max(30, Math.ceil(maxDay / 30) * 30);
+  }
+
   async function handleAnalyse(events, silent = false) {
     if (!events?.length) { showToast('Please add at least one clinical event.', 'error'); return; }
     
+    const autoFup = calculateAutoFup(events);
+    const fupDisplay = document.getElementById('fup-display');
+    if (fupDisplay) fupDisplay.textContent = `Follow-up: ${autoFup} days`;
+
     const loadToast = showToast('Analysing patient sequence…', 'loading', 0);
     
     try {
-      const result     = await submitPrediction(events, state.selectedHorizon, state.selectedFup);
+      if (!state.cohort || state.selectedFup !== autoFup) {
+        state.selectedFup = autoFup;
+        state.cohort = await fetchCohort(autoFup);
+        state.chartsInitialized = false;
+      }
+
+      const result     = await submitPrediction(events, state.selectedHorizon, autoFup);
       state.prediction = result;
 
       // Always show results first to ensure containers render
@@ -417,7 +448,7 @@ window.AIIDKIT = (() => {
       if (state.chartsInitialized) {
         const C = window.AIIDKIT_CHARTS;
         if (C) {
-          C.updateUMAPWithPatient(result.umap_x, result.umap_y);
+          C.updateUMAPWithPatient(result.umap_x, result.umap_y, result);
           C.updateHistogramWithPatient(result.risk_score);
           if (state.cohort && typeof C.updateAttributionChart === 'function') {
             C.updateAttributionChart(state.cohort.global_attributions || []);
@@ -431,6 +462,7 @@ window.AIIDKIT = (() => {
       }
 
       showToast('Analysis updated!', 'success');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (err) {
       if (loadToast) {
         loadToast.remove();
@@ -470,17 +502,17 @@ window.AIIDKIT = (() => {
     const toggleBtn = document.getElementById('theme-toggle');
     if (toggleBtn) {
       if (theme === 'light') {
-        // Moon icon + label (indicates next action or current state, here we show current state)
+        // Moon icon + Dark theme text (indicates clicking will switch to dark theme)
         toggleBtn.innerHTML = `
-          <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
-          <span>Light theme</span>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+          <span>Dark theme</span>
         `;
         toggleBtn.setAttribute('title', 'Switch to dark theme');
       } else {
-        // Sun icon + label
+        // Sun icon + Light theme text (indicates clicking will switch to light theme)
         toggleBtn.innerHTML = `
-          <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
-          <span>Dark theme</span>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
+          <span>Light theme</span>
         `;
         toggleBtn.setAttribute('title', 'Switch to light theme');
       }
@@ -502,93 +534,38 @@ window.AIIDKIT = (() => {
   function _setupListeners() {
     [30, 60, 90].forEach(h => {
       const card = document.getElementById(`horizon-card-${h}`);
-      card?.addEventListener('click', () => {
-        const select = document.getElementById('horizon-select');
-        if (select && parseInt(select.value, 10) !== h) {
-          select.value = h;
-          select.dispatchEvent(new Event('change'));
-        }
-      });
-    });
+      card?.addEventListener('click', async () => {
+        if (state.selectedHorizon === h) return;
+        state.selectedHorizon = h;
 
-    document.getElementById('horizon-select')?.addEventListener('change', async e => {
-      state.selectedHorizon = parseInt(e.target.value, 10);
-      
-      updateRiskScoreCards(
-        state.prediction?.risk_scores,
-        state.prediction?.calibrated_risks,
-        state.selectedHorizon
-      );
+        updateRiskScoreCards(
+          state.prediction?.risk_scores,
+          state.prediction?.calibrated_risks,
+          state.selectedHorizon
+        );
 
-      const C = window.AIIDKIT_CHARTS;
-      if (state.chartsInitialized && C && state.cohort) {
-        const activeCohort = state.cohort.horizons[state.selectedHorizon];
-        if (activeCohort) {
-          C.initUMAP(activeCohort); // Re-initialize UMAP completely since coordinates and scales bounds changed
-          if (state.prediction) {
-            C.updateUMAPWithPatient(state.prediction.umap_x, state.prediction.umap_y);
-          }
-          C.updateHistogramData(activeCohort.risk_distribution);
-          C.updateClusterProfiles(activeCohort.cluster_profiles);
-        }
-      }
-
-      // Auto-re-run prediction if a patient has been analyzed
-      const formEvents = window.AIIDKIT_FORM?.getFormEvents?.() || [];
-      if (formEvents.length > 0 && state.prediction) {
-        await handleAnalyse(formEvents, true);
-      }
-    });
-
-    document.getElementById('fup-select')?.addEventListener('change', async e => {
-      state.selectedFup = parseInt(e.target.value, 10);
-      showLoading('Updating cohort data…');
-      try {
-        state.cohort = await fetchCohort(state.selectedFup);
         const C = window.AIIDKIT_CHARTS;
         if (state.chartsInitialized && C && state.cohort) {
           const activeCohort = state.cohort.horizons[state.selectedHorizon];
           if (activeCohort) {
-            // Re-initialize UMAP completely since coordinates and scales bounds changed
             C.initUMAP(activeCohort);
-            // Draw gold star immediately if a patient has been analyzed
             if (state.prediction) {
-              C.updateUMAPWithPatient(state.prediction.umap_x, state.prediction.umap_y);
+              C.updateUMAPWithPatient(state.prediction.umap_x, state.prediction.umap_y, state.prediction);
             }
             C.updateHistogramData(activeCohort.risk_distribution);
             C.updateClusterProfiles(activeCohort.cluster_profiles);
-            if (typeof C.updateAttributionChart === 'function') {
-              C.updateAttributionChart(state.cohort.global_attributions || []);
-            }
-          }
-        }
-        
-        // Update form events based on FUP
-        let updatedEvents = [];
-        if (state.currentPatientRawEvents) {
-          updatedEvents = state.currentPatientRawEvents.filter(ev => ev.days_since_tpx <= state.selectedFup);
-          window.AIIDKIT_FORM?.setEvents?.(updatedEvents);
-        } else {
-          // If manually entered, trim events that exceed the new FUP
-          const formEvents = window.AIIDKIT_FORM?.getFormEvents?.() || [];
-          updatedEvents = formEvents.filter(ev => ev.days_since_tpx <= state.selectedFup);
-          if (updatedEvents.length !== formEvents.length) {
-            window.AIIDKIT_FORM?.setEvents?.(updatedEvents);
           }
         }
 
-        // Auto-re-run prediction if a patient has been analyzed
-        if (updatedEvents.length > 0 && state.prediction) {
-          await handleAnalyse(updatedEvents);
-        } else {
-          showToast(`Cohort loaded for ${state.selectedFup}-day follow-up.`, 'success');
+        const formEvents = window.AIIDKIT_FORM?.getFormEvents?.() || [];
+        if (formEvents.length > 0 && state.prediction) {
+          await handleAnalyse(formEvents, true);
         }
-      } catch (err) {
-        showToast(`Failed to load cohort: ${err.message}`, 'error');
-        console.error('[AIIDKIT] FUP cohort load error:', err);
-      } finally {
-        hideLoading();
-      }
+      });
+    });
+
+    document.getElementById('header-brand')?.addEventListener('click', () => {
+      resetAnalysis();
     });
 
     document.getElementById('reset-analysis-btn')?.addEventListener('click', () => {
@@ -601,6 +578,32 @@ window.AIIDKIT = (() => {
       window.AIIDKIT_CHARTS?.toggleUMAPColorMode?.('risk'));
     document.getElementById('umap-toggle-imminence')?.addEventListener('click', () =>
       window.AIIDKIT_CHARTS?.toggleUMAPColorMode?.('imminence'));
+
+    // Panel 2 Mode Toggle (List vs Risk Timeline)
+    const btnList   = document.getElementById('timeline-toggle-list');
+    const btnGraph  = document.getElementById('timeline-toggle-graph');
+    const wrapList  = document.getElementById('timeline-list-wrapper');
+    const wrapGraph = document.getElementById('timeline-graph-wrapper');
+
+    btnList?.addEventListener('click', () => {
+      btnList.classList.add('active');
+      btnGraph?.classList.remove('active');
+      wrapList?.classList.remove('hidden');
+      wrapGraph?.classList.add('hidden');
+    });
+
+    btnGraph?.addEventListener('click', () => {
+      btnGraph.classList.add('active');
+      btnList?.classList.remove('active');
+      wrapGraph?.classList.remove('hidden');
+      wrapList?.classList.add('hidden');
+      if (state.prediction && state.prediction.events_with_scores) {
+        window.AIIDKIT_CHARTS?.drawRiskTimelineGraph?.(
+          state.prediction.events_with_scores,
+          state.prediction.risk_score
+        );
+      }
+    });
 
     document.getElementById('analyze-form-btn')?.addEventListener('click', () =>
       handleAnalyse(window.AIIDKIT_FORM?.getFormEvents?.() || []));
@@ -627,29 +630,7 @@ window.AIIDKIT = (() => {
       _initTheme();
       state.config = await fetchConfig();
 
-      const badge = document.getElementById('mock-badge');
-      if (badge) {
-        if (state.config.using_mock_data) {
-          badge.textContent = 'DEMO MODE'; badge.className = 'mode-badge badge-demo';
-        } else {
-          badge.textContent = 'LIVE MODEL'; badge.className = 'mode-badge badge-live';
-        }
-      }
-
-      state.selectedFup = state.config.default_fup || 90;
-
-      // Populate follow-up period select dropdown
-      const fupSel = document.getElementById('fup-select');
-      if (fupSel && state.config.available_fups) {
-        fupSel.innerHTML = '';
-        state.config.available_fups.forEach(f => {
-          const opt = document.createElement('option');
-          opt.value = f;
-          opt.textContent = `${f} days`;
-          if (f === state.selectedFup) opt.selected = true;
-          fupSel.appendChild(opt);
-        });
-      }
+      state.selectedFup = state.config.default_fup || 30;
 
       window.AIIDKIT_FORM?.initForm?.(state.config.vocabulary);
 

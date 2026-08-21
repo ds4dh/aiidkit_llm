@@ -33,8 +33,8 @@ window.AIIDKIT_FORM = (() => {
     // File upload
     initFileUpload();
 
-    // Pre-load one starter row
-    addEventRow({ entity: 'Medication', attribute: 'Tacrolimus', value: 'High', days_since_tpx: 7 });
+    // Pre-load one blank starter row with placeholders
+    addEventRow();
   }
 
   function switchTab(name) {
@@ -62,17 +62,18 @@ window.AIIDKIT_FORM = (() => {
     const id = `r${_rowCount}`;
     const entities = Object.keys(_vocabulary);
 
-    const defaultEntity = defaults.entity || entities[0] || '';
+    const defaultEntity = defaults.entity || '';
     const defaultAttrs  = defaultEntity ? Object.keys(_vocabulary[defaultEntity] || {}) : [];
-    const defaultAttr   = defaults.attribute || defaultAttrs[0] || '';
+    const defaultAttr   = defaults.attribute || '';
     const defaultVals   = (defaultEntity && defaultAttr)
       ? (_vocabulary[defaultEntity]?.[defaultAttr] || [])
       : [];
+    const defaultValue  = defaults.value || '';
 
     // --- build selects ---
-    const entitySel = _makeSelect(`ent-${id}`, entities, defaultEntity);
-    const attrSel   = _makeSelect(`att-${id}`, defaultAttrs, defaultAttr);
-    const valSel    = _makeSelect(`val-${id}`, defaultVals,  defaults.value);
+    const entitySel = _makeSelect(`ent-${id}`, entities, defaultEntity, '—');
+    const attrSel   = _makeSelect(`att-${id}`, defaultAttrs, defaultAttr, '—');
+    const valSel    = _makeSelect(`val-${id}`, defaultVals,  defaultValue, '—');
 
     entitySel.addEventListener('change', () => _onEntityChange(entitySel, attrSel, valSel));
     attrSel.addEventListener('change',   () => _onAttrChange(entitySel, attrSel, valSel));
@@ -103,36 +104,60 @@ window.AIIDKIT_FORM = (() => {
   function _onEntityChange(entitySel, attrSel, valSel) {
     const entity  = entitySel.value;
     const attribs = entity ? Object.keys(_vocabulary[entity] || {}) : [];
-    _populateSelect(attrSel, attribs);
-    const vals = (entity && attrSel.value)
-      ? (_vocabulary[entity]?.[attrSel.value] || []) : [];
-    _populateSelect(valSel, vals);
+    _updatePlaceholderClass(entitySel);
+    _populateSelect(attrSel, attribs, '', '—');
+    _populateSelect(valSel, [], '', '—');
   }
 
   function _onAttrChange(entitySel, attrSel, valSel) {
     const entity = entitySel.value;
     const attr   = attrSel.value;
     const vals   = (entity && attr) ? (_vocabulary[entity]?.[attr] || []) : [];
-    _populateSelect(valSel, vals);
+    _updatePlaceholderClass(attrSel);
+    _populateSelect(valSel, vals, '', '—');
   }
 
-  function _makeSelect(id, options, selectedValue) {
+  function _makeSelect(id, options, selectedValue, placeholder = '—') {
     const sel = document.createElement('select');
     sel.id = id;
-    _populateSelect(sel, options, selectedValue);
+    _populateSelect(sel, options, selectedValue, placeholder);
+    sel.addEventListener('change', () => _updatePlaceholderClass(sel));
     return sel;
   }
 
-  function _populateSelect(sel, options, selectedValue) {
-    const prev = sel.value;
+  function _populateSelect(sel, options, selectedValue, placeholder = '—') {
     sel.innerHTML = '';
+    
+    if (placeholder) {
+      const ph = document.createElement('option');
+      ph.value = '';
+      ph.textContent = placeholder;
+      ph.disabled = true;
+      if (!selectedValue) {
+        ph.selected = true;
+      }
+      sel.appendChild(ph);
+    }
+
     options.forEach(opt => {
       const o = document.createElement('option');
-      o.value = opt; o.textContent = opt;
-      if (opt === (selectedValue ?? prev)) o.selected = true;
+      o.value = opt;
+      o.textContent = opt;
+      if (selectedValue && opt === selectedValue) {
+        o.selected = true;
+      }
       sel.appendChild(o);
     });
-    if (!selectedValue && options.includes(prev)) sel.value = prev;
+
+    _updatePlaceholderClass(sel);
+  }
+
+  function _updatePlaceholderClass(sel) {
+    if (!sel.value) {
+      sel.classList.add('is-placeholder');
+    } else {
+      sel.classList.remove('is-placeholder');
+    }
   }
 
   // ------------------------------------------------------------------
@@ -208,17 +233,12 @@ window.AIIDKIT_FORM = (() => {
           window.AIIDKIT.setCurrentPatientRawEvents(events);
         }
 
-        // Filter events to FUP boundary
-        const fupSel = document.getElementById('fup-select');
-        const selectedFup = fupSel ? parseInt(fupSel.value, 10) : 90;
-        const filteredEvents = events.filter(ev => ev.days_since_tpx <= selectedFup);
-
         // Load events into manual entry form
         const tbody = document.getElementById('patient-events-tbody');
         if (tbody) {
           tbody.innerHTML = '';
           _rowCount = 0;
-          filteredEvents.forEach(ev => addEventRow(ev));
+          events.forEach(ev => addEventRow(ev));
         }
 
         // Switch active tab to Manual Entry form
@@ -231,7 +251,7 @@ window.AIIDKIT_FORM = (() => {
 
         // Show toast
         if (window.AIIDKIT && typeof window.AIIDKIT.showToast === 'function') {
-          window.AIIDKIT.showToast(`${filteredEvents.length} events loaded into manual entry form (filtered to ${selectedFup}-day follow-up).`, 'success');
+          window.AIIDKIT.showToast(`${events.length} events loaded into manual entry form.`, 'success');
         }
       } catch (err) {
         alert(`Could not parse file: ${err.message}`);
@@ -294,20 +314,15 @@ window.AIIDKIT_FORM = (() => {
         window.AIIDKIT.setCurrentPatientRawEvents(events);
       }
 
-      // Filter events to FUP boundary
-      const fupSel = document.getElementById('fup-select');
-      const selectedFup = fupSel ? parseInt(fupSel.value, 10) : 90;
-      const filteredEvents = events.filter(ev => ev.days_since_tpx <= selectedFup);
-
       const tbody = document.getElementById('patient-events-tbody');
       if (!tbody) return;
       tbody.innerHTML = '';
       _rowCount = 0;
-      filteredEvents.forEach(ev => addEventRow(ev));
+      events.forEach(ev => addEventRow(ev));
       scrollToBottom();
       if (window.AIIDKIT && typeof window.AIIDKIT.showToast === 'function') {
         const labels = { high: 'High', mod: 'Moderate', low: 'Low' };
-        window.AIIDKIT.showToast(`${labels[type] || type}-risk example patient loaded (filtered to ${selectedFup}-day follow-up).`, 'success');
+        window.AIIDKIT.showToast(`${labels[type] || type}-risk example patient loaded (${events.length} events).`, 'success');
       }
     } catch (err) {
       console.error('[AIIDKIT] Failed to load example patient:', err);
@@ -325,7 +340,7 @@ window.AIIDKIT_FORM = (() => {
     const tbody = document.getElementById('patient-events-tbody');
     if (tbody) tbody.innerHTML = '';
     _rowCount = 0;
-    addEventRow({ entity: 'Medication', attribute: 'Tacrolimus', value: 'High', days_since_tpx: 7 });
+    addEventRow();
   }
 
   function clearUpload() {
