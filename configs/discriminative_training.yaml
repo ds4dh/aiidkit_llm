@@ -54,7 +54,7 @@ pretrainer:
   learning_rate: 1.0e-4  # careful! "1e-4" will be read as a string, use 1.0e-4
   weight_decay: 0.1
   bf16: true
-  report_to: wandb
+  report_to: none
   remove_unused_columns: false  # crucial for custom collators
   load_best_model_at_end: true  # required for early stopping
   metric_for_best_model: eval_mlm_accuracy  # format: "eval_" + metric name
@@ -83,7 +83,7 @@ finetuner:
   loss_name: ce  # ce, weighted_ce, focal, poly1 -> ce optimizes calibration!
   enforce_monotonicity: true  # if True, classifier probabilities increase with horizon
   bf16: true
-  report_to: wandb
+  report_to: none
   remove_unused_columns: false  # crucial for custom collators
   load_best_model_at_end: true
   metric_for_best_model: eval_all_early_stopping_metric  # see evaluator arguments

@@ -1,7 +1,10 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import argparse
 import yaml
 import json
-import sys
 import gc
 import torch
 import wandb
@@ -24,35 +27,38 @@ from src.evaluation.evaluate_models import (
 from scripts.script_utils import scan_all_fups, prepare_dataset_fup_dict
 
 
-CLI_CFG: dict[str, dict] = {}
-SAFE_NUM_PROCS = 4  # max(1, len(os.sched_getaffinity(0)) - 2)
-
-parser = argparse.ArgumentParser(description="Fine-tune a model to predict future infections.")
-parser.add_argument("--config", "-c", type=str, default="configs/discriminative_training.yaml")
-parser.add_argument("--reset_weights", "-r", action="store_true", help="Whether to reset model weights before fine-tuning.")
-parser.add_argument("--plot_only", "-p", action="store_true", help="Skip run and goes directly to the plot.")
-parser.add_argument("--silent", "-s", action="store_true", help="Disable wandb logging.")
-parser.add_argument("--overrides", "-o", type=str, default="{}", help="Overrides config (JSON string).")
-cli_args = parser.parse_args()
+def parse_args():
+    parser = argparse.ArgumentParser(description="Fine-tune a model to predict future infections.")
+    parser.add_argument("--config", "-c", type=str, default="configs/discriminative_training.yaml")
+    parser.add_argument("--reset_weights", "-r", action="store_true", help="Whether to reset model weights before fine-tuning.")
+    parser.add_argument("--plot_only", "-p", action="store_true", help="Skip run and goes directly to the plot.")
+    parser.add_argument("--silent", "-s", action="store_true", help="Disable wandb logging.")
+    parser.add_argument("--overrides", "-o", action="append", default=[], help="Overrides config (JSON string or key=value).")
+    return parser.parse_args()
 
 
 def main():
     """
     Fine-tune models for the prediction tasks in the yaml file from the CLI config
     """
+    cli_args = parse_args()
+    with open(cli_args.config, 'r') as f:
+        cfg = yaml.safe_load(f)
+    cfg = apply_config_overrides(cfg, cli_args.overrides)
+
     # Identify pretraining and finetuning directories
-    train_data_augment = CLI_CFG["train_data_augment"]
-    mlm_masking_rules = CLI_CFG["data_collator"]["mlm_masking_rules"]
+    train_data_augment = cfg["train_data_augment"]
+    mlm_masking_rules = cfg["data_collator"]["mlm_masking_rules"]
     pretrain_run_id = "-".join([f"{k[0]}{int(v * 100):02d}" for k, v in mlm_masking_rules.items()])
     finetune_run_id = pretrain_run_id if not cli_args.reset_weights else "no_pretrain"
-    result_dir = Path(CLI_CFG["result_dir"]) / CLI_CFG["data_split_type"]
+    result_dir = Path(cfg["result_dir"]) / cfg["data_split_type"]
     pretrained_dir = result_dir / pretrain_run_id / "pretraining"
-    finetuning_subdir = CLI_CFG["finetuner"].pop("ft_subdir", "finetuning")
+    finetuning_subdir = cfg["finetuner"].pop("ft_subdir", "finetuning")
     finetuning_dir = result_dir / finetune_run_id / finetuning_subdir
 
     # Iterate over prediction tasks
-    enforce_monotonicity = CLI_CFG["finetuner"].pop("enforce_monotonicity")
-    for task_key, task_specs in CLI_CFG["prediction_tasks"].items():
+    enforce_monotonicity = cfg["finetuner"].pop("enforce_monotonicity", True)
+    for task_key, task_specs in cfg["prediction_tasks"].items():
         if not cli_args.plot_only:
             
             # Iterate over all horizon configurations
@@ -66,7 +72,7 @@ def main():
                     if train_data_augment == "valid":
                         train_fups = valid_fups  # all of interest
                     elif train_data_augment == "all":
-                        data_dir = Path(CLI_CFG["data_dir"]) / CLI_CFG["data_split_type"]
+                        data_dir = Path(cfg["data_dir"]) / cfg["data_split_type"]
                         train_fups = scan_all_fups(data_dir)  # all available
                     run_configs = [(train_fups, valid_fups)]
 
@@ -82,6 +88,8 @@ def main():
                         f"Train FUPs={train_fups} | Valid FUPs={valid_fups}"
                     )
                     finetune_disciminative_model(
+                        cfg=cfg,
+                        cli_args=cli_args,
                         task_key=task_key,
                         horizons=horizons,  
                         fup_train=train_fups,
@@ -103,6 +111,8 @@ def main():
 
 
 def finetune_disciminative_model(
+    cfg: dict,
+    cli_args: argparse.Namespace,
     task_key: str,
     horizons: list[int],
     fup_valid: list[int],
@@ -116,7 +126,7 @@ def finetune_disciminative_model(
     """
     Fine-tune one model on a specific infection prediction task
     """
-    data_root_dir = Path(CLI_CFG["data_dir"]) / CLI_CFG["data_split_type"]
+    data_root_dir = Path(cfg["data_dir"]) / cfg["data_split_type"]
     all_possible_fups = scan_all_fups(data_root_dir)
     label_keys = [f"label_{task_key}_{h:04d}d" for h in horizons]
 
@@ -127,9 +137,9 @@ def finetune_disciminative_model(
         fup_valid=all_possible_fups,
         fup_test=all_possible_fups,
         label_keys=label_keys,
-        target_undersampling_ratio=CLI_CFG.get("target_undersampling_ratio", None),
-        time_mapping=CLI_CFG["data_collator"]["time_mapping"],
-        eav_mappings=CLI_CFG["data_collator"]["eav_mappings"],
+        target_undersampling_ratio=cfg.get("target_undersampling_ratio", None),
+        time_mapping=cfg["data_collator"]["time_mapping"],
+        eav_mappings=cfg["data_collator"]["eav_mappings"],
     )
 
     # Prepare split identification flags across arrays
@@ -148,48 +158,53 @@ def finetune_disciminative_model(
     # Auto-detect model sub-directory and best pre-trained model checkpoint
     pretrained_last_ckpt_dir = get_last_checkpoint(str(pretrained_dir))
     if pretrained_last_ckpt_dir is None:
-        sys.exit(f"Error: No checkpoint found in {pretrained_dir}")
+        if (pretrained_dir / "config.json").exists():
+            pretrained_last_ckpt_dir = str(pretrained_dir)
+        else:
+            sys.exit(f"Error: No checkpoint found in {pretrained_dir}")
 
     # Set up model configuration
-    CLI_CFG["model"]["pretrained_dir"] = pretrained_last_ckpt_dir
-    CLI_CFG["model"]["embedding_layer_config"]["vocab_size"] = len(vocab)
-    CLI_CFG["model"]["reset_weights"] = cli_args.reset_weights
-    CLI_CFG["model"]["enforce_monotonicity"] = enforce_monotonicity
-    CLI_CFG["model"]["task"] = "classification"
-    CLI_CFG["model"]["model_args"]["num_labels"] = len(label_keys)
-    CLI_CFG["model"]["model_args"]["problem_type"] = "multi_label_classification"
+    model_cfg = cfg["model"].copy()
+    model_cfg["pretrained_dir"] = pretrained_last_ckpt_dir
+    model_cfg["embedding_layer_config"]["vocab_size"] = len(vocab)
+    model_cfg["reset_weights"] = cli_args.reset_weights
+    model_cfg["enforce_monotonicity"] = enforce_monotonicity
+    model_cfg["task"] = "classification"
+    model_cfg["model_args"]["num_labels"] = len(label_keys)
+    model_cfg["model_args"]["problem_type"] = "multi_label_classification"
 
     # Initialize model
-    model = PatientEmbeddingModelFactory.from_pretrained(**CLI_CFG["model"])
+    model = PatientEmbeddingModelFactory.from_pretrained(**model_cfg)
     max_pos_embeddings = model.config.max_position_embeddings  
     
     # Inject LoRA, if required
-    if CLI_CFG.get("use_lora", False):
-        peft_conf = CLI_CFG.get("lora_config", {})
+    if cfg.get("use_lora", False):
+        peft_conf = cfg.get("lora_config", {})
         peft_config = LoraConfig(**peft_conf)
         model = get_peft_model(model, peft_config)
         print(">>> LoRA Enabled. Trainable parameters:")
         model.print_trainable_parameters()
 
     # Custom data collator dedicated to patient classification
-    CLI_CFG["data_collator"]["label_keys"] = label_keys
+    collator_cfg = cfg["data_collator"].copy()
+    collator_cfg["label_keys"] = label_keys
     ft_collator = PatientDataCollatorForClassification(
-        **CLI_CFG["data_collator"],
+        **collator_cfg,
         max_position_embeddings=max_pos_embeddings,
     )
 
     # Evaluation pipelines
-    patience = CLI_CFG["finetuner"].pop("early_stopping_patience", 20)
+    patience = cfg["finetuner"].pop("early_stopping_patience", 20)
     callbacks = [EarlyStoppingCallback(early_stopping_patience=patience)]
     evaluator = CustomEvaluator(
         do_clustering=False,
         label_names=label_keys,
         enforce_monotonicity=enforce_monotonicity,
-        early_stopping_metric=CLI_CFG["early_stopping_metric"],
+        early_stopping_metric=cfg["early_stopping_metric"],
     )
 
     # Setup loss function
-    ft_cfg = CLI_CFG["finetuner"].copy()
+    ft_cfg = cfg["finetuner"].copy()
     loss_name = ft_cfg.pop("loss_name", "poly1")
     loss_args = compute_loss_args(train_dataset, label_keys)
     loss_func = make_loss_func(loss_name, loss_args)  
@@ -202,15 +217,20 @@ def finetune_disciminative_model(
     task_subdir = f"hrz({hrz_str})_fut({fut_str})_fuv({fuv_str})"
     run_subdir = str(Path(task_key) / task_subdir)
     ft_cfg["output_dir"] = str(finetuning_dir / run_subdir)
-    if cli_args.silent: ft_cfg["report_to"] = "none"
+    if cli_args.silent:
+        ft_cfg["report_to"] = "none"
+    if not torch.cuda.is_available():
+        ft_cfg["bf16"] = False
+        ft_cfg["fp16"] = False
+        ft_cfg["use_cpu"] = True
     ft_args = TrainingArguments(**ft_cfg)
 
     # Re-initialize a wandb run within the same workspace
-    use_wandb = (not cli_args.silent) and (CLI_CFG.get("finetuner", {}).get("report_to") == "wandb")
+    use_wandb = (not cli_args.silent) and (cfg.get("finetuner", {}).get("report_to") == "wandb")
     if use_wandb:
         workspace = Path(__file__).stem
         run_name = f"{run_id}_{run_subdir}"
-        wandb.init(project=workspace, name=run_name, config=CLI_CFG)
+        wandb.init(project=workspace, name=run_name, config=cfg)
 
     # Trainer (standard HuggingFace)
     trainer = PrefixAwareTrainer(
@@ -238,10 +258,12 @@ def finetune_disciminative_model(
     )
 
     # Reset wandb and clean up CUDA memory for the next run
-    if use_wandb: wandb.finish()
+    if use_wandb:
+        wandb.finish()
     del dataset, model, trainer
     gc.collect()  
-    torch.cuda.empty_cache()  
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()  
 
 
 class PrefixAwareTrainer(Trainer):
@@ -306,7 +328,8 @@ def test_model(
                 all_predictions[f"{prefix}_{key}"] = array
                 
             trainer.compute_metrics.saved_labels_and_probs = None
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
         # Write outputs to disk
         np.savez_compressed(output_dir / config["npz_name"], **all_predictions)
@@ -323,7 +346,4 @@ def preprocess_logits_for_metrics(logits, labels):
 
 
 if __name__ == "__main__":
-    with open(cli_args.config, 'r') as f:
-        CLI_CFG = yaml.safe_load(f)
-    CLI_CFG = apply_config_overrides(CLI_CFG, cli_args.overrides)
-    main()
+    main()

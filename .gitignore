@@ -175,14 +175,7 @@ cython_debug/
 
 # Custom
 temp.py
-data/raw/*
-!data/raw/README.md
-data/hf_data
-data/hf_metadata
-data/processed/*
-!data/processed/.gitkeep
-data/preprocessed/*
-data/huggingface/*
+data/
 *.sif
 archives
 results*

@@ -1,11 +1,20 @@
+import sys
+import io
+import os
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+if hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+
 import argparse
 import hashlib
 import json
-import os
 import re
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import numpy as np
@@ -48,6 +57,12 @@ parser.add_argument(
     default=14,
     help="Number of threads used for bootstrap resampling (does not affect results).",
 )
+parser.add_argument(
+    "--data-dir", "--data_dir",
+    type=Path,
+    default=Path(os.environ.get("TEAV_DATA_DIR", "/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6/teav")),
+    help="Path to tEAV dataset directory.",
+)
 args = parser.parse_args()
 
 THRESHOLD_MODE = args.threshold_mode
@@ -66,9 +81,7 @@ USE_CALIBRATED_PROBS = {
 THRESHOLD_SUBFOLDER = f"rec-{TARGET_RECALL_INPUT}"
 CALIB_SUBFOLDER = f"calib-{int(USE_CALIBRATED_PROBS['Transformer'])}"
 
-BASE_DATA_PATH = Path(
-    "/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6_old/teav"
-)
+BASE_DATA_PATH = args.data_dir
 RESULTS_DIR = Path("results_final")
 ANALYSIS_DIR = RESULTS_DIR / "analysis" / "comparison" / "lt-1-3_vlt-3-10" / THRESHOLD_SUBFOLDER
 ANALYSIS_SUBDIR = ANALYSIS_DIR / THRESHOLD_MODE / CALIB_SUBFOLDER
@@ -315,7 +328,8 @@ def threshold(df, lo, hi, label):
     """Compute classification threshold based on target recall."""
     d = df[(df.time_step >= lo) & ((df.time_step + df.horizon) <= hi)]
     if d.empty or d.y_true.nunique() != 2:
-        raise RuntimeError(f"Threshold failure for {label}: no valid two-class validation data in {lo}-{hi} days")
+        print(f"Warning for {label}: no valid two-class validation data in {lo}-{hi} days. Using default threshold 0.5.")
+        return 0.5
 
     _, recall, thresholds = precision_recall_curve(d.y_true, d.y_prob)
     idx = np.where(recall[:-1] >= TARGET_RECALL)[0]

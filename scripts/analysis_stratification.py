@@ -1,3 +1,10 @@
+import sys
+import os
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import matplotlib
+matplotlib.use("Agg")
 import gc
 import yaml
 import torch
@@ -24,16 +31,25 @@ from src.data.patient_dataset import load_hf_data_and_metadata
 from scripts.analysis_interpretability import find_best_checkpoint, extract_horizons_from_path
 from scripts.script_utils import scan_all_fups, get_best_optuna_run, calibrate_array_pair
 
+import argparse
+import os
+
+parser = argparse.ArgumentParser(description="Run patient stratification and survival analysis.")
+parser.add_argument("--results-dir", type=Path, default=Path("results_final"), help="Base directory for results")
+parser.add_argument("--data-split-type", "--data_split_type", type=str, default="temporal_split", help="Data split strategy")
+parser.add_argument("--data-dir", "--data_dir", type=Path, default=Path(os.environ.get("TEAV_DATA_DIR", "/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6/teav")), help="Path to tEAV dataset directory")
+args, _ = parser.parse_known_args()
+
 # Model selection
-RESULTS_DIR = Path("results_final")
+RESULTS_DIR = args.results_dir
 TRANSFORMER_BASE_DIR = RESULTS_DIR / "transformer"
 OUTPUT_DIR = RESULTS_DIR / Path("analysis/stratification")
 CONFIG_PATH = Path("configs/discriminative_training.yaml") 
-DATA_DIR = Path("/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6_old/teav")
+DATA_DIR = args.data_dir
 
 # Configuration
 FROM_OPTUNA = "optuna" in TRANSFORMER_BASE_DIR.name
-DATA_SPLIT_TYPE = "temporal_split"
+DATA_SPLIT_TYPE = args.data_split_type
 TASKS = [
     "infection_bacteria",
     # "infection_virus",

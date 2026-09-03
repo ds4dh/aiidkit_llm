@@ -1,3 +1,7 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import argparse
 import yaml
 import json
@@ -34,6 +38,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train baseline ML models.")
     parser.add_argument("--config", "-c", type=str, default="configs/discriminative_classic_ml.yaml")
     parser.add_argument("--fixed_hp", "-f", action="store_true", help="Skip Optuna hyperparameter search.")
+    parser.add_argument("--overrides", "-o", action="append", default=[], help="Overrides config (JSON string or key=value).")
     return parser.parse_args()
 
 
@@ -64,6 +69,8 @@ def main():
     args = parse_args()
     with open(args.config, 'r') as f:
         cfg = yaml.safe_load(f)
+    from src.utils import apply_config_overrides
+    cfg = apply_config_overrides(cfg, args.overrides)
 
     # Run all models
     model_types = cfg['model_types']
@@ -382,8 +389,13 @@ class OptunaTrainer:
         self.pipeline.fit(X_train, y_train)
 
         # Save best params for reference
+        serializable_params = {}
+        for k, v in final_params.items():
+            if isinstance(v, (np.integer, int)): serializable_params[k] = int(v)
+            elif isinstance(v, (np.floating, float)): serializable_params[k] = float(v)
+            else: serializable_params[k] = v
         with open(self.output_dir / "best_params.json", "w") as f:
-            json.dump(final_params, f, indent=4)
+            json.dump(serializable_params, f, indent=4)
 
     def evaluate(self, X, y, evaluator, prefix="eval"):
         if self.pipeline is None: raise RuntimeError("Not trained")

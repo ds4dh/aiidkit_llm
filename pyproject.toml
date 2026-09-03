@@ -15,27 +15,26 @@ requires-python = ">=3.11,<3.13"
 
 dependencies = [
   # LLM stack
-  "trl[vllm]==0.25.1",
+  "trl",
   "peft",
   "sentence-transformers",
   "captum>=0.8,<1.0",
 
-  # Core science stack (aligned with cuML required constraints)
+  # Core science stack
   "numpy>=1.26,<2.0",
   "scipy>=1.11,<2.0",
-  "numba>=0.60.0,<0.62.0",
   "scikit-learn>=1.6,<1.8",
 
-  # RAPIDS GPU stack (CUDA 12)
-  "cupy-cuda12x>=13.6.0",
-  "treelite==4.4.1",
-  "cudf-cu12==25.10.*",
-  "cuml-cu12==25.10.*",
+  # RAPIDS GPU stack (CUDA 12 - Linux only)
+  "cupy-cuda12x>=13.6.0; sys_platform == 'linux'",
+  "treelite==4.4.1; sys_platform == 'linux'",
+  "cudf-cu12==25.10.*; sys_platform == 'linux'",
+  "cuml-cu12==25.10.*; sys_platform == 'linux'",
 
   # ML stack
   "xgboost>=2.1.0",
   "umap-learn==0.5.7",
-  "hdbscan>=0.8.39,<0.8.40",
+  "hdbscan>=0.8.38; sys_platform == 'linux'",
   "imblearn",
 
   # Experiment / data / visualization
@@ -49,6 +48,7 @@ dependencies = [
   "tabulate",
   "adjustText",
   "lifelines",
+  "statsmodels",
   "wandb",
   "tqdm",
 ]
@@ -59,3 +59,12 @@ dev = ["ipdb", "pytest", "pytest-mock"]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*"]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }

@@ -23,8 +23,16 @@ from scipy.special import expit, logit
 import optuna
 from optuna.samplers import TPESampler
 optuna.logging.set_verbosity(optuna.logging.WARNING)
-import umap
-import hdbscan
+try:
+    import umap
+except ImportError:
+    umap = None
+
+try:
+    import hdbscan
+except ImportError:
+    hdbscan = None
+
 import gc
 import io
 from tqdm import tqdm
@@ -48,6 +56,9 @@ def _get_gpu_backend():
     except Exception as e:
         return None, None, f"{type(e).__name__}: {e}"
 
+
+_GPU_WARNING_PRINTED = False
+_CPU_WARNING_PRINTED = False
 
 class UMAP_HDBSCAN_Clusterer:
     """ Class for clustering UMAP-reduced embeddings with HDBSCAN
@@ -110,64 +121,62 @@ class UMAP_HDBSCAN_Clusterer:
         best_params = {
             "n_components": 15,
             "min_cluster_size": max(2, int(num_samples / 10)),
-            "min_samples": max(2, int(num_samples / 20)),
+            "min_samples": max(1, int(num_samples / 20)),
+            "n_neighbors": 15,
+            "min_dist": 0.1,
         }
 
-        # Parameters identified using
-        if self.n_optuna_trials is not None and self.n_optuna_trials > 0:
-            study = optuna.create_study(direction="maximize", sampler=TPESampler())
-            objective_fn = lambda trial: self.cluster_objective(trial, pooled_embeddings)
-            study.optimize(
-                func=objective_fn,
-                n_trials=self.n_optuna_trials,
-                show_progress_bar=True,
-            )
-            best_params = study.best_params
+        # Run hyperparameter optimization if Optuna is available
+        def objective(trial):
+            n_components = trial.suggest_int("n_components", 2, 30)
+            min_cluster_size = trial.suggest_int("min_cluster_size", 2, max(3, int(num_samples / 5)))
+            min_samples = trial.suggest_int("min_samples", 1, max(2, int(num_samples / 10)))
+            n_neighbors = trial.suggest_int("n_neighbors", 5, max(6, int(num_samples / 2)))
+            min_dist = trial.suggest_float("min_dist", 0.0, 0.99)
+
+            umap_args = {
+                "n_components": n_components,
+                "n_neighbors": n_neighbors,
+                "min_dist": min_dist,
+            }
+            hdbscan_args = {
+                "min_cluster_size": min_cluster_size,
+                "min_samples": min_samples,
+            }
+
+            try:
+                reduced_data, labels = self.predict(
+                    pooled_embeddings,
+                    compute_clusters=True,
+                    **umap_args,
+                    **hdbscan_args,
+                )
+                unique_labels = np.unique(labels)
+                n_clusters = len(unique_labels) - (1 if -1 in unique_labels else 0)
+                if n_clusters > 1:
+                    score = silhouette_score(reduced_data, labels)
+                    return float(score)
+                return -1.0
+            except Exception:
+                return -1.0
+
+        study = optuna.create_study(direction="maximize", sampler=TPESampler(seed=42))
+        study.optimize(objective, n_trials=self.n_optuna_trials, show_progress_bar=True)
+
+        if study.best_trial and study.best_value > -1.0:
+            best_params.update(study.best_params)
 
         return best_params
 
-    def cluster_objective(
+    def fit_predict(
         self,
-        trial: optuna.Trial,
         embeddings: np.ndarray,
-    ) -> float:
+    ) -> tuple[np.ndarray, np.ndarray]:
         """
-        Objective function for clustering UMAP-reduced embeddings with HDBSCAN
+        Fit UMAP and HDBSCAN and return 2D embeddings and cluster labels
         """
-        params = {
-
-            # General parameters
-            "compute_clusters": True,
-            "use_cuml": True,
-
-            # UMAP parameters
-            "n_components": trial.suggest_int("n_components", 2, 20),
-            "n_neighbors": trial.suggest_int("n_neighbors", 5, 50),
-            "min_dist": trial.suggest_float("min_dist", 0.0, 0.5),
-
-            # HDBSCAN parameters
-            "min_cluster_size": trial.suggest_int("min_cluster_size", 5, 60),
-            "min_samples": trial.suggest_int("min_samples", 2, 25),
-
-        }
-
-        # Pass all params; the next function will sort them out
-        try:
-            reduced_embeddings, cluster_labels = self.predict(embeddings, **params)
-        
-        except Exception:
-            print(f"Out of memory with these parameters: {params}. Skipping trial")
-            return -1.0
-
-        # Compute silhouette score
-        no_cluster_correction = (1 if -1 in np.unique(cluster_labels) else 0)
-        num_clusters = len(np.unique(cluster_labels)) - no_cluster_correction
-        if num_clusters > 1:
-            silhouette_score_ = silhouette_score(reduced_embeddings, cluster_labels)
-        else:
-            silhouette_score_ = -1.0
-
-        return silhouette_score_
+        best_params = self.fit(embeddings)
+        return self.predict(embeddings, compute_clusters=True, **best_params)
 
     def predict(
         self,
@@ -179,6 +188,7 @@ class UMAP_HDBSCAN_Clusterer:
         """
         Reduce a set of embeddings with UMAP and cluster them with HDBSCAN
         """
+        global _GPU_WARNING_PRINTED
         UMAP_KEYS = {"n_components", "n_neighbors", "min_dist"}
         HDBSCAN_KEYS = {"min_cluster_size", "min_samples"}
         umap_args = {k: v for k, v in kwargs.items() if k in UMAP_KEYS}
@@ -187,8 +197,9 @@ class UMAP_HDBSCAN_Clusterer:
         if use_cuml:
             cp, cuml, err = _get_gpu_backend()
             if cp is None:
-                # Optional: only print once, because _get_gpu_backend is cached.
-                print(f"GPU mode disabled (cuml/cupy unavailable): {err}")
+                if not _GPU_WARNING_PRINTED:
+                    print(f"[INFO] RAPIDS GPU acceleration unavailable ({err}). Using CPU backend for UMAP/HDBSCAN.")
+                    _GPU_WARNING_PRINTED = True
             else:
                 try:
                     return self.reduce_and_cluster_gpu(
@@ -253,6 +264,18 @@ class UMAP_HDBSCAN_Clusterer:
         """
         Reduce embeddings with UMAP and cluster them with HDBSCAN on CPU
         """
+        global _CPU_WARNING_PRINTED
+        if umap is None or hdbscan is None:
+            if not _CPU_WARNING_PRINTED:
+                missing = []
+                if umap is None:
+                    missing.append("umap-learn")
+                if hdbscan is None:
+                    missing.append("hdbscan")
+                print(f"[WARNING] Clustering skipped: {', '.join(missing)} is missing. Install with: uv pip install {' '.join(missing)}")
+                _CPU_WARNING_PRINTED = True
+            return np.zeros((len(embeddings), 2)), np.full(len(embeddings), -1)
+
         # Compute dimensionality-reduced embeddings on CPU
         reducer = umap.UMAP(**umap_args)
         reduced_embeddings = reducer.fit_transform(embeddings)
@@ -845,7 +868,9 @@ class GenerativeEmbeddingEvaluatorForClassification(BaseEmbeddingEvaluatorForCla
 
 class ModelInterpreter:
     """Extracts embeddings and logits from the model for a given dataloader."""
-    def __init__(self, model, device="cuda"):
+    def __init__(self, model, device=None):
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = model
         self.model.eval()
         self.model.to(device)
@@ -857,11 +882,13 @@ class ModelInterpreter:
                         vary by batch, causing np.vstack to crash.
         """
         embeddings_list, logits_list, labels_list = [], [], []
+        device_type = "cuda" if ("cuda" in str(self.device) and torch.cuda.is_available()) else "cpu"
+        target_dtype = torch.bfloat16 if device_type == "cuda" else torch.float32
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="Extracting embeddings"):
                 input_dict = {k: v.to(self.device) for k, v in batch["input_dict"].items()}
     
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                with torch.autocast(device_type=device_type, dtype=target_dtype):
                     outputs = self.model(input_dict=input_dict, output_hidden_states=True) 
                 
                 last_hidden = outputs.hidden_states[-1]

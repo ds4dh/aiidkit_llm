@@ -318,8 +318,8 @@ class PatientEmbeddingLayer(nn.Module):
         delta_times = times.clone()
         delta_times[:, 1:] = times[:, 1:] - times[:, :-1]
         delta_times[:, 0] = 0  # default delta for the very first event
-        t_abs = self.time_embedding(times)
-        t_delta = self.delta_time_embedding(delta_times)
+        t_abs = self.time_embedding(times).to(dtype=x.dtype)
+        t_delta = self.delta_time_embedding(delta_times).to(dtype=x.dtype)
         
         return self.time_projector(torch.cat([x, t_abs, t_delta], dim=-1))
 

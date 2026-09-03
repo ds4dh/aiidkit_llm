@@ -1,3 +1,10 @@
+import sys
+import os
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import matplotlib
+matplotlib.use("Agg")
 import gc
 import re
 import yaml
@@ -46,6 +53,7 @@ parser.add_argument("--max-delta", type=float, default=0.10, help="Maximum allow
 parser.add_argument("--agg-method", type=str, default="mean", choices=["mean", "sum"], help="Aggregation method")
 parser.add_argument("--num-samples", type=int, default=1000, help="Number of samples to analyze")
 parser.add_argument("--num-steps", type=int, default=200, help="Number of Integrated Gradients steps")
+parser.add_argument("--data-dir", "--data_dir", type=Path, default=Path(os.environ.get("TEAV_DATA_DIR", "/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6/teav")), help="Path to tEAV dataset directory")
 args, _ = parser.parse_known_args()
 
 # Run configuration
@@ -53,13 +61,14 @@ RESULTS_DIR = args.results_dir
 DATA_SPLIT_TYPE = args.data_split_type
 TRANSFORMER_BASE_DIR = RESULTS_DIR / "transformer"
 OUTPUT_DIR_BASE_NAME = RESULTS_DIR / "analysis" / "interpretability"
-DATA_DIR = Path("/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6_old/teav")
+DATA_DIR = args.data_dir
 CONFIG_PATH = Path("configs/discriminative_training.yaml")
 FROM_OPTUNA = "optuna" in TRANSFORMER_BASE_DIR.name
 PLOT_ONLY = False  # run downstream plots directly from cache
 MAX_LEGEND_VALUES_TO_SHOW = 5  # threshold capping distinct legend item limits
 
 # Captum configuration
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 TOP_K = args.top_k
 MIN_FREQ = args.min_freq
 MAX_DELTA = args.max_delta
@@ -320,7 +329,7 @@ def main():
             embedding_layer_config=emb_cfg,
             model_args=model_cfg_base["model_args"]
         )
-        model = model.to(device="cuda", dtype=target_dtype)
+        model = model.to(device=DEVICE, dtype=target_dtype)
         
         collator = PatientDataCollatorForClassification(
             **config["data_collator"], 
@@ -346,13 +355,14 @@ def main():
         run_captum_analysis(
             model=model, dataset=test_ds, collator=collator, OUTPUT_DIR=OUTPUT_DIR,
             label_name=label_name, fup_max=fup_max, indices=selected_idx, vocab=vocab,
-            device="cuda", target_idx=target_idx, max_delta=MAX_DELTA, top_k=TOP_K,
+            device=DEVICE, target_idx=target_idx, max_delta=MAX_DELTA, top_k=TOP_K,
             plot_only=PLOT_ONLY, agg_method=AGG_METHOD, min_freq=MIN_FREQ,
         )
 
         del model, interpreter, loader, res, dataset, test_ds
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     print(f"\nSuccess! All results can be found in {OUTPUT_DIR}")
 
