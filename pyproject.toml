@@ -9,37 +9,33 @@ description = "A project to train discriminative and generative LLMs to predict 
 readme = "README.md"
 authors = [{ name = "Alban Bornet", email = "alban.bornet@unige.ch" }]
 license = { text = "MIT" }
-
-# Keep Python bounded to avoid “works on 3.11, breaks on 3.12” wheel drift.
-requires-python = ">=3.11,<3.13"
-
 dependencies = [
   # LLM stack
   "trl",
   "peft",
   "sentence-transformers",
-  "captum>=0.8,<1.0",
+  "captum",
 
   # Core science stack
-  "numpy>=1.26,<2.0",
-  "scipy>=1.11,<2.0",
-  "scikit-learn>=1.6,<1.8",
+  "numpy",
+  "scipy",
+  "scikit-learn",
 
   # RAPIDS GPU stack (CUDA 12 - Linux only)
   "cupy-cuda12x>=13.6.0; sys_platform == 'linux'",
-  "treelite==4.4.1; sys_platform == 'linux'",
+  "treelite; sys_platform == 'linux'",
   "cudf-cu12==25.10.*; sys_platform == 'linux'",
   "cuml-cu12==25.10.*; sys_platform == 'linux'",
 
   # ML stack
-  "xgboost>=2.1.0",
-  "umap-learn==0.5.7",
-  "hdbscan>=0.8.38; sys_platform == 'linux'",
+  "xgboost",
+  "umap-learn",
+  "hdbscan; sys_platform == 'linux'",
   "imblearn",
 
   # Experiment / data / visualization
   "optuna",
-  "pandas>=2.2,<3",
+  "pandas",
   "matplotlib",
   "plotly",
   "seaborn",

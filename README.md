@@ -13,15 +13,14 @@ First, install the `uv` tool and set up the virtual environment with all require
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Create and activate the virtual environment
-uv venv --python 3.11
+uv venv --python 3.14
 source .venv/bin/activate
 
-# Install PyTorch with CUDA 12.4 support (for GPU systems)
-uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# Install PyTorch with CUDA 13.2 support (for GPU systems)
+uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu132
 
 # Install the project and dependencies
 uv pip install -e ".[dev]"
-uv pip install flash-attn --no-build-isolation
 ```
 
 ## Usage and paper replication

@@ -182,6 +182,7 @@ results*
 backups*
 wandb
 digest.txt
+scratch/metadata_exports
 configs/run_configs
 scoping_review/data
 scoping_review/results
