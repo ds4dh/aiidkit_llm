@@ -3,6 +3,7 @@ From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
 
 %files
     pyproject.toml /opt/pyproject.toml
+    web_tool/requirements.txt /opt/web_tool_requirements.txt
 
 %environment
     export LC_ALL=C
@@ -11,15 +12,20 @@ From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
     export PATH="/opt/venv/bin:$PATH"
     export PYTHONPATH="${PWD}:${PYTHONPATH}"
 
-    # Avoid writes to /root or a read-only $HOME inside SIF
     export MPLCONFIGDIR=/tmp/matplotlib
     export XDG_CACHE_HOME=/tmp/.cache
     export XDG_CONFIG_HOME=/tmp/.config
 
 %post
     chmod 1777 /tmp
-    mkdir -p /tmp/matplotlib /tmp/.cache /tmp/.config
+    mkdir -p /tmp/matplotlib /tmp/.cache /tmp/.config /tmp/uv-cache
     export DEBIAN_FRONTEND=noninteractive
+
+    export UV_CACHE_DIR="/tmp/uv-cache"
+    export TMPDIR="/tmp"
+    
+    # Disable rapid TTY/progress-bar redraws over network stderr
+    export UV_NO_PROGRESS=1
 
     apt-get update && apt-get install -y \
       python3-pip python3-venv git curl build-essential ninja-build nvtop screen
@@ -30,8 +36,11 @@ From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
     . /opt/venv/bin/activate
 
     cd /opt
-    uv pip install -e ".[dev]"
-    uv pip install flash-attn --no-build-isolation
+    uv pip install --no-cache --no-progress -e ".[dev]"
+    uv pip install --no-cache --no-progress -r /opt/web_tool_requirements.txt
+    uv pip install flash-attn --no-build-isolation --no-progress
+
+    rm -rf /tmp/uv-cache
 
 %test
     . /opt/venv/bin/activate
@@ -41,6 +50,10 @@ From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
     python3 -c "import cupy; print(f'CuPy: {cupy.__version__}')"
     python3 -c "import captum; print(f'Captum: {captum.__version__}')"
     python3 -c "import flash_attn; print(f'Flash Attn: {flash_attn.__version__}')"
+    python3 -c "import flask; print(f'Flask: {flask.__version__}')"
+    python3 -c "import umap; print(f'UMAP: {umap.__version__}')"
+    python3 -c "import hdbscan; print(f'HDBSCAN: {hdbscan.__version__}')"
+    python3 -c "import lifelines; print(f'Lifelines: {lifelines.__version__}')"
 
 %runscript
     exec /bin/bash "$@"

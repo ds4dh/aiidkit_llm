@@ -772,12 +772,12 @@ def render_bars(task, horizon, outdir, hs, csv_summaries_in_memory=None):
     metrics_to_plot = [("ROC-AUC", "↑"), ("PR-AUC", "↑"), ("Sensitivity", "↑"), ("Specificity", "↑")]
     
     metric_yticks_map = {
-        "ROC-AUC": np.arange(0.5, 0.95, 0.1),
+        "ROC-AUC": np.arange(0.4, 0.95, 0.1),
         "PR-AUC": np.arange(0.0, 0.45, 0.1),
         "Sensitivity": np.arange(0.0, 1.1, 0.2),
         "Specificity": np.arange(0.0, 1.1, 0.2),
     }
-    metric_ylim_map = {"ROC-AUC": (0.5, 0.9), "PR-AUC": (0.0, 0.4), "Sensitivity": (0.0, 1.0), "Specificity": (0.0, 1.0)}
+    metric_ylim_map = {"ROC-AUC": (0.4, 0.9), "PR-AUC": (0.0, 0.35), "Sensitivity": (0.0, 1.0), "Specificity": (0.0, 1.0)}
 
     n_windows = len(CLINICAL_WINDOWS)
     n_splits = len(SPLIT_TYPES)
@@ -820,11 +820,35 @@ def render_bars(task, horizon, outdir, hs, csv_summaries_in_memory=None):
             n_models = len(MODEL_PLOT_ORDER)
             bar_width = 0.20
             offsets = (np.arange(n_models) - (n_models - 1) / 2.0) * bar_width
+            
+            cache_dict = npz_data_by_split.get(split, {})
+
+            # --- Random baseline level for metrics ---
+            # ROC-AUC, Sensitivity, and Specificity default to 0.50 (random guessing)
+            if metric_prefix in {"ROC-AUC"}:
+                for w_i, _ in enumerate(window_keys):
+                    # Attach label only to the very first line of the top-left subplot so it shows once in the legend
+                    lbl = "Random level" if (m_idx == 0 and s_idx == 0 and w_i == 0) else ""
+                    ax.hlines(
+                        y=0.50, xmin=w_i - 0.42, xmax=w_i + 0.42,
+                        colors="black", linestyles="--", linewidth=1.8, zorder=3,
+                        label=lbl,
+                    )
+            elif metric_prefix == "PR-AUC":
+                for w_i, window_name in enumerate(window_keys):
+                    y_key = f"{window_name}_y_true"
+                    if y_key in cache_dict:
+                        y_arr = cache_dict[y_key]
+                        if len(y_arr) > 0:
+                            prev = np.sum(y_arr == 1) / len(y_arr)
+                            ax.hlines(
+                                y=prev, xmin=w_i - 0.42, xmax=w_i + 0.42,
+                                colors="black", linestyles="--", linewidth=1.8, zorder=3,
+                            )
 
             for m_model_idx, m in enumerate(MODEL_PLOT_ORDER):
                 c_hex = COLORS[m]
                 pes, yerr_low, yerr_high = [], [], []
-                cache_dict = npz_data_by_split.get(split, {})
 
                 for window_name in window_keys:
                     pe_key = f"{window_name}_{m}_{metric_prefix}_pe"
@@ -953,7 +977,7 @@ def render_bars(task, horizon, outdir, hs, csv_summaries_in_memory=None):
     if handles:
         fig.legend(
             handles, labels, loc="upper center", bbox_to_anchor=(0.5, 1.014),
-            ncol=len(MODEL_PLOT_ORDER), fontsize=22, frameon=True, framealpha=0.9, borderpad=0.25,
+            ncol=len(handles), fontsize=22, frameon=True, framealpha=0.9, borderpad=0.25,
         )
 
     acronym_explanation = "Clinical phases:  POP = Perioperative  |  OPT = Opportunistic  |  MTN = Maintenance  |  LT = Long-term  |  VLT = Very long-term"
@@ -965,8 +989,8 @@ def render_bars(task, horizon, outdir, hs, csv_summaries_in_memory=None):
     plt.subplots_adjust(top=0.935, hspace=0.25, wspace=0.06)
     fig.savefig(outdir / f"matrix_bar_performance_comparison_{hs}.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
-
-
+    
+    
 def render_curves(cache, outdir, hs):
     """Render ROC, PR, and Decision Curve Analysis (DCA) grids with synchronized y-ticks across all columns."""
     n_windows = len(CLINICAL_WINDOWS)
@@ -977,14 +1001,52 @@ def render_curves(cache, outdir, hs):
     fig_dca, axes_dca = plt.subplots(n_windows, n_splits, figsize=(7.5 * n_splits, 4.5 * n_windows), squeeze=False)
 
     for w_idx, window_name in enumerate(CLINICAL_WINDOWS):
-        max_dca_y_limit = 0.02
+        # 1. Determine the exact maximum prevalence across splits (no arbitrary minimum floor)
+        prevalences = []
         for split in SPLIT_TYPES:
             if split in cache and window_name in cache[split]:
                 sub_df, _ = cache[split][window_name]
-                prevalence = np.sum(sub_df.y_true.values == 1) / len(sub_df)
-                max_dca_y_limit = max(max_dca_y_limit, prevalence * 1.05)
+                if len(sub_df) > 0:
+                    prevalences.append(np.sum(sub_df.y_true.values == 1) / len(sub_df))
 
-        dca_yticks = np.linspace(0.0, max_dca_y_limit, 5)
+        max_prev = max(prevalences) if prevalences else 0.01
+
+        # 2. Tight bounds mapping: allows slight undershoot or tight fit rather than overshooting
+        # Target:
+        # peak ~0.015 -> max 0.02 (step 0.01)
+        # peak ~0.025 -> max 0.03 (step 0.01)
+        # peak ~0.042 -> max 0.04 or 0.05 (step 0.01)
+        # peak ~0.080 -> max 0.08 or 0.09 (step 0.02)
+        # peak ~0.135 -> max 0.14 or 0.15 (step 0.03)
+        if max_prev <= 0.018:
+            step = 0.01
+            upper_ylim = 0.02
+        elif max_prev <= 0.028:
+            step = 0.01
+            upper_ylim = 0.025 if max_prev <= 0.024 else 0.03
+        elif max_prev <= 0.045:
+            step = 0.01
+            upper_ylim = 0.04
+        elif max_prev <= 0.065:
+            step = 0.01
+            upper_ylim = 0.05
+        elif max_prev <= 0.095:
+            step = 0.02
+            upper_ylim = 0.08
+        elif max_prev <= 0.125:
+            step = 0.02
+            upper_ylim = 0.10
+        else:
+            step = 0.03
+            upper_ylim = float(np.round(max_prev / step) * step)
+
+        # Generate clean ticks matching the exact step size
+        dca_yticks = np.arange(0.0, upper_ylim + (step * 0.1), step)
+        if dca_yticks[-1] < upper_ylim:
+            dca_yticks = np.append(dca_yticks, upper_ylim)
+
+        # Proportional bottom buffer to accommodate dips below 0
+        lower_ylim = -0.15 * upper_ylim
 
         for s_idx, split in enumerate(SPLIT_TYPES):
             ax_roc, ax_pr, ax_dca = axes_roc[w_idx, s_idx], axes_pr[w_idx, s_idx], axes_dca[w_idx, s_idx]
@@ -1008,6 +1070,7 @@ def render_curves(cache, outdir, hs):
 
             sub_df, _ = cache[split][window_name]
             y_true = sub_df.y_true.values
+            prevalence = np.sum(y_true == 1) / len(y_true)
 
             # --- ROC Curves ---
             for m in MODEL_PLOT_ORDER:
@@ -1016,7 +1079,10 @@ def render_curves(cache, outdir, hs):
                 label = MODEL_FULLNAME_MAP[m] if (w_idx == 0 and s_idx == 0) else ""
                 fpr, tpr, _ = roc_curve(y_true, p_arr)
                 ax_roc.plot(fpr, tpr, label=label, color=c_hex, lw=3.5, zorder=2)
-            ax_roc.plot([0, 1], [0, 1], linestyle="--", color="gray", alpha=0.5, zorder=1)
+            ax_roc.plot(
+                [0, 1], [0, 1], linestyle="--", color="gray", alpha=0.5, lw=2.0,
+                label="Random" if (w_idx == 0 and s_idx == 0) else "", zorder=1
+            )
             ax_roc.set_xlim([0.0, 1.0])
             ax_roc.set_ylim([0.0, 1.05])
             
@@ -1043,6 +1109,10 @@ def render_curves(cache, outdir, hs):
                 label = MODEL_FULLNAME_MAP[m] if (w_idx == 0 and s_idx == 0) else ""
                 prec_arr, rec_arr, _ = precision_recall_curve(y_true, p_arr)
                 ax_pr.plot(rec_arr, prec_arr, label=label, color=c_hex, lw=3.5, zorder=2)
+            ax_pr.axhline(
+                prevalence, linestyle="--", color="gray", alpha=0.6, lw=2.0,
+                label="Random" if (w_idx == 0 and s_idx == 0) else "", zorder=1
+            )
             ax_pr.set_xlim([0.0, 1.0])
             ax_pr.set_ylim([0.0, 1.05])
             
@@ -1064,11 +1134,11 @@ def render_curves(cache, outdir, hs):
 
             # --- DCA Curves ---
             dca_thresh = np.linspace(0.01, 0.50, 50)
-            prevalence = np.sum(y_true == 1) / len(y_true)
             ax_dca.plot(dca_thresh, np.zeros_like(dca_thresh), color="#1a1a1a", linestyle="--", lw=3.5,
                         label="Treat none" if (w_idx == 0 and s_idx == 0) else "", zorder=1)
             ax_dca.plot(dca_thresh, prevalence - (1.0 - prevalence) * (dca_thresh / (1.0 - dca_thresh)),
                         color="#a0a0a0", linestyle="--", lw=3.5, label="Treat all" if (w_idx == 0 and s_idx == 0) else "", zorder=1)
+            
             for m in MODEL_PLOT_ORDER:
                 p_arr = sub_df[f"y_prob_{m}"].values
                 c_hex = COLORS[m]
@@ -1081,8 +1151,9 @@ def render_curves(cache, outdir, hs):
                 ax_dca.plot(dca_thresh, net_benefit, label=label, color=c_hex, lw=3.5, zorder=2)
 
             ax_dca.set_xlim([0.0, 0.5])
-            ax_dca.set_ylim([-0.005 if max_dca_y_limit < 0.1 else -0.03, max_dca_y_limit])
+            ax_dca.set_ylim([lower_ylim, upper_ylim])
             
+            # Formatted to strict 2 decimal places
             ax_dca.set_yticks(dca_yticks)
             ax_dca.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.2f"))
             ax_dca.grid(True, which="major", linestyle=":", color="#eeeeee", linewidth=1.0, alpha=0.9, axis="y", zorder=0)
@@ -1124,8 +1195,8 @@ def render_curves(cache, outdir, hs):
     fig_dca.tight_layout()
     fig_dca.savefig(outdir / f"matrix_dca_comparison_curves_{hs}.png", dpi=200, bbox_inches="tight")
     plt.close(fig_dca)
-
-
+    
+    
 # ==========================================
 # Pipeline Orchestration
 # ==========================================
@@ -1137,6 +1208,7 @@ def pipeline(task, horizon):
     outdir.mkdir(parents=True, exist_ok=True)
     cache = {}
     csv_summaries = {}
+    prevalence_records = []
 
     for split in SPLIT_TYPES:
         wc, df_main = process(task, split, horizon, outdir)
@@ -1144,12 +1216,49 @@ def pipeline(task, horizon):
             cache[split] = wc
             csv_summaries[split] = df_main
 
+            # Extract test set prevalence for each clinical window (period)
+            for window_name, (sub_df, _) in wc.items():
+                y_true = sub_df["y_true"].to_numpy()
+                n_total = len(y_true)
+                n_pos = int(np.sum(y_true == 1))
+                prev = float(n_pos / n_total) if n_total > 0 else np.nan
+
+                # Format period to single line for cleaner display
+                clean_period = window_name.replace("\n", " ")
+
+                prevalence_records.append({
+                    "Task": task,
+                    "Horizon": hs,
+                    "Split": split,
+                    "Period": clean_period,
+                    "N_Pos": n_pos,
+                    "N_Total": n_total,
+                    "Prevalence": prev,
+                    "Prevalence (%)": f"{prev * 100:.2f}%" if not np.isnan(prev) else "NaN",
+                })
+
     if cache:
         render_curves(cache, outdir, hs)
         render_bars(task, horizon, outdir, hs, csv_summaries)
 
+    return prevalence_records
+
 
 if __name__ == "__main__":
+    all_prevalences = []
+
     for task in TASKS:
         for horizon in ["combined", *TARGET_HORIZONS]:
-            pipeline(task, horizon)
+            records = pipeline(task, horizon)
+            if records:
+                all_prevalences.extend(records)
+
+    # Print summary at the very end
+    if all_prevalences:
+        prev_df = pd.DataFrame(all_prevalences)
+        print("\n" + "=" * 80)
+        print(">>> TEST SET PREVALENCES (DASHED BASELINE IN PR-AUC PLOTS) <<<")
+        print("=" * 80)
+        with pd.option_context("display.max_rows", None, "display.max_columns", None, "display.width", 1000):
+            print(prev_df.to_string(index=False))
+        print("=" * 80 + "\n")
