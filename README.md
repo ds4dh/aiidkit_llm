@@ -50,10 +50,10 @@ Pre-train the backbone model using self-supervised Masked Language Modeling (MLM
 OVERRIDES='{"data_dir": "data/synthetic/teav", "pretrainer": {"max_steps": 5, "eval_steps": 5, "save_steps": 5}}'  # Synthetic local test (default)
 # OVERRIDES='{"data_dir": "path/to/stcs/teav"}'  # Real STCS dataset
 
-# Temporal split (earliest 85% train/val, prospective 15% test)
+# Random split (earliest 85% train/val, prospective 15% test)
 python scripts/train_mlm.py -c configs/discriminative_training.yaml --overrides "$OVERRIDES" --overrides '{"data_split_type": "random_split"}'
 
-# Random split (70% train / 15% val / 15% test)
+# Temporal split (70% train / 15% val / 15% test)
 python scripts/train_mlm.py -c configs/discriminative_training.yaml --overrides "$OVERRIDES" --overrides '{"data_split_type": "temporal_split"}'
 
 # Center split (CHUV center held out as test set)
