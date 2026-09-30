@@ -175,6 +175,7 @@ cython_debug/
 
 # Custom
 temp.py
+tmp/
 data/
 *.sif
 archives
