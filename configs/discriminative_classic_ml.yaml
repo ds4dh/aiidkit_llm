@@ -1,5 +1,5 @@
 # Run parameters
-data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v3.8/classic_ml
+data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v3.9/classic_ml
 data_split_type: temporal_split  # random_split, center_split, temporal_split
 result_dir: results_final/classic_ml
 model_types: [logistic_regression, random_forest, xgboost]

@@ -60,7 +60,7 @@ parser.add_argument(
 parser.add_argument(
     "--data-dir", "--data_dir",
     type=Path,
-    default=Path(os.environ.get("DATA_DIR", "/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6/teav")),
+    default=Path(os.environ.get("TEAV_DATA_DIR", "/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6/teav")),
     help="Path to tEAV dataset directory.",
 )
 args = parser.parse_args()
