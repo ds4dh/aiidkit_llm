@@ -8,18 +8,18 @@ set -euo pipefail
 USE_SYNTHETIC=false
 
 # Root base directories (subfolders are 'teav' and 'classic_ml')
-REAL_DATA_ROOT="/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.8"
+REAL_DATA_ROOT="/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.9"
 SYNTHETIC_DATA_ROOT="$(pwd)/data/synthetic"
 
 # ==============================================================================
 # STEP EXECUTION TOGGLES
 # ==============================================================================
-RUN_STEP_1_MLM=true          # Step 1: Pre-train t-EAV Transformer
-RUN_STEP_2_FINETUNING=true   # Step 2: Fine-tune for Infection Prediction Tasks
-RUN_STEP_3_CLASSIC_ML=true   # Step 3: Classic ML Baselines (LR, RF, XGBoost)
+RUN_STEP_1_MLM=true          # Step 1: Pre-train t-EAV-Transformer
+RUN_STEP_2_FINETUNING=true   # Step 2: Fine-tune for infection prediction tasks
+RUN_STEP_3_CLASSIC_ML=true   # Step 3: Classic ML baselines (LR, RF, XGBoost)
 RUN_STEP_4_COMPARISON=true   # Step 4: DCA, McNemar, PR-AUC
-RUN_STEP_5_INTERPRET=true    # Step 5: Captum Feature Attribution
-RUN_STEP_6_SURVIVAL=true     # Step 6: Patient Stratification & Survival
+RUN_STEP_5_INTERPRET=true    # Step 5: Captum feature attribution
+RUN_STEP_6_SURVIVAL=true     # Step 6: Patient stratification and survival
 
 # ==============================================================================
 # ACTIVE PATH SELECTION AND DIRECTORY VERIFICATION
