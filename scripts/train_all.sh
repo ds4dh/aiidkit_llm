@@ -8,7 +8,7 @@ set -euo pipefail
 USE_SYNTHETIC=false
 
 # Root base directories (subfolders are 'teav' and 'classic_ml')
-REAL_DATA_ROOT="/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.9"
+STCS_DATA_ROOT="/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.9"
 SYNTHETIC_DATA_ROOT="$(pwd)/data/synthetic"
 
 # ==============================================================================
@@ -36,7 +36,7 @@ if [ "$USE_SYNTHETIC" = true ]; then
     ML_OVERRIDES='{"data_dir": "'"$CLASSIC_DATA_DIR"'", "models": {"logistic_regression": {"n_optuna_trials": 2}, "random_forest": {"n_optuna_trials": 2}, "xgboost": {"n_optuna_trials": 2}}}'
 else
     echo "=== Running pipeline in REAL dataset mode ==="
-    DATA_ROOT="$REAL_DATA_ROOT"
+    DATA_ROOT="$STCS_DATA_ROOT"
     
     TEAV_DATA_DIR="${DATA_ROOT}/teav"
     CLASSIC_DATA_DIR="${DATA_ROOT}/classic_ml"

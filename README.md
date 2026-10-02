@@ -27,9 +27,9 @@ uv pip install -e ".[dev]"
 
 ## Data preparation
 
-### Option A: Preprocessing the real STCS dataset
+### Option A: Preprocessing the STCS dataset
 
-Access to the real Swiss Transplant Cohort Study (STCS) dataset is necessary to reproduce the reported clinical findings.
+Access to the [Swiss Transplant Cohort Study (STCS)](https://www.stcs.ch) dataset is necessary to reproduce the reported clinical findings.
 
 Upon receiving data access approval from the STCS, process the raw cohort tables into timed EAV sequences and classic ML tabular matrices using the preprocessing pipeline in [`aiidkit`](https://github.com/mhmmdrz92/aiidkit):
 
@@ -37,6 +37,9 @@ Upon receiving data access approval from the STCS, process the raw cohort tables
 # Clone the preprocessing repository
 git clone [https://github.com/mhmmdrz92/aiidkit.git](https://github.com/mhmmdrz92/aiidkit.git) aiidkit_data_preprocessing
 cd aiidkit_data_preprocessing
+
+# Note: you can set BASE_DATA_DIR in src/constants.py
+# Current: BASE_DATA_DIR = Path("/home/shares/ds4dh/aiidkit_project/data_new/")
 
 # Build timed EAV sequence datasets (for MLM and Transformer fine-tuning)
 python scripts/build_teav_datasets.py
@@ -66,7 +69,7 @@ The entire workflow (pre-training, fine-tuning, classic ML baselines, and downst
 Before running the orchestrator, open `scripts/train_all.sh` and set the configuration flags at the top of the file to match your setup:
 
 * **Data source (`USE_SYNTHETIC`):** Set to `false` for the real STCS dataset, or `true` if using the synthetic verification dataset.
-* **Data paths:** If using real data, ensure `TEAV_DATA_DIR` and `CLASSIC_DATA_DIR` point to the directories generated during preprocessing.
+* **Data paths:** If using real data, ensure `STCS_DATA_ROOT`points to the directory generated during preprocessing. If using synthetic data, ensure `SYNTHETIC_DATA_ROOT` is set to the correct location.
 
 * **Stage toggles:** Enable or disable individual stages as needed:
   * `RUN_STEP_1_MLM`: Transformer MLM pre-training
