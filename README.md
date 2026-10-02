@@ -29,7 +29,7 @@ uv pip install -e ".[dev]"
 
 ### Option A: Preprocessing the STCS dataset
 
-Access to the <a href="https://www.stcs.ch/for-investigators/#general_rules" target="_blank" rel="noopener noreferrer">Swiss Transplant Cohort Study (STCS)</a> dataset is necessary to reproduce the reported clinical findings.
+Access to the [Swiss Transplant Cohort Study (STCS)](https://www.stcs.ch/for-investigators/#general_rules) dataset is necessary to reproduce the reported clinical findings.
 
 Upon receiving data access approval from the STCS, process the raw cohort tables into timed EAV sequences and classic ML tabular matrices using the preprocessing pipeline in [`aiidkit`](https://github.com/mhmmdrz92/aiidkit).
 
