@@ -27,7 +27,13 @@ from src.evaluation.plot_results import plot_task_results
 from src.evaluation.evaluate_models import (
     DiscriminativeEmbeddingEvaluatorForClassification as CustomEvaluator
 )
+from scripts.script_utils import save_predictions_table, extract_horizons_from_path
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+# Minimum training positives required to attempt a classic-ML run for a given
+# (task, horizon); below this the fitted model would be degenerate (see
+# train_model_run) and rare groups are skipped with a warning instead.
+MIN_TRAIN_POSITIVES = 5
 
 
 # =================
@@ -86,7 +92,7 @@ def main():
         print(f"Data root for split '{cfg['data_split_type']}': {data_root}")
 
         # Iterate over tasks
-        train_data_augment = cfg.get("train_data_augment", "none")
+        train_data_augment = cfg.get("train_data_augment", "all")
         for task_key, task_specs in cfg["prediction_tasks"].items():
             
             valid_fups = task_specs["fups"]
@@ -177,8 +183,11 @@ def load_combined_data(
 
     X = X_df.values
     y = full_df[label_key].values if label_key in full_df.columns else None
+    patient_ids = (
+        full_df["patientid"].values if "patientid" in full_df.columns else None
+    )
     
-    return X, y, feats
+    return X, y, feats, patient_ids
 
 
 def train_model_run(
@@ -202,7 +211,7 @@ def train_model_run(
 
     # Load training data
     print(f"Loading training data from {len(train_fups)} folders...")
-    X_train, y_train, features = load_combined_data(
+    X_train, y_train, features, _ = load_combined_data(
         data_root, train_fups, "train.parquet",
         label_key, ignore_cols, enforced_features=None,
     )
@@ -211,12 +220,24 @@ def train_model_run(
         return
 
     # Load validation data
-    X_val, y_val, _ = load_combined_data(
+    X_val, y_val, _, _ = load_combined_data(
         data_root, valid_fups, "validation.parquet",
         label_key, ignore_cols, enforced_features=features,
     )
     if X_val is None:
         print("Validation set empty. Skipping.")
+        return
+
+    # Rare (task, horizon) combinations (e.g. fungal groups at 30 days) can
+    # leave too few events to tune or fit: the pipeline then degenerates, emits
+    # nan probabilities and fails EVERY Optuna trial ('The value nan is not
+    # acceptable'), crashing the run with 'No trials are completed yet'.
+    # Skip such combinations gracefully instead.
+    n_pos_train = int(np.sum(y_train == 1))
+    n_pos_val = int(np.sum(y_val == 1))
+    if n_pos_train < MIN_TRAIN_POSITIVES or n_pos_val < 1:
+        print(f"[SKIP] {task_key} @ {horizon}d: too few events to fit a baseline "
+              f"({n_pos_train} positives in train, {n_pos_val} in validation).")
         return
 
     # Setup output directory
@@ -354,16 +375,20 @@ class OptunaTrainer:
             
             # Fit on train, score on validation (simple hold-out optimization)
             # For more robustness, replace this with cross_val_score on X_train
-            pipeline.fit(X_train, y_train)
-            if hasattr(pipeline, "predict_proba"):
-                probs = pipeline.predict_proba(X_val)[:, 1]
-                try:
+            # NOTE: any degenerate fit (nan predictions, nan/failed AUC) must
+            # return a valid fallback score, otherwise the whole study has no
+            # completed trials and study.best_trial raises.
+            try:
+                pipeline.fit(X_train, y_train)
+                if hasattr(pipeline, "predict_proba"):
+                    probs = pipeline.predict_proba(X_val)[:, 1]
+                    if np.isnan(probs).any():
+                        return 0.5
                     score = roc_auc_score(y_val, probs)
-                except ValueError:
-                    score = 0.5
-            else:
-                score = 0.5
-            return score
+                    return 0.5 if np.isnan(score) else float(score)
+                return 0.5
+            except Exception:
+                return 0.5
 
         # Run hyper-parameter optimization
         print(f"Starting Optuna optimization ({self.n_trials} trials)...")
@@ -591,8 +616,8 @@ def test_classic_ml_model(
     
     # Define execution matrices for validation and testing splits
     split_configs = [
-        {"split_label": "validation", "filename": "validation.parquet", "json_name": "validation_results.json", "npz_name": "val_predictions.npz"},
-        {"split_label": "test",       "filename": "test.parquet",       "json_name": "test_results.json",       "npz_name": "test_predictions.npz"}
+        {"split_label": "validation", "filename": "validation.parquet", "json_name": "validation_results.json"},
+        {"split_label": "test",       "filename": "test.parquet",       "json_name": "test_results.json"}
     ]
     
     for config in split_configs:
@@ -608,7 +633,7 @@ def test_classic_ml_model(
         all_predictions = {}
         
         # Compute the global aggregated matrix cut across ALL discovered FUP folders
-        X_all, y_all, _ = load_combined_data(
+        X_all, y_all, _, pid_all = load_combined_data(
             data_root, all_possible_fups, config["filename"], label_key, ignore_cols, enforced_features=features
         )
         
@@ -616,12 +641,11 @@ def test_classic_ml_model(
             prefix = f"{config['split_label']}_all"
             metrics_all = trainer.evaluate(X_all, y_all, evaluator, prefix=prefix)
             final_metrics.update(metrics_all)
-            for key, array in evaluator.saved_labels_and_probs.items():
-                all_predictions[f"{prefix}_{key}"] = array
+            evaluator.saved_labels_and_probs = None
                 
         # Iterate through individual stratified FUP time-steps sequentially
         for fup in all_possible_fups:
-            X_fup, y_fup, _ = load_combined_data(
+            X_fup, y_fup, _, pid_fup = load_combined_data(
                 data_root, [fup], config["filename"], label_key, ignore_cols, enforced_features=features
             )
             if X_fup is not None and len(X_fup) > 0:
@@ -630,14 +654,25 @@ def test_classic_ml_model(
                 final_metrics.update(metrics_fup)
                 for key, array in evaluator.saved_labels_and_probs.items():
                     all_predictions[f"{prefix}_{key}"] = array
+                if pid_fup is not None and len(pid_fup) == len(y_fup):
+                    all_predictions[f"{prefix}_patientid"] = np.asarray(pid_fup)
                     
         # Explicitly flush out evaluator memory storage arrays between passes
         evaluator.saved_labels_and_probs = None
         
-        # Write files out using mirrored path formats
-        np.savez_compressed(output_dir / config["npz_name"], **all_predictions)
+        # Write metrics to disk (predictions go to the tidy CSV below)
         with open(output_dir / config["json_name"], "w") as f:
             json.dump(final_metrics, f, indent=4)
+        print(f"    [SUCCESS] Saved {config['split_label']} classic ML stats to: {output_dir}")
+
+        # Tidy long-format table: patient_id, fup, horizon, label, prob, prob_cal
+        save_predictions_table(
+            all_predictions=all_predictions,
+            split_label=config["split_label"],
+            horizons=extract_horizons_from_path(output_dir),
+            output_dir=output_dir,
+            csv_name=f"{config['split_label']}_predictions.csv",
+        )
             
         print(f"    [SUCCESS] Saved {config['split_label']} classic ML arrays and stats to: {output_dir}")
         

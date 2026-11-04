@@ -1,9 +1,25 @@
+"""Head-to-head comparison of a proposed classification model against
+contender baselines (e.g., t-EAV-transformer vs classic ML models).
+
+Inputs: Use '{split}_predictions.csv' files written by the training
+scripts (e.g., results/transformer/... and results/classic_ml/...).
+Note: Field 'prob' in the csv files must mean P(event by horizon H).
+
+Usage:
+    python scripts/analysis_comparison.py \
+        --proposed-model transformer \
+        --contender-models logistic_regression random_forest xgboost
+
+Models are declared in MODEL_REGISTRY (path_template / display / full / calibrated)
+Unknown model names fall back to the classic_ml layout with a generated abbreviation.
+Outputs land under results/analysis/comparison/.../<PROPOSED>-vs-<CONTENDERS>/.
+Derived caches are invalidated from the input CSV fingerprints.
+"""
 import sys
 import io
 import os
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 if hasattr(sys.stdout, "buffer"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
@@ -19,7 +35,6 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import numpy as np
 import pandas as pd
-from datasets import load_from_disk
 from sklearn.metrics import (
     average_precision_score,
     precision_recall_curve,
@@ -36,20 +51,22 @@ from scripts.script_utils import (
 )
 
 
-# ==========================================
-# CLI Argument Parsing & Global Configurations
-# ==========================================
+# ================================================================================
+# Command-line arguments
+# ================================================================================
 
 parser = argparse.ArgumentParser(description="Evaluation pipeline")
 parser.add_argument(
     "--threshold_mode",
     choices=["global", "window_specific"],
     default="window_specific",
+    help="Whether to use a single global threshold for all clinical windows or compute a separate threshold per window.",
 )
 parser.add_argument(
     "--target_recall",
     type=int,
     default=80,
+    help="Target recall percentage (0-100) for threshold selection.",
 )
 parser.add_argument(
     "--workers",
@@ -58,10 +75,34 @@ parser.add_argument(
     help="Number of threads used for bootstrap resampling (does not affect results).",
 )
 parser.add_argument(
-    "--data-dir", "--data_dir",
-    type=Path,
-    default=Path(os.environ.get("TEAV_DATA_DIR", "/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6/teav")),
-    help="Path to tEAV dataset directory.",
+    "--tasks",
+    nargs="+",
+    default=["infection_bacteria", "infection_virus"],
+    help="Outcome tasks to analyze (one comparison report per task). When the proposed "
+         "model's predictions CSV carries a 'task' column (multi-task runs), this "
+         "selects the corresponding head per task. E.g. --tasks infection_bacteria "
+         "infection_grp_cmv",
+)
+parser.add_argument(
+    "--proposed-model",
+    default="transformer",
+    help="Name of the proposed model (registry key). See MODEL_REGISTRY.",
+)
+parser.add_argument(
+    "--contender-models",
+    nargs="+",
+    default=["logistic_regression", "random_forest", "xgboost"],
+    help="List of contender/baseline model names (registry keys) to compare against the proposed model.",
+)
+parser.add_argument(
+    "--run-id",
+    default="e00-a15-v60",
+    help="Pre-training run id used to locate transformer-family result directories.",
+)
+parser.add_argument(
+    "--results-dir",
+    default="results",
+    help="Directory containing all results.",
 )
 args = parser.parse_args()
 
@@ -70,27 +111,167 @@ TARGET_RECALL_INPUT = args.target_recall
 TARGET_RECALL = TARGET_RECALL_INPUT / 100.0
 THRESHOLD_TUNING_SET = "validation"
 MAX_WORKERS = max(1, args.workers)
+RESULTS_DIR = Path(args.results_dir)
 
-USE_CALIBRATED_PROBS = {
-    "Transformer": True,
-    "logistic_regression": True,
-    "random_forest": True,
-    "xgboost": True,
+
+# ================================================================================
+# Model registry for classification model comparison.
+# Each entry four fields (identical for all models):
+#   path_template : the FULL path (relative to RESULTS_DIR = --results-dir,
+#                   default "results/")
+#                   of the folder that DIRECTLY contains
+#                   'validation_predictions.csv' and 'test_predictions.csv'.
+#                   There is NO auto-discovery: the path you write here is
+#                   exactly the folder that is read.
+#                   Optional placeholders filled in by the script:
+#                     {split}        random_split | temporal_split | center_split
+#                     {run_id}       value of --run-id (pretraining run id)
+#                     {task}         infection_bacteria | infection_virus
+#                     {model}        the registry key itself
+#                     {horizon:04d}  zero-padded horizon (0030, 0060, 0090),
+#                                    for models storing one folder per horizon
+#                   Literal path segments (like the hrz(...)/fuv(...) folder
+#                   names below) are simply fixed directory names produced by
+#                   the training scripts; keep or drop them as your output
+#                   tree requires.
+#                   If a template is horizon-independent, one CSV may hold
+#                   several horizons: rows are filtered on its 'horizon'
+#                   column. Required CSV columns: patient_id, fup, horizon,
+#                   label, prob.
+#   display       : short label (plot legend + output subfolder name).
+#   full          : full model name (used in report text).
+#   calibrated    : True  -> the script calibrates the probabilities in memory
+#                            before computing metrics (Platt scaling: an
+#                            L2-regularized logistic fit on validation
+#                            logit-space probabilities, applied to the test
+#                            set);
+#                   False -> probabilities are used as-is.
+# ================================================================================
+
+MODEL_REGISTRY = {
+    "transformer": dict(
+        path_template="transformer/{split}/{run_id}/finetuning/{task}/hrz(0030-0060-0090)_fut(all)_fuv(0000-0030-0060-0090-0180-0360)",
+        display="TF",
+        full="t-EAV-Transformer",
+        calibrated=True,
+    ),
+    # Multi-task run: ONE checkpoint with a head per (task, horizon) pair. The
+    # path has no {task} placeholder; the task under analysis is selected from
+    # the CSV 'task' column (see --tasks / _load_predictions_csv_slice).
+    "transformer_multitask": dict(
+        path_template="transformer/{split}/{run_id}/finetuning/multitask_infections/hrz(0030-0060-0090)_fut(all)_fuv(0000-0030-0060-0090-0180-0360)",
+        display="TFMT",
+        full="t-EAV-Transformer (multi-task)",
+        calibrated=True,
+    ),
+    "survival_transformer": dict(
+        path_template="survival_transformer/{split}/{run_id}/finetuning/{task}/hrz(0030-0060-0090)_fut(all)_fuv(0000-0030-0060-0090-0180-0360)",
+        display="SURV",
+        full="t-EAV-Transformer (Cox)",
+        calibrated=True,
+    ),
+    "logistic_regression": dict(
+        path_template="classic_ml/{split}/logistic_regression/{task}/hrz({horizon:04d})_fut(all)_fuv(0000-0030-0060-0090-0180-0360)",
+        display="LR",
+        full="Logistic regression",
+        calibrated=True,
+    ),
+    "random_forest": dict(
+        path_template="classic_ml/{split}/random_forest/{task}/hrz({horizon:04d})_fut(all)_fuv(0000-0030-0060-0090-0180-0360)",
+        display="RF",
+        full="Random forest",
+        calibrated=True,
+    ),
+    "xgboost": dict(
+        path_template="classic_ml/{split}/xgboost/{task}/hrz({horizon:04d})_fut(all)_fuv(0000-0030-0060-0090-0180-0360)",
+        display="XGB",
+        full="XGBoost",
+        calibrated=True,
+    ),
+
+    # ------------------- Adding a new model (examples) -------------------
+    # Case A: your predictions live in ONE folder per split and task, e.g.:
+    #
+    #   results/
+    #     my_new_model/
+    #       temporal_split/              <- filled by {split}
+    #         infection_bacteria/        <- filled by {task}
+    #           test_predictions.csv     <- all horizons mixed in one CSV
+    #           validation_predictions.csv
+    #
+    #   "my_new_model": dict(
+    #       path_template="my_new_model/{split}/{task}",
+    #       display="NM",                # short: used in plot legends
+    #       full="My new model",         # shown in reports
+    #       calibrated=False,            # keep raw probabilities
+    #   ),
+    #
+    # Case B: your tree stores one folder per horizon, e.g.:
+    #   results/my_new_model/temporal_split/infection_bacteria/h0030/test_predictions.csv
+    #
+    #   "my_new_model": dict(
+    #       path_template="my_new_model/{split}/{task}/h{horizon:04d}",
+    #       ... same fields as above ...
+    #   ),
+    #
+    # After adding all proposed and baseline models, run something like:
+    #   python scripts/analysis_comparison.py --proposed-model my_new_model \
+    #       --contender-models my_new_baseline_a my_new_baseline_b
 }
 
-THRESHOLD_SUBFOLDER = f"rec-{TARGET_RECALL_INPUT}"
-CALIB_SUBFOLDER = f"calib-{int(USE_CALIBRATED_PROBS['Transformer'])}"
 
-BASE_DATA_PATH = args.data_dir
-RESULTS_DIR = Path("results_final")
+def _registry_entry(name: str) -> dict:
+    """Return registry metadata for a model, with a graceful fallback for unknown names."""
+    if name in MODEL_REGISTRY:
+        return dict(MODEL_REGISTRY[name])
+    disp = "".join(w[0].upper() for w in re.split(r"[_\-\s]+", name) if w) or name[:3].upper()
+    print(f"[WARN] Model '{name}' not in MODEL_REGISTRY; assuming the default "
+          f"classic_ml layout (classic_ml/<split>/{name}/<task>/hrz(<horizon>)_"
+          f"fut(all)_fuv(...)) and display name '{disp}'. If that is not where "
+          f"your CSVs are, add an explicit entry to MODEL_REGISTRY.")
+    return dict(
+        path_template=(f"classic_ml/{{split}}/{name}/{{task}}/"
+                       "hrz({horizon:04d})_fut(all)_fuv(0000-0030-0060-0090-0180-0360)"),
+        display=disp,
+        full=name.replace("_", " ").capitalize(),
+        calibrated=True,
+    )
+
+
+# ================================================================================
+# Model parameters and derived paths
+# ================================================================================
+
+PROPOSED_MODEL = args.proposed_model
+CONTENDER_MODELS = list(args.contender_models)
+if PROPOSED_MODEL in CONTENDER_MODELS:
+    raise ValueError(f"--proposed-model '{PROPOSED_MODEL}' must not also appear in --contender-models.")
+if not CONTENDER_MODELS:
+    raise ValueError("--contender-models must contain at least one model.")
+
+MODEL_ENTRIES = {m: _registry_entry(m) for m in [PROPOSED_MODEL, *CONTENDER_MODELS]}
+MODEL_RUN_ID = args.run_id
+USE_CALIBRATED_PROBS = {m: e["calibrated"] for m, e in MODEL_ENTRIES.items()}
+THRESHOLD_SUBFOLDER = f"rec-{TARGET_RECALL_INPUT}"
+CALIB_SUBFOLDER = f"calib-{int(USE_CALIBRATED_PROBS[PROPOSED_MODEL])}"
 ANALYSIS_DIR = RESULTS_DIR / "analysis" / "comparison" / "lt-1-3_vlt-3-10" / THRESHOLD_SUBFOLDER
-ANALYSIS_SUBDIR = ANALYSIS_DIR / THRESHOLD_MODE / CALIB_SUBFOLDER
+MODEL_SET_TAG = (
+    f"{MODEL_ENTRIES[PROPOSED_MODEL]['display']}-vs-"
+    + "-".join(MODEL_ENTRIES[m]["display"] for m in CONTENDER_MODELS)
+)
+ANALYSIS_SUBDIR = ANALYSIS_DIR / THRESHOLD_MODE / CALIB_SUBFOLDER / MODEL_SET_TAG
 CACHE_DIR = ANALYSIS_DIR / "cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-CLASSIC_MODELS = ["logistic_regression", "random_forest", "xgboost"]
-ALL_MODELS = ["Transformer", *CLASSIC_MODELS]
-TASKS = ["infection_bacteria", "infection_virus"]
+
+
+# ================================================================================
+# Model comparison constants and utilities
+# ================================================================================
+
+ALL_MODELS = [PROPOSED_MODEL, *CONTENDER_MODELS]
+PROPOSED_DISP = MODEL_ENTRIES[PROPOSED_MODEL]["display"]
+TASKS = list(args.tasks)  # overridable via --tasks (one report per task)
 SPLIT_TYPES = ["random_split", "temporal_split", "center_split"]
 TARGET_HORIZONS = [30, 60, 90]
 N_BOOTSTRAP = 1000
@@ -102,26 +283,20 @@ CLINICAL_WINDOWS = {
     "Long-term\n(361-1080 days)": (361, 1080),
     "Very long-term\n(1081-3600 days)": (1081, 3600),
 }
-
 CONCISE_WINDOW_LABELS = ["POP", "OPT", "MTN", "LT", "VLT"]
 
-MODEL_DISPLAY_MAP = {
-    "Transformer": "TF",
-    "logistic_regression": "LR",
-    "random_forest": "RF",
-    "xgboost": "XGB",
-}
-MODEL_FULLNAME_MAP = {
-    "Transformer": "t-EAV-Transformer",
-    "logistic_regression": "Logistic regression",
-    "random_forest": "Random forest",
-    "xgboost": "XGBoost",
-}
-BASELINE_FULL_NAME_MAP = {"LR": "logistic_regression", "RF": "random_forest", "XGB": "xgboost"}
+MODEL_DISPLAY_MAP = {m: e["display"] for m, e in MODEL_ENTRIES.items()}
+MODEL_FULLNAME_MAP = {m: e["full"] for m, e in MODEL_ENTRIES.items()}
+BASELINE_FULL_NAME_MAP = {MODEL_DISPLAY_MAP[m]: m for m in CONTENDER_MODELS}
+ALL_ABBREVS = {MODEL_DISPLAY_MAP[m] for m in ALL_MODELS}
 
-MODEL_PLOT_ORDER = ["logistic_regression", "random_forest", "xgboost", "Transformer"]
-COLORS_BY_PLOT_ORDER = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
-COLORS = {m: c for m, c in zip(MODEL_PLOT_ORDER, COLORS_BY_PLOT_ORDER)}
+MODEL_PLOT_ORDER = [*CONTENDER_MODELS, PROPOSED_MODEL]  # contenders first, proposed model last (highlighted in red).
+CONTENDER_PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#9467bd", "#8c564b", "#e377c2", "#17becf", "#bcbd22"]
+PROPOSED_COLOR = "#d62728"
+COLORS = {
+    **{m: CONTENDER_PALETTE[i % len(CONTENDER_PALETTE)] for i, m in enumerate(CONTENDER_MODELS)},
+    PROPOSED_MODEL: PROPOSED_COLOR,
+}
 
 METRIC_MAPPING = [
     ("ROC-AUC", "↑"), ("PR-AUC", "↑"), ("ECE", "↓"),
@@ -132,7 +307,44 @@ MAIN_METRIC_MAPPING = [
     ("Sensitivity", "↑"), ("Specificity", "↑"),
 ]
 
-CACHE_SCHEMA_VERSION = 3
+
+# ================================================================================
+# Cache logic (some computations are long)
+# ================================================================================
+
+CACHE_SCHEMA_VERSION = 5
+
+def _predictions_csv(model: str, split: str, task: str, dataset_split: str, horizon: int) -> Path:
+    """Resolve the exact CSV path for one model/split/task/horizon.
+
+    The model's 'path_template' must point to the folder that DIRECTLY
+    contains '{validation,test}_predictions.csv' (no auto-discovery).
+    """
+    rel = MODEL_ENTRIES[model]["path_template"].format(
+        split=split, run_id=MODEL_RUN_ID, task=task, model=model, horizon=horizon,
+    )
+    return RESULTS_DIR / rel / f"{dataset_split}_predictions.csv"
+
+def _input_csv_fingerprint() -> str:
+    """Fingerprint every input predictions CSV (path + mtime + size).
+
+    Folded into PARAM_HASH so regenerated result CSVs invalidate the derived
+    plot/metric caches (the previous behavior served stale metrics after a
+    rerun of the training scripts).
+    """
+    paths = set()
+    for model in ALL_MODELS:
+        for s in SPLIT_TYPES:
+            for t in TASKS:
+                for h in TARGET_HORIZONS:
+                    for ds in ("validation", "test"):
+                        p = _predictions_csv(model, s, t, ds, h)
+                        if p.exists():
+                            paths.add(p)
+    paths = sorted(paths)
+    sig = "|".join(f"{p}:{p.stat().st_mtime_ns}:{p.stat().st_size}" for p in paths)
+    return hashlib.sha256(sig.encode()).hexdigest()[:12]
+
 PARAM_SIGNATURE = {
     "schema": CACHE_SCHEMA_VERSION,
     "threshold_mode": THRESHOLD_MODE,
@@ -142,15 +354,19 @@ PARAM_SIGNATURE = {
     "n_bootstrap": N_BOOTSTRAP,
     "windows": CLINICAL_WINDOWS,
     "models": ALL_MODELS,
+    "proposed_model": PROPOSED_MODEL,
+    "contender_models": CONTENDER_MODELS,
+    "run_id": MODEL_RUN_ID,
+    "input_csvs": _input_csv_fingerprint(),
 }
 PARAM_HASH = hashlib.sha256(
     json.dumps(PARAM_SIGNATURE, sort_keys=True, separators=(",", ":")).encode()
 ).hexdigest()[:12]
 
 
-# ==========================================
-# Utility & Path Functions
-# ==========================================
+# ================================================================================
+# Utility and path functions
+# ================================================================================
 
 def horizon_name(h):
     """Return a formatted string representation for the prediction horizon."""
@@ -185,144 +401,67 @@ def ece(y, p, n_bins=10):
     return float(result)
 
 
-# ==========================================
-# Data Loading Functions
-# ==========================================
+# ================================================================================
+# Data loading functions
+# ================================================================================
 
-def load_transformer(task, split, dataset_split, horizon):
-    """Load and process Transformer prediction probabilities and true labels."""
+def _load_predictions_csv_slice(csv_path: Path, horizon: int, task: str | None = None) -> pd.DataFrame:
+    """
+    Read a tidy '{dataset_split}_predictions.csv' written by the training
+    scripts and return the classic analysis schema:
+        patient_id (= patient id), time_step (= fup), horizon, y_true, y_prob
+
+    Multi-task prediction CSVs mix several outcome tasks in one file (extra
+    'task' column): keep only the rows of the task under analysis.
+    """
+    df = pd.read_csv(csv_path)
+    if "task" in df.columns and task is not None:
+        df = df[df["task"] == task]
+    df = df[df["horizon"] == horizon]
+    if df.empty:
+        return pd.DataFrame()
+    return pd.DataFrame({
+        "patient_id": df["patient_id"].astype(str),
+        "time_step": df["fup"].astype(int),
+        "horizon": df["horizon"].astype(int),
+        "y_true": df["label"].astype(int),
+        "y_prob": df["prob"].astype(float),
+    }).reset_index(drop=True)
+
+
+def load_model_predictions(model, task, split, dataset_split, horizon):
+    """Load a model's predictions from the tidy per-run '{dataset_split}_predictions.csv'.
+
+    The only raw input this analysis uses: no raw datasets, no checkpoints.
+    """
     if horizon == "combined":
-        x = [load_transformer(task, split, dataset_split, h) for h in TARGET_HORIZONS]
+        x = [load_model_predictions(model, task, split, dataset_split, h) for h in TARGET_HORIZONS]
         return (
             pd.concat([d for d in x if not d.empty], ignore_index=True)
             if any(not d.empty for d in x) else pd.DataFrame()
         )
 
-    cp = raw_cache("raw_tf", task, split, dataset_split, horizon)
+    src = _predictions_csv(model, split, task, dataset_split, horizon)
+    if not src.exists():
+        return pd.DataFrame()
+
+    # Fingerprint the source CSV (mtime + size) in the cache key so that
+    # regenerated CSVs or a different --run-id never serve stale parquet.
+    st = src.stat()
+    cp = raw_cache("raw", model, task, split, dataset_split, horizon,
+                   f"{int(st.st_mtime_ns)}_{st.st_size}")
     if cp.exists():
         return pd.read_parquet(cp)
 
-    fname = "validation_probs.npz" if dataset_split == "validation" else "test_probs.npz"
-    root = RESULTS_DIR / "transformer" / split / "e00-a15-v60" / "finetuning" / task
-    if not root.exists():
-        return pd.DataFrame()
-
-    found = None
-    for d in root.iterdir():
-        m = re.search(r"hrz\(([\d-]+)\)", d.name)
-        if d.is_dir() and m and horizon in [int(v) for v in m.group(1).split("-")]:
-            hs = [int(v) for v in m.group(1).split("-")]
-            found = (d, hs.index(horizon), hs)
-            break
-
-    if found is None or not (found[0] / fname).exists():
-        return pd.DataFrame()
-
-    d, target_idx, hs = found
-    z = np.load(d / fname, allow_pickle=True)
-    pref = "validation_" if dataset_split == "validation" else "test_"
-    days = sorted(int(m.group(1)) for k in z.files if (m := re.match(rf"^{pref}fup_(\d+)_labels$", k)))
-
-    records = []
-    for day in days:
-        labels = z[f"{pref}fup_{day:04d}_labels"]
-        probs = z[f"{pref}fup_{day:04d}_probs"]
-        y = labels if labels.ndim == 1 else labels[:, target_idx]
-        p = probs if probs.ndim == 1 else probs[:, target_idx]
-
-        dsdir = BASE_DATA_PATH / split / f"fup_{day:04d}"
-        if not dsdir.exists():
-            dsdir = BASE_DATA_PATH / split / f"fup_{day:04d}d"
-        if not dsdir.exists():
-            continue
-
-        ds = load_from_disk(str(dsdir))[dataset_split]
-        keys = ds["patientkey"]
-        cols = [f"label_{task}_{h:04d}d" for h in hs if f"label_{task}_{h:04d}d" in ds.column_names]
-        keep = (
-            (np.stack([ds[c] for c in cols], 1) != -100).any(1)
-            if cols else np.ones(len(keys), bool)
-        )
-        valid = np.where(keep)[0]
-
-        for i in range(min(len(valid), len(y), len(p))):
-            if int(y[i]) != -100:
-                records.append(
-                    dict(
-                        patientkey=keys[valid[i]], time_step=day, horizon=horizon,
-                        y_true=int(y[i]), y_prob=float(p[i]),
-                    )
-                )
-
-    df = pd.DataFrame(records)
+    df = _load_predictions_csv_slice(src, horizon, task=task)
     if not df.empty:
         df.to_parquet(cp, index=False)
     return df
 
 
-def load_classic(model, task, split, dataset_split, horizon):
-    """Load and process classic ML model prediction probabilities and labels."""
-    if horizon == "combined":
-        x = [load_classic(model, task, split, dataset_split, h) for h in TARGET_HORIZONS]
-        return (
-            pd.concat([d for d in x if not d.empty], ignore_index=True)
-            if any(not d.empty for d in x) else pd.DataFrame()
-        )
-
-    cp = raw_cache("raw_ml", model, task, split, dataset_split, horizon)
-    if cp.exists():
-        return pd.read_parquet(cp)
-
-    fname = "val_predictions.npz" if dataset_split == "validation" else "test_predictions.npz"
-    root = RESULTS_DIR / "classic_ml" / split / model / task
-    if not root.exists():
-        return pd.DataFrame()
-
-    d = next(
-        (x for x in root.iterdir() if x.is_dir() and f"hrz({horizon:04d})" in x.name),
-        None,
-    )
-    if d is None or not (d / fname).exists():
-        return pd.DataFrame()
-
-    z = np.load(d / fname, allow_pickle=True)
-    pref = "validation_" if dataset_split == "validation" else "test_"
-    days = sorted(int(m.group(1)) for k in z.files if (m := re.match(rf"^{pref}fup_(\d+)_labels$", k)))
-
-    records = []
-    for day in days:
-        y = z[f"{pref}fup_{day:04d}_labels"].ravel()
-        p = z[f"{pref}fup_{day:04d}_probs"].ravel()
-
-        dsdir = BASE_DATA_PATH / split / f"fup_{day:04d}"
-        if not dsdir.exists():
-            dsdir = BASE_DATA_PATH / split / f"fup_{day:04d}d"
-        if not dsdir.exists():
-            continue
-
-        ds = load_from_disk(str(dsdir))[dataset_split]
-        keys = ds["patientkey"]
-        col = f"label_{task}_{horizon:04d}d"
-        valid = np.where(
-            np.asarray(ds[col]) != -100 if col in ds.column_names else np.ones(len(keys), bool)
-        )[0]
-
-        for i in range(min(len(valid), len(y), len(p))):
-            if int(y[i]) != -100:
-                records.append(dict(
-                    patientkey=keys[valid[i]], time_step=day, horizon=horizon,
-                    y_true=int(y[i]), y_prob=float(p[i]),
-                ))
-
-    df = pd.DataFrame(records)
-    if not df.empty:
-        df.to_parquet(cp, index=False)
-    return df
-
-
-# ==========================================
-# Evaluation & Statistical Metrics
-# ==========================================
+# ================================================================================
+# Evaluation and statistical metrics
+# ================================================================================
 
 def threshold(df, lo, hi, label):
     """Compute classification threshold based on target recall."""
@@ -399,10 +538,10 @@ def bootstrap_ci(df, model, t, kind):
 
 
 def aligned(dfs):
-    """Align patient cohorts across all model dataframes."""
-    keys = ["patientkey", "time_step", "horizon", "y_true"]
-    common = dfs["Transformer"][keys].drop_duplicates()
-    for m in CLASSIC_MODELS:
+    """Align patient cohorts across all model dataframes (proposed model is the anchor)."""
+    keys = ["patient_id", "time_step", "horizon", "y_true"]
+    common = dfs[PROPOSED_MODEL][keys].drop_duplicates()
+    for m in CONTENDER_MODELS:
         common = common.merge(dfs[m][keys].drop_duplicates(), on=keys, how="inner")
 
     if common.empty:
@@ -413,29 +552,29 @@ def aligned(dfs):
     }
 
 
-# ==========================================
-# Report Structuring (restored old layout)
-# ==========================================
+# ================================================================================
+# Report structuring
+# ================================================================================
 
 def build_report_layout_and_mapping():
     """Build the row order and display-name mapping for the detailed CSV report."""
     metric_sort_order = ["Total evaluation frames"]
     row_cleaning_map = {"Total evaluation frames": "Total evaluation frames"}
 
-    for m in CLASSIC_MODELS:
+    for m in CONTENDER_MODELS:
         disp = MODEL_DISPLAY_MAP[m]
-        key_head = f"TF vs {disp}"
+        key_head = f"{PROPOSED_DISP} vs {disp}"
         metric_sort_order.append(key_head)
         row_cleaning_map[key_head] = key_head
 
         sub_metrics = [
             (f"  PR-AUC winner ({disp})", "  Statistical winner (PR-AUC)"),
-            (f"  Threshold-free PR-AUC p-value ({disp})", f"  PR-AUC bootstrap p-value (TF > {disp})"),
-            (f"  Threshold-free PR-AUC q-value ({disp})", f"  PR-AUC bootstrap FDR q-value (TF > {disp})"),
+            (f"  Threshold-free PR-AUC p-value ({disp})", f"  PR-AUC bootstrap p-value ({PROPOSED_DISP} > {disp})"),
+            (f"  Threshold-free PR-AUC q-value ({disp})", f"  PR-AUC bootstrap FDR q-value ({PROPOSED_DISP} > {disp})"),
             (f"  McNemar winner ({disp})", "  Statistical winner (McNemar)"),
             (f"  McNemar p-value ({disp})", "  McNemar p-value"),
             (f"  McNemar q-value ({disp})", "  McNemar FDR q-value"),
-            (f"  Discordant pairs (TF correct) ({disp})", "  Discordant pairs (TF correct)"),
+            (f"  Discordant pairs ({PROPOSED_DISP} correct) ({disp})", f"  Discordant pairs ({PROPOSED_DISP} correct)"),
             (f"  Discordant pairs ({disp} correct) ({disp})", f"  Discordant pairs ({disp} correct)"),
         ]
         for internal_key, clean_name in sub_metrics:
@@ -460,7 +599,7 @@ def fdr_and_reports(results, outdir, split, hs):
     """
     p_entries = []
     for window_name, record in results.items():
-        for m in CLASSIC_MODELS:
+        for m in CONTENDER_MODELS:
             disp = MODEL_DISPLAY_MAP[m]
             for test_key, field in (("PR-AUC", f"  Threshold-free PR-AUC p-value ({disp})"),
                                      ("McNemar", f"  McNemar p-value ({disp})")):
@@ -499,7 +638,7 @@ def fdr_and_reports(results, outdir, split, hs):
         main_win_record["PR-AUC bootstrap statistical winner and p-value"] = ""
         main_win_record["McNemar statistical winner and p-value"] = ""
 
-        for m in CLASSIC_MODELS:
+        for m in CONTENDER_MODELS:
             disp = MODEL_DISPLAY_MAP[m]
 
             q_pr = q_map.get((window_name, disp, "PR-AUC"), np.nan)
@@ -507,14 +646,14 @@ def fdr_and_reports(results, outdir, split, hs):
             pr_winner = "Tie" if (not np.isnan(q_pr) and q_pr >= 0.05) else raw_pr_winner
             record[f"  PR-AUC winner ({disp})"] = pr_winner
             record[f"  Threshold-free PR-AUC q-value ({disp})"] = format_sci(q_pr)
-            main_win_record[f"  TF vs {disp} (PR-AUC)"] = f"{pr_winner} (q {format_p_or_q(q_pr)})"
+            main_win_record[f"  {PROPOSED_DISP} vs {disp} (PR-AUC)"] = f"{pr_winner} (q {format_p_or_q(q_pr)})"
 
             q_mcn = q_map.get((window_name, disp, "McNemar"), np.nan)
             raw_mcn_winner = record.get(f"  McNemar winner ({disp})", "Tie")
             mcn_winner = "Tie" if (not np.isnan(q_mcn) and q_mcn >= 0.05) else raw_mcn_winner
             record[f"  McNemar winner ({disp})"] = mcn_winner
             record[f"  McNemar q-value ({disp})"] = format_sci(q_mcn)
-            main_win_record[f"  TF vs {disp} (McNemar)"] = f"{mcn_winner} (q {format_p_or_q(q_mcn)})"
+            main_win_record[f"  {PROPOSED_DISP} vs {disp} (McNemar)"] = f"{mcn_winner} (q {format_p_or_q(q_mcn)})"
 
         main_table_data[window_name] = main_win_record
 
@@ -532,11 +671,11 @@ def fdr_and_reports(results, outdir, split, hs):
         for model in MODEL_PLOT_ORDER:
             main_rows_order.append(f"  {MODEL_DISPLAY_MAP[model]}_{head_lbl}")
     main_rows_order.append("PR-AUC bootstrap statistical winner and p-value")
-    for m in CLASSIC_MODELS:
-        main_rows_order.append(f"  TF vs {MODEL_DISPLAY_MAP[m]} (PR-AUC)")
+    for m in CONTENDER_MODELS:
+        main_rows_order.append(f"  {PROPOSED_DISP} vs {MODEL_DISPLAY_MAP[m]} (PR-AUC)")
     main_rows_order.append("McNemar statistical winner and p-value")
-    for m in CLASSIC_MODELS:
-        main_rows_order.append(f"  TF vs {MODEL_DISPLAY_MAP[m]} (McNemar)")
+    for m in CONTENDER_MODELS:
+        main_rows_order.append(f"  {PROPOSED_DISP} vs {MODEL_DISPLAY_MAP[m]} (McNemar)")
 
     df_main = pd.DataFrame(main_table_data).reindex(main_rows_order)
     df_main.index.name = "Evaluation metric"
@@ -546,7 +685,7 @@ def fdr_and_reports(results, outdir, split, hs):
     winners = {}
     for window_name in results:
         winners[window_name] = {}
-        for m in CLASSIC_MODELS:
+        for m in CONTENDER_MODELS:
             disp = MODEL_DISPLAY_MAP[m]
             winners[window_name][disp] = {
                 "PR-AUC": {"winner": results[window_name].get(f"  PR-AUC winner ({disp})", "Tie"),
@@ -558,9 +697,9 @@ def fdr_and_reports(results, outdir, split, hs):
     return df_main, df_detailed, winners
 
 
-# ==========================================
-# Main Processing Pipeline
-# ==========================================
+# ================================================================================
+# Main processing pipeline
+# ================================================================================
 
 def process(task, split, horizon, outdir):
     """Run model evaluation pipeline for a specific task, split, and horizon."""
@@ -608,11 +747,8 @@ def process(task, split, horizon, outdir):
     else:
         print(f"[CACHE MISS] split={split}, horizon={hs}, hash={PARAM_HASH}")
 
-    val = {"Transformer": load_transformer(task, split, "validation", horizon)}
-    test = {"Transformer": load_transformer(task, split, "test", horizon)}
-    for m in CLASSIC_MODELS:
-        val[m] = load_classic(m, task, split, "validation", horizon)
-        test[m] = load_classic(m, task, split, "test", horizon)
+    val = {m: load_model_predictions(m, task, split, "validation", horizon) for m in ALL_MODELS}
+    test = {m: load_model_predictions(m, task, split, "test", horizon) for m in ALL_MODELS}
 
     if any(d.empty for d in val.values()) or any(d.empty for d in test.values()):
         print(f"[SKIP] missing predictions for {split}/{hs}")
@@ -637,19 +773,19 @@ def process(task, split, horizon, outdir):
     payload = {}
 
     for w, (lo, hi) in CLINICAL_WINDOWS.items():
-        base = test["Transformer"]
+        base = test[PROPOSED_MODEL]
         sub = (
             base[(base.time_step >= lo) & ((base.time_step + base.horizon) <= hi)][
-                ["patientkey", "time_step", "horizon", "y_true", "y_prob"]
-            ].rename(columns={"y_prob": "y_prob_Transformer"})
+                ["patient_id", "time_step", "horizon", "y_true", "y_prob"]
+            ].rename(columns={"y_prob": f"y_prob_{PROPOSED_MODEL}"})
         )
-        for m in CLASSIC_MODELS:
+        for m in CONTENDER_MODELS:
             x = (
                 test[m][(test[m].time_step >= lo) & ((test[m].time_step + test[m].horizon) <= hi)][
-                    ["patientkey", "time_step", "horizon", "y_prob"]
+                    ["patient_id", "time_step", "horizon", "y_prob"]
                 ].rename(columns={"y_prob": f"y_prob_{m}"})
             )
-            sub = sub.merge(x, on=["patientkey", "time_step", "horizon"], how="inner")
+            sub = sub.merge(x, on=["patient_id", "time_step", "horizon"], how="inner")
 
         if sub.empty or sub.y_true.nunique() != 2:
             print(f"[WINDOW SKIP] {split}/{hs}/{w}: empty or single-class test set")
@@ -672,31 +808,31 @@ def process(task, split, horizon, outdir):
         rec = {"Total evaluation frames": len(sub)}
         pred = {m: (sub[f"y_prob_{m}"].values >= ts[m]) for m in ALL_MODELS}
 
-        for m in CLASSIC_MODELS:
+        for m in CONTENDER_MODELS:
             disp = MODEL_DISPLAY_MAP[m]
-            tfc = pred["Transformer"] == y
+            tfc = pred[PROPOSED_MODEL] == y
             bc = pred[m] == y
             n10 = int(np.sum(tfc & ~bc))
             n01 = int(np.sum(~tfc & bc))
             try:
                 p_m = float(mcnemar([[np.sum(tfc & bc), n10], [n01, np.sum(~tfc & ~bc)]], exact=True).pvalue)
-                mcn_winner = "Tie" if p_m > 0.05 else ("TF" if n10 > n01 else disp)
+                mcn_winner = "Tie" if p_m > 0.05 else (PROPOSED_DISP if n10 > n01 else disp)
             except Exception:
                 p_m = np.nan
                 mcn_winner = "NaN"
 
             p_pr = float(paired_bootstrap_pr_auc_pvalue(
-                y_true=y, p_tf=sub.y_prob_Transformer.values, p_base=sub[f"y_prob_{m}"].values,
+                y_true=y, p_tf=sub[f"y_prob_{PROPOSED_MODEL}"].values, p_base=sub[f"y_prob_{m}"].values,
                 n_bootstraps=N_BOOTSTRAP,
             ))
-            tfpr = average_precision_score(y, sub.y_prob_Transformer) if np.unique(y).size == 2 else 0.0
+            tfpr = average_precision_score(y, sub[f"y_prob_{PROPOSED_MODEL}"]) if np.unique(y).size == 2 else 0.0
             bpr = average_precision_score(y, sub[f"y_prob_{m}"]) if np.unique(y).size == 2 else 0.0
-            pr_winner = "NaN" if pd.isna(p_pr) else ("Tie" if p_pr > 0.05 else ("TF" if tfpr > bpr else disp))
+            pr_winner = "NaN" if pd.isna(p_pr) else ("Tie" if p_pr > 0.05 else (PROPOSED_DISP if tfpr > bpr else disp))
 
-            rec[f"TF vs {disp}"] = ""
+            rec[f"{PROPOSED_DISP} vs {disp}"] = ""
             rec[f"  Threshold-free PR-AUC p-value ({disp})"] = f"{p_pr:.3e}" if not pd.isna(p_pr) else "NaN"
             rec[f"  PR-AUC winner ({disp})"] = pr_winner
-            rec[f"  Discordant pairs (TF correct) ({disp})"] = n10
+            rec[f"  Discordant pairs ({PROPOSED_DISP} correct) ({disp})"] = n10
             rec[f"  Discordant pairs ({disp} correct) ({disp})"] = n01
             rec[f"  McNemar p-value ({disp})"] = f"{p_m:.3e}" if not pd.isna(p_m) else "NaN"
             rec[f"  McNemar winner ({disp})"] = mcn_winner
@@ -743,7 +879,7 @@ def process(task, split, horizon, outdir):
 
     # Store FDR-corrected winner tokens directly in the cache payload for plotting.
     for w_name in CLINICAL_WINDOWS:
-        for m in CLASSIC_MODELS:
+        for m in CONTENDER_MODELS:
             disp = MODEL_DISPLAY_MAP[m]
             payload[f"{w_name}_{disp}_PR-AUC_winner"] = winners.get(w_name, {}).get(disp, {}).get("PR-AUC", {}).get("winner", "Tie")
             payload[f"{w_name}_{disp}_McNemar_winner"] = winners.get(w_name, {}).get(disp, {}).get("McNemar", {}).get("winner", "Tie")
@@ -761,9 +897,9 @@ def process(task, split, horizon, outdir):
     return cache, df_main
 
 
-# ==========================================
-# Visualization Functions
-# ==========================================
+# ================================================================================
+# Visualization functions
+# ================================================================================
 
 def render_bars(task, horizon, outdir, hs, csv_summaries_in_memory=None):
     """Render grouped bar charts (rows 1-4) + statistical test matrix rows (5-6),
@@ -818,7 +954,7 @@ def render_bars(task, horizon, outdir, hs, csv_summaries_in_memory=None):
             split_title = split.replace("_", " ").capitalize()
             x_group_centers = np.arange(n_windows)
             n_models = len(MODEL_PLOT_ORDER)
-            bar_width = 0.20
+            bar_width = min(0.20, 0.8 / max(n_models, 1))
             offsets = (np.arange(n_models) - (n_models - 1) / 2.0) * bar_width
             
             cache_dict = npz_data_by_split.get(split, {})
@@ -895,8 +1031,11 @@ def render_bars(task, horizon, outdir, hs, csv_summaries_in_memory=None):
                 ax.tick_params(axis="x", length=6, width=1.0)
 
     test_rows_info = [("PR-AUC test", "PR-AUC"), ("McNemar test", "McNemar")]
-    sub_baselines = ["LR", "RF", "XGB"]
-    y_positions = [0.65, 0.0, -0.65]
+    sub_baselines = [MODEL_DISPLAY_MAP[m] for m in CONTENDER_MODELS]
+    if len(sub_baselines) <= 1:
+        y_positions = [0.0]
+    else:
+        y_positions = list(np.linspace(0.65, -0.65, len(sub_baselines)))
 
     for test_idx, (test_row_label, test_type_key) in enumerate(test_rows_info):
         ax_row = n_metrics + test_idx
@@ -908,7 +1047,7 @@ def render_bars(task, horizon, outdir, hs, csv_summaries_in_memory=None):
             ax.set_ylim([-1.1, 1.1])
             
             ax.set_yticks(y_positions)
-            ax.set_yticklabels(["", "", ""])
+            ax.set_yticklabels([""] * len(y_positions))
             
             if s_idx == 0:
                 ax.set_ylabel(test_row_label, fontsize=26, fontweight="bold", labelpad=22)
@@ -936,7 +1075,7 @@ def render_bars(task, horizon, outdir, hs, csv_summaries_in_memory=None):
             for w_idx, window_name in enumerate(window_keys):
                 for b_idx, base_disp in enumerate(sub_baselines):
                     winner_token = None
-                    row_key_unique = f"  TF vs {base_disp} ({test_type_key})"
+                    row_key_unique = f"  {PROPOSED_DISP} vs {base_disp} ({test_type_key})"
                     col_match = None
                     if not df_summary.empty:
                         w_prefix = window_name.split("\n")[0].strip()
@@ -948,13 +1087,13 @@ def render_bars(task, horizon, outdir, hs, csv_summaries_in_memory=None):
                         cell_val = str(df_summary.loc[row_key_unique, col_match]).strip()
                         if "(" in cell_val:
                             winner_token = cell_val.split("(")[0].strip()
-                        elif cell_val in {"TF", "LR", "RF", "XGB", "Tie"}:
+                        elif cell_val in ALL_ABBREVS | {"Tie"}:
                             winner_token = cell_val
                     if not winner_token:
                         cache_key = f"{window_name}_{base_disp}_{test_type_key}_winner"
                         winner_token = str(cache_dict.get(cache_key, "Tie"))
 
-                    if winner_token == "TF":
+                    if winner_token == PROPOSED_DISP:
                         face_c, edge_c, alpha_v = "#d62728", "#8b0000", 0.85
                     elif winner_token in sub_baselines:
                         full_name = BASELINE_FULL_NAME_MAP.get(winner_token, winner_token)
@@ -1001,7 +1140,7 @@ def render_curves(cache, outdir, hs):
     fig_dca, axes_dca = plt.subplots(n_windows, n_splits, figsize=(7.5 * n_splits, 4.5 * n_windows), squeeze=False)
 
     for w_idx, window_name in enumerate(CLINICAL_WINDOWS):
-        # 1. Determine the exact maximum prevalence across splits (no arbitrary minimum floor)
+        # Determine the exact maximum prevalence across splits (no arbitrary minimum floor)
         prevalences = []
         for split in SPLIT_TYPES:
             if split in cache and window_name in cache[split]:
@@ -1011,7 +1150,7 @@ def render_curves(cache, outdir, hs):
 
         max_prev = max(prevalences) if prevalences else 0.01
 
-        # 2. Tight bounds mapping: allows slight undershoot or tight fit rather than overshooting
+        # Tight bounds mapping: allows slight undershoot or tight fit rather than overshooting
         # Target:
         # peak ~0.015 -> max 0.02 (step 0.01)
         # peak ~0.025 -> max 0.03 (step 0.01)
@@ -1197,9 +1336,9 @@ def render_curves(cache, outdir, hs):
     plt.close(fig_dca)
     
     
-# ==========================================
-# Pipeline Orchestration
-# ==========================================
+# ================================================================================
+# Pipeline orchestration
+# ================================================================================
 
 def pipeline(task, horizon):
     """Execute evaluation and visualization pipeline for a given task and horizon."""
@@ -1245,8 +1384,9 @@ def pipeline(task, horizon):
 
 
 if __name__ == "__main__":
-    all_prevalences = []
 
+    # Run the evaluation and visualization pipeline for all tasks and horizons
+    all_prevalences = []
     for task in TASKS:
         for horizon in ["combined", *TARGET_HORIZONS]:
             records = pipeline(task, horizon)

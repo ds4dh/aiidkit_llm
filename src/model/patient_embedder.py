@@ -117,7 +117,8 @@ class PatientEmbeddingModelFactory:
     def _get_model_class(task: str):
         if task == "masked": return AutoModelForMaskedLM
         if task == "classification": return AutoModelForSequenceClassification
-        raise ValueError("Task must be 'masked' or 'classification'")
+        if task == "survival": return AutoModelForSequenceClassification  # 1 logit = log hazard ratio
+        raise ValueError("Task must be 'masked', 'classification' or 'survival'")
 
     @staticmethod
     def _patch_model(model, custom_embed, config_dict):
@@ -139,14 +140,38 @@ class PatientEmbeddingModelFactory:
             if is_monotonic and is_multilabel and hasattr(outputs, "logits"):
                 raw_logits = outputs.logits
                 if raw_logits.shape[-1] > 1:  # only if we have more than one horizon
-                    monotonic_logits = [raw_logits[:, 0]]
-                    for i in range(1, raw_logits.shape[-1]):
-                        
-                        # Force the next horizon's logit to be strictly greater than the previous
-                        next_logit = monotonic_logits[-1] + torch.nn.functional.softplus(raw_logits[:, i])
-                        monotonic_logits.append(next_logit)
-                    
-                    outputs.logits = torch.stack(monotonic_logits, dim=1)
+                    # 'enforce_monotonicity' may be True (all columns form ONE
+                    # horizon-ordered group, classic single-task run) or a list
+                    # of group sizes for multi-task runs: each task's horizon
+                    # block is monotonic on its own (columns are task-major
+                    # ordered: [t1_h1, t1_h2, ..., t2_h1, t2_h2, ...]).
+                    if isinstance(is_monotonic, (list, tuple)):
+                        group_sizes = [int(g) for g in is_monotonic]
+                        if sum(group_sizes) != raw_logits.shape[-1]:
+                            raise ValueError(
+                                f"enforce_monotonicity groups {group_sizes} do not cover "
+                                f"{raw_logits.shape[-1]} output columns"
+                            )
+                    else:
+                        group_sizes = [raw_logits.shape[-1]]
+
+                    chunks, start = [], 0
+                    for size in group_sizes:
+                        group = raw_logits[:, start:start + size]
+                        start += size
+                        if size <= 1:
+                            chunks.append(group)
+                            continue
+                        # Force the next horizon's logit to be strictly greater
+                        # than the previous one WITHIN the group
+                        monotonic_logits = [group[:, 0]]
+                        for i in range(1, size):
+                            monotonic_logits.append(
+                                monotonic_logits[-1] + torch.nn.functional.softplus(group[:, i])
+                            )
+                        chunks.append(torch.stack(monotonic_logits, dim=1))
+
+                    outputs.logits = torch.cat(chunks, dim=1)
             
             # Remove hidden states from output to save memory if not needed
             if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
@@ -720,3 +745,27 @@ class PatientDataCollatorForClassification(PatientDataCollatorForMaskedLanguageM
         batch.update(non_features)  # in case useful somewhere
 
         return batch
+
+
+@dataclass
+class PatientDataCollatorForSurvival(PatientDataCollatorForClassification):
+    """
+    Data collator for survival fine-tuning (Cox proportional hazards).
+
+    Instead of one binary label per horizon, each patient provides a pair of
+    survival labels (already present in the raw datasets as
+    `label_{outcome}_time` and `label_{outcome}_status`). The collator stacks
+    them into a [batch, 2] label tensor with columns (time, status), matching
+    the target format expected by `CoxNLLLoss`.
+    """
+    time_label: str | None = None    # e.g. "label_infection_bacteria_time"
+    status_label: str | None = None  # e.g. "label_infection_bacteria_status"
+
+    def __post_init__(self):
+        if self.time_label is None or self.status_label is None:
+            raise ValueError(
+                "PatientDataCollatorForSurvival requires 'time_label' and 'status_label'."
+            )
+        # The parent collator pops label keys in order -> labels = [time, status]
+        self.label_keys = [self.time_label, self.status_label]
+        super().__post_init__()

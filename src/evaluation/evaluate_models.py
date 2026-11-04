@@ -396,6 +396,23 @@ class DiscriminativeEmbeddingEvaluatorForMaskedLanguageModelling:
         return metrics
 
 
+def _grouped_cummax(probs: np.ndarray, group_sizes: list[int] | None) -> np.ndarray:
+    """np.maximum.accumulate along the column axis, within contiguous column groups.
+
+    group_sizes=None -> one global group (classic single-task horizon ordering).
+    Otherwise each contiguous block of columns (one task's horizon slice in a
+    multi-task run) is made monotonic independently.
+    """
+    if not group_sizes or sum(group_sizes) != probs.shape[1]:
+        return np.maximum.accumulate(probs, axis=1)
+    out = np.empty_like(probs)
+    start = 0
+    for size in group_sizes:
+        out[:, start:start + size] = np.maximum.accumulate(probs[:, start:start + size], axis=1)
+        start += size
+    return out
+
+
 class BaseEmbeddingEvaluatorForClassification:
     def __init__(
         self,
@@ -405,12 +422,26 @@ class BaseEmbeddingEvaluatorForClassification:
         label_names: list[str] = None,
         early_stopping_metric: str = "roc_auc",
         enforce_monotonicity: bool = False,
+        monotonic_groups: list[int] | None = None,
+        early_stopping_subset: list[str] | None = None,
+        early_stopping_mean: str = "harmonic",
     ):
         self.do_clustering = do_clustering
         self.max_clustered_samples = max_clustered_samples
         self.label_names = label_names
         self.early_stopping_metric = early_stopping_metric
         self.enforce_monotonicity = enforce_monotonicity
+        # Contiguous column-group sizes for monotonicity (multi-task runs pass
+        # one group per task; None = all columns form a single horizon chain).
+        self.monotonic_groups = monotonic_groups
+        # Heads contributing to the early-stopping/checkpoint-selection score.
+        # None = every valid head votes (default, classic single-task runs).
+        # Multi-task runs can restrict the vote to reliable task keys (all heads
+        # are still COMPUTED and reported as metrics regardless).
+        self.early_stopping_subset = early_stopping_subset
+        # Aggregation across the voting heads: 'harmonic' (default, punishes the
+        # weakest head), 'mean' (arithmetic) or 'geometric'.
+        self.early_stopping_mean = early_stopping_mean
         self.current_prefix = "eval"
         self.calibrators = None
         self.saved_labels_and_probs = None
@@ -419,6 +450,26 @@ class BaseEmbeddingEvaluatorForClassification:
 
     def prepare_predictions(self, eval_preds: EvalPrediction) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
         raise NotImplementedError
+
+    def _in_early_stopping_subset(self, label_name: str) -> bool:
+        """Whether the head named `label_name` votes on the early-stopping metric.
+
+        Label names follow the 'label_{task}_{H:04d}d' convention; a task must
+        match the FULL task segment (so task 'infection' does not accidentally
+        match heads of 'infection_bacteria'). Unnamed fallback columns
+        ('lbl0') always vote.
+        """
+        if not self.early_stopping_subset:
+            return True
+        if not label_name.startswith("label_"):
+            return True
+        for t in self.early_stopping_subset:
+            prefix = f"label_{t}_"
+            rest = label_name[len(prefix):]
+            if label_name.startswith(prefix) and len(rest) == 5 \
+                    and rest[:4].isdigit() and rest[4] == "d":
+                return True
+        return False
 
     def __call__(self, eval_preds: EvalPrediction) -> dict[str, float]:
         """
@@ -433,7 +484,7 @@ class BaseEmbeddingEvaluatorForClassification:
         probs = expit(logits)  # sigmoid is valid for both binary (1 col) and multi-label
         probs_cal = self._apply_calibration_strategy(labels, probs)
         if self.enforce_monotonicity and num_labels > 1:
-            probs_cal = np.maximum.accumulate(probs_cal, axis=1)
+            probs_cal = _grouped_cummax(probs_cal, self.monotonic_groups)
             
         # Expose arrays for saving (useful for the final test)
         self.saved_labels_and_probs = {
@@ -466,16 +517,23 @@ class BaseEmbeddingEvaluatorForClassification:
             sub_metrics = self._compute_single_label_metrics(y_true, y_prob, y_cal)
             metrics.update({f"{k}_{name}": v for k, v in sub_metrics.items()})
             
-            # Record valid early stopping metrics
-            if sub_metrics[self.early_stopping_metric] != -1.0:
+            # Record valid early stopping metrics (optionally restricted to the
+            # heads of the early_stopping_subset tasks; every head is still
+            # reported as a metric regardless of the vote)
+            if sub_metrics[self.early_stopping_metric] != -1.0 \
+                    and self._in_early_stopping_subset(name):
                 valid_early_stopping_metric.append(sub_metrics[self.early_stopping_metric])
 
-        # Compute macro-average early stopping metric
+        # Aggregate the early-stopping score across the voting heads
         if valid_early_stopping_metric:
-            valid_early_stopping_metric = np.array(valid_early_stopping_metric) + 1e-6
-            # metrics["early_stopping_metric"] = np.mean(valid_early_stopping_metric)
-            metrics["early_stopping_metric"] = hmean(valid_early_stopping_metric)
-            # metrics["early_stopping_metric"] = gmean(valid_early_stopping_metric)
+            vals = np.array(valid_early_stopping_metric) + 1e-6
+            kind = (self.early_stopping_mean or "harmonic").lower()
+            if kind in ("mean", "arithmetic"):
+                metrics["early_stopping_metric"] = float(np.mean(vals))
+            elif kind == "geometric":
+                metrics["early_stopping_metric"] = float(gmean(vals))
+            else:  # 'harmonic' (default): most conservative, punishes the worst head
+                metrics["early_stopping_metric"] = float(hmean(vals))
         else:
             metrics["early_stopping_metric"] = 0.0  # fallback if nothing valid
 
@@ -834,6 +892,219 @@ class DiscriminativeEmbeddingEvaluatorForClassification(BaseEmbeddingEvaluatorFo
 
         labels = eval_preds.label_ids
         return logits, labels, embeddings
+
+
+class DiscriminativeEmbeddingEvaluatorForSurvival(DiscriminativeEmbeddingEvaluatorForClassification):
+    """
+    Evaluator for the survival fine-tuning task (Cox proportional hazards).
+
+    The model outputs a single log-hazard-ratio per patient. This evaluator:
+        - computes Harrell's C-index on (time, status) labels,
+        - estimates a Breslow baseline survival on the evaluation cohort to
+          convert risk scores into predicted survival probabilities S(h|x)
+          at the configured reporting horizons,
+        - binarizes survival labels at those horizons to report AUROC / AP /
+          IPCW-Brier, directly comparable with the binary classifiers,
+        - exposes (labels=[B,K], probs=[B,K]) arrays so the final test pass
+          saves the same JSON/NPZ structure as the classification pipeline.
+    """
+
+    def __init__(
+        self,
+        horizons: list[int],
+        early_stopping_metric: str = "cindex",
+        **kwargs,
+    ):
+        kwargs["do_clustering"] = False  # keep evaluation lightweight
+        super().__init__(early_stopping_metric=early_stopping_metric, **kwargs)
+        self.horizons = sorted(int(h) for h in horizons)
+        self.current_prefix = "eval"
+        self.saved_labels_and_probs = None
+        # When True, scoring passes reuse the Breslow baseline previously
+        # fitted on the matching VALIDATION segment instead of refitting on
+        # the scored cohort (used for the final test pass so that absolute
+        # probabilities never depend on test-set outcomes).
+        self.freeze_baseline_for_test = False
+        self.fitted_baselines: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
+    def _baseline_for_cohort(
+        self,
+        times: np.ndarray,
+        statuses: np.ndarray,
+        risk: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return (event_times, cumulative_baseline_hazard) for this scoring pass.
+
+        Baselines are stratified per scoring cohort (one pass per FUP segment),
+        so each landmark keeps its own event clock (early FUPs have their own
+        high early hazard, late FUPs theirs). For the final test pass
+        (freeze_baseline_for_test=True) the baseline fitted on the matching
+        validation segment is reused: the probability scale then depends only
+        on validation data, exactly like the downstream Platt calibration and
+        the recall-target thresholds.
+        """
+        from src.evaluation.survival_metrics import breslow_baseline
+
+        if self.freeze_baseline_for_test:
+            frozen = self._lookup_frozen_baseline(self.current_prefix)
+            if frozen is not None:
+                return frozen
+        event_times, baseline_hazard = breslow_baseline(times, statuses, risk)
+        self.fitted_baselines[self.current_prefix] = (event_times, baseline_hazard)
+        return event_times, baseline_hazard
+
+    def _lookup_frozen_baseline(self, prefix: str):
+        """Find the validation baseline for a test scoring pass.
+
+        Prefixes look like 'test_fup_0030' / 'validation_fup_0030' / 'test_all'.
+        Preference: exact validation counterpart -> nearest FUP segment
+        (handles test-only FUPs) -> the validation 'all' mega pass -> None
+        (falls back to fitting on the scored cohort).
+        """
+        import re
+
+        candidates = {k: v for k, v in self.fitted_baselines.items() if k.startswith("validation")}
+        if not candidates:
+            return None
+        counterpart = prefix.replace("test", "validation", 1)
+        if counterpart in candidates:
+            return candidates[counterpart]
+        m = re.search(r"fup_(\d+)", prefix)
+        if m:
+            target = int(m.group(1))
+            scored = sorted(
+                (abs(int(mm.group(1)) - target), k)
+                for k in candidates
+                if (mm := re.search(r"fup_(\d+)", k))
+            )
+            if scored:
+                return candidates[scored[0][1]]
+        return candidates.get("validation_all")
+
+    def __call__(self, eval_preds: EvalPrediction) -> dict[str, float]:
+        from src.data.survival_labels import binarize_survival_labels
+        from src.evaluation.survival_metrics import (
+            breslow_baseline, survival_matrix_from_baseline,
+            ipcw_brier_scores, concordance_index,
+        )
+
+        # Unpack model outputs: risk = log hazard ratio
+        logits, labels, embeddings = self.prepare_predictions(eval_preds)
+        risk = logits.reshape(logits.shape[0], -1)[:, 0].astype(np.float64)
+        if labels.ndim == 1 or labels.shape[1] < 2:
+            raise ValueError("Survival labels must contain (time, status) columns")
+        times = labels[:, 0].astype(np.float64)
+        statuses = labels[:, 1].astype(np.int64)
+        valid = (times != -100) & (statuses != -100)
+        times, statuses, risk = times[valid], statuses[valid], risk[valid]
+
+        metrics: dict[str, float] = {}
+        if len(times) == 0 or np.unique(statuses).size == 0:
+            metrics["cindex"] = 0.0
+            metrics["early_stopping_metric"] = 0.0
+            return metrics
+
+        # 1) Concordance (discrimination, horizon-free)
+        cindex = concordance_index(times, statuses, risk)
+        metrics["cindex"] = 0.0 if np.isnan(cindex) else float(cindex)
+
+        # 2) Baseline survival -> S(h|x) at reporting horizons (per-FUP
+        #    stratified; frozen to the validation-fitted baseline on test)
+        event_times, baseline_hazard = self._baseline_for_cohort(times, statuses, risk)
+        surv = survival_matrix_from_baseline(event_times, baseline_hazard, risk, self.horizons)
+        risk_probs = np.clip(1.0 - surv, 0.0, 1.0)  # P(event within horizon h)
+
+        # 2b) Predicted median time to event per patient: smallest t with
+        #     S(t|x) <= 0.5, i.e. H0(t) >= ln(2)/exp(r); NaN if never reached
+        #     within the observed baseline follow-up window.
+        if len(event_times) > 0 and len(baseline_hazard) > 0:
+            target_h0 = np.log(2.0) / np.exp(np.clip(risk, -30, 30))
+            med_idx = np.searchsorted(baseline_hazard, target_h0, side="left")
+            median_times = np.where(
+                med_idx < len(event_times),
+                event_times[np.clip(med_idx, 0, len(event_times) - 1)],
+                np.nan,
+            )
+        else:
+            median_times = np.full(len(risk), np.nan)
+
+        # 3) Horizon-wise binary metrics (comparable with binary classifiers)
+        binary_labels = np.stack(
+            [binarize_survival_labels(times, statuses, h) for h in self.horizons], axis=1
+        )
+        briers = ipcw_brier_scores(times, statuses, surv, self.horizons)
+        for k, h in enumerate(self.horizons):
+            y_true = binary_labels[:, k]
+            y_prob = risk_probs[:, k]
+            mask = y_true != -100
+            h_str = f"{h:04d}d"
+            if mask.sum() > 0 and len(np.unique(y_true[mask])) >= 2:
+                metrics[f"roc_auc_{h_str}"] = float(roc_auc_score(y_true[mask], y_prob[mask]))
+                metrics[f"pr_auc_{h_str}"] = float(average_precision_score(y_true[mask], y_prob[mask]))
+            else:
+                metrics[f"roc_auc_{h_str}"] = -1.0
+                metrics[f"pr_auc_{h_str}"] = -1.0
+            metrics[f"ipcw_brier_{h_str}"] = float(briers[k])
+
+        # 4) Early-stopping metric
+        if self.early_stopping_metric == "cindex":
+            metrics["early_stopping_metric"] = metrics["cindex"]
+        else:
+            vals = [
+                metrics[f"{self.early_stopping_metric}_{h:04d}d"]
+                for h in self.horizons
+                if metrics.get(f"{self.early_stopping_metric}_{h:04d}d", -1.0) > 0.0
+            ]
+            metrics["early_stopping_metric"] = float(np.mean(vals)) if vals else 0.0
+
+        # 5) Expose arrays for the final test pass (the tidy predictions CSV
+        #    keeps: horizon-binarized labels, predicted event probabilities,
+        #    and the raw survival ground truth / model outputs per row)
+        self.saved_labels_and_probs = {
+            "labels": binary_labels,
+            "probs": risk_probs,
+            "times": times,
+            "statuses": statuses,
+            "risks": risk,
+            "median_times": median_times,
+            "horizons": np.asarray(self.horizons),
+        }
+
+        # 6) WandB plots: KM curves by risk tertile
+        if wandb.run is not None:
+            try:
+                wandb.log(
+                    {f"{self.current_prefix}/km_risk_tertiles": self._plot_km_tertiles(times, statuses, risk)},
+                    commit=False,
+                )
+            except Exception as e:
+                print(f"Survival KM plot logging error: {e}")
+
+        return metrics
+
+    @staticmethod
+    def _plot_km_tertiles(times, statuses, risk):
+        """Kaplan-Meier survival curves stratified by predicted-risk tertiles."""
+        from lifelines import KaplanMeierFitter
+        q33, q66 = np.quantile(risk, [1 / 3, 2 / 3])
+        strata = np.select([risk <= q33, risk <= q66], ["Low risk", "Mid risk"], default="High risk")
+        fig = go.Figure()
+        for name in ["Low risk", "Mid risk", "High risk"]:
+            m = strata == name
+            if m.sum() == 0:
+                continue
+            kmf = KaplanMeierFitter().fit(times[m], statuses[m], label=f"{name} (n={int(m.sum())})")
+            sf = kmf.survival_function_
+            fig.add_trace(go.Scatter(
+                x=sf.index, y=sf.iloc[:, 0], mode="steps",
+                name=name, line=dict(shape="hv"),
+            ))
+        fig.update_layout(
+            title="Survival by predicted-risk tertile",
+            xaxis_title="Days since observation point", yaxis_title="Survival probability",
+            width=700, height=500,
+        )
+        return fig
 
 
 class GenerativeEmbeddingEvaluatorForClassification(BaseEmbeddingEvaluatorForClassification):

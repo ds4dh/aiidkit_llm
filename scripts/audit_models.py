@@ -6,7 +6,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, precision_recall_curve
 from scipy.stats import norm
-from datasets import load_from_disk
 
 from scripts.script_utils import calibrate_dataframe_pair
 
@@ -15,122 +14,52 @@ from scripts.script_utils import calibrate_dataframe_pair
 # Paths & Settings Defaults
 # ==========================================
 BASE_DATA_PATH = Path("/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6_old/teav")
-RESULTS_DIR = Path("results_final")
+RESULTS_DIR = Path("results")
 OUTPUT_IMAGE = Path("./tmp/conf_mats.png")
 
 
 # ==========================================
 # Data Loading Functions (Single Step)
 # ==========================================
-def load_transformer_step(task, split, dataset_split, horizon, time_step):
-    """Load Transformer predictions for a single follow-up time step."""
-    fname = "validation_probs.npz" if dataset_split == "validation" else "test_probs.npz"
-    root = RESULTS_DIR / "transformer" / split / "e00-a15-v60" / "finetuning" / task
+def _load_step_from_csv(root: Path, dataset_split: str, horizon: int, time_step: int) -> pd.DataFrame:
+    """
+    Reads one (horizon, fup) slice from a run's tidy '{dataset_split}_predictions.csv'
+    (written by the training scripts) into the audit schema:
+        patient_id, time_step, horizon, y_true, y_prob
+    """
     if not root.exists():
         return pd.DataFrame()
-
-    found = None
-    for d in root.iterdir():
-        m = re.search(r"hrz\(([\d-]+)\)", d.name)
-        if d.is_dir() and m and horizon in [int(v) for v in m.group(1).split("-")]:
-            hs = [int(v) for v in m.group(1).split("-")]
-            found = (d, hs.index(horizon), hs)
-            break
-
-    if found is None or not (found[0] / fname).exists():
-        return pd.DataFrame()
-
-    d, target_idx, hs = found
-    z = np.load(d / fname, allow_pickle=True)
-    pref = "validation_" if dataset_split == "validation" else "test_"
-    lbl_key = f"{pref}fup_{time_step:04d}_labels"
-    prob_key = f"{pref}fup_{time_step:04d}_probs"
-
-    if lbl_key not in z.files or prob_key not in z.files:
-        return pd.DataFrame()
-
-    labels = z[lbl_key]
-    probs = z[prob_key]
-    y = labels if labels.ndim == 1 else labels[:, target_idx]
-    p = probs if probs.ndim == 1 else probs[:, target_idx]
-
-    dsdir = BASE_DATA_PATH / split / f"fup_{time_step:04d}"
-    if not dsdir.exists():
-        dsdir = BASE_DATA_PATH / split / f"fup_{time_step:04d}d"
-    if not dsdir.exists():
-        return pd.DataFrame()
-
-    ds = load_from_disk(str(dsdir))[dataset_split]
-    keys = ds["patientkey"]
-    cols = [f"label_{task}_{h:04d}d" for h in hs if f"label_{task}_{h:04d}d" in ds.column_names]
-    keep = (
-        (np.stack([ds[c] for c in cols], 1) != -100).any(1)
-        if cols else np.ones(len(keys), bool)
+    fname = f"{dataset_split}_predictions.csv"
+    run_dir = next(
+        (x for x in sorted(root.iterdir())
+         if x.is_dir() and f"hrz({horizon:04d})" in x.name and (x / fname).exists()),
+        None,
     )
-    valid = np.where(keep)[0]
+    if run_dir is None:
+        return pd.DataFrame()
+    df = pd.read_csv(run_dir / fname)
+    df = df[(df["horizon"] == horizon) & (df["fup"] == time_step)]
+    if df.empty:
+        return pd.DataFrame()
+    return pd.DataFrame({
+        "patient_id": df["patient_id"].astype(str),
+        "time_step": df["fup"].astype(int),
+        "horizon": df["horizon"].astype(int),
+        "y_true": df["label"].astype(int),
+        "y_prob": df["prob"].astype(float),
+    }).reset_index(drop=True)
 
-    records = []
-    for i in range(min(len(valid), len(y), len(p))):
-        if int(y[i]) != -100:
-            records.append({
-                "patientkey": keys[valid[i]],
-                "time_step": time_step,
-                "horizon": horizon,
-                "y_true": int(y[i]),
-                "y_prob": float(p[i]),
-            })
-    return pd.DataFrame(records)
+
+def load_transformer_step(task, split, dataset_split, horizon, time_step):
+    """Load Transformer predictions for a single follow-up time step (tidy CSV)."""
+    root = RESULTS_DIR / "transformer" / split / "e00-a15-v60" / "finetuning" / task
+    return _load_step_from_csv(root, dataset_split, horizon, time_step)
 
 
 def load_classic_step(model, task, split, dataset_split, horizon, time_step):
-    """Load classic ML predictions for a single follow-up time step."""
-    fname = "val_predictions.npz" if dataset_split == "validation" else "test_predictions.npz"
+    """Load classic ML predictions for a single follow-up time step (tidy CSV)."""
     root = RESULTS_DIR / "classic_ml" / split / model / task
-    if not root.exists():
-        return pd.DataFrame()
-
-    d = next(
-        (x for x in root.iterdir() if x.is_dir() and f"hrz({horizon:04d})" in x.name),
-        None,
-    )
-    if d is None or not (d / fname).exists():
-        return pd.DataFrame()
-
-    z = np.load(d / fname, allow_pickle=True)
-    pref = "validation_" if dataset_split == "validation" else "test_"
-    lbl_key = f"{pref}fup_{time_step:04d}_labels"
-    prob_key = f"{pref}fup_{time_step:04d}_probs"
-
-    if lbl_key not in z.files or prob_key not in z.files:
-        return pd.DataFrame()
-
-    y = z[lbl_key].ravel()
-    p = z[prob_key].ravel()
-
-    dsdir = BASE_DATA_PATH / split / f"fup_{time_step:04d}"
-    if not dsdir.exists():
-        dsdir = BASE_DATA_PATH / split / f"fup_{time_step:04d}d"
-    if not dsdir.exists():
-        return pd.DataFrame()
-
-    ds = load_from_disk(str(dsdir))[dataset_split]
-    keys = ds["patientkey"]
-    col = f"label_{task}_{horizon:04d}d"
-    valid = np.where(
-        np.asarray(ds[col]) != -100 if col in ds.column_names else np.ones(len(keys), bool)
-    )[0]
-
-    records = []
-    for i in range(min(len(valid), len(y), len(p))):
-        if int(y[i]) != -100:
-            records.append({
-                "patientkey": keys[valid[i]],
-                "time_step": time_step,
-                "horizon": horizon,
-                "y_true": int(y[i]),
-                "y_prob": float(p[i]),
-            })
-    return pd.DataFrame(records)
+    return _load_step_from_csv(root, dataset_split, horizon, time_step)
 
 
 def load_model_data(model_name, task, split, dataset_split, horizon, time_step):
@@ -195,7 +124,7 @@ def main():
         raise RuntimeError("Could not find matching prediction files for the specified parameters.")
 
     # Align common patients
-    keys = ["patientkey", "time_step", "horizon", "y_true"]
+    keys = ["patient_id", "time_step", "horizon", "y_true"]
     common_val = val_a[keys].merge(val_b[keys], on=keys, how="inner").drop_duplicates()
     val_a = val_a.merge(common_val, on=keys).sort_values(keys).reset_index(drop=True)
     val_b = val_b.merge(common_val, on=keys).sort_values(keys).reset_index(drop=True)

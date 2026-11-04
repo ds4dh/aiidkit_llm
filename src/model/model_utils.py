@@ -1,5 +1,7 @@
 import math
 import inspect
+from collections import deque
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -120,6 +122,91 @@ class EarlyStoppingCallbackWithWarmup(EarlyStoppingCallback):
 
         # If the warm-up phase is over, execute the original early stopping logic
         super().on_evaluate(args, state, control, metrics, **kwargs)
+
+
+# -------------------------------------------------------------------
+# Gradient clipping: observability + non-finite gradient guard
+# -------------------------------------------------------------------
+
+class GradientClippingGuard:
+    """
+    Mixin for HF's Trainer that makes gradient clipping observable and safe.
+
+    Context: the Trainer logs the *pre-clip* total gradient norm and clips to
+    `args.max_grad_norm` (1.0 by default) afterwards, so logs alone cannot tell
+    a run where clipping never fires apart from one where every step is
+    rescaled by ~100x. On top of that, a single bf16 overflow (total norm = inf
+    or nan) is *not* fixed by clipping: the clip coefficient itself becomes
+    nan/inf and the poisoned gradient lands in the Adam moments.
+
+    This mixin adds, with no change to the optimisation math:
+      * `clip_*` metrics on every logging step: how often the cap fired
+        (`clip_frac`), how much of the gradient survived it (`clip_ratio`, 1.0
+        when never clipped) and the pre-clip norm distribution seen in the
+        window (`grad_norm_med`, `grad_norm_max`).
+      * a guard that drops the whole gradient (p.grad = None, so AdamW leaves
+        weights *and* moments untouched for that step instead of applying stale
+        momentum) whenever the total norm is non-finite, counted as
+        `grad_skipped`. DeepSpeed/FSDP report no norm and are left untouched.
+    """
+
+    _GC_WINDOW = 1024  # optimizer steps kept for the median/max statistics
+
+    def _gc_state(self) -> dict:
+        # Lazily initialised so the mixin never has to touch __init__/MRO.
+        if not hasattr(self, "_gc"):
+            self._gc = {
+                "norms": deque(maxlen=self._GC_WINDOW),
+                "steps": 0, "clipped": 0, "skipped": 0, "ratio_sum": 0.0,
+            }
+        return self._gc
+
+    def clip_gradient(self, *args, **kwargs):
+        total_norm = super().clip_gradient(*args, **kwargs)
+        if total_norm is None:  # DeepSpeed clips on its own side
+            return total_norm
+
+        model = args[0] if args else kwargs.get("model")
+        max_norm = args[1] if len(args) > 1 else kwargs.get("max_norm", kwargs.get("norm"))
+        gc = self._gc_state()
+        gc["steps"] += 1
+        norm = float(total_norm)
+
+        if not math.isfinite(norm):
+            # Clipping cannot rescue this step: drop it instead of updating.
+            if model is not None:
+                for param in model.parameters():
+                    if param.grad is not None:
+                        param.grad = None
+            gc["skipped"] += 1
+            if getattr(self, "_grad_norm", None) is not None:
+                self._grad_norm = torch.zeros_like(self._grad_norm)  # keep device/dtype
+            print(f"[grad-guard] non-finite gradient at step {getattr(self.state, 'global_step', '?')}: update skipped")
+            return torch.zeros_like(total_norm) if torch.is_tensor(total_norm) else 0.0
+
+        gc["norms"].append(norm)
+        if max_norm and max_norm > 0 and norm > max_norm:
+            gc["clipped"] += 1
+            gc["ratio_sum"] += max_norm / norm
+        else:
+            gc["ratio_sum"] += 1.0
+        return total_norm
+
+    def log(self, logs, *args, **kwargs):
+        gc = self._gc_state()
+        if gc["steps"]:
+            norms = list(gc["norms"])
+            logs = {
+                **logs,
+                "clip_frac": round(gc["clipped"] / gc["steps"], 3),
+                "clip_ratio": round(gc["ratio_sum"] / gc["steps"], 4),
+                "grad_norm_med": round(float(np.median(norms)), 2) if norms else 0.0,
+                "grad_norm_max": round(max(norms), 2) if norms else 0.0,
+                "grad_skipped": gc["skipped"],
+            }
+            gc.update(steps=0, clipped=0, skipped=0, ratio_sum=0.0)
+            gc["norms"].clear()
+        return super().log(logs, *args, **kwargs)
 
 
 # -------------------------------------------------------------------

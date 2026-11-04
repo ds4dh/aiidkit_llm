@@ -1,0 +1,171 @@
+# Survival fine-tuning configuration (Cox proportional hazards)
+# Mirrors configs/discriminative_training.yaml, but instead of binary labels
+# per horizon, each patient provides (time, status) survival labels
+# (label_{outcome}_time / label_{outcome}_status, computed by the aiidkit
+# preprocessing repo). The model outputs a single log hazard ratio per patient.
+data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v3.9/teav
+data_split_type: temporal_split  # random_split, center_split, temporal_split
+result_dir: results/survival_transformer  # base directory name for all results
+pretrain_result_dir: results/transformer  # where the MLM pretraining checkpoint lives (set to result_dir to pretrain separately)
+data_collator:
+  eav_mappings:
+    entity_id: entity
+    attribute_id: attribute
+    value_id: value_binned
+  time_mapping:
+    days_since_tpx: time
+  mlm_label_keys:
+    - entity_id
+    - attribute_id
+    - value_id
+  mlm_masking_rules:    # must match the pre-training run to reuse its checkpoint
+    entity_id: 0.00
+    attribute_id: 0.15
+    value_id: 0.60
+
+# Configuration for survival fine-tuning tasks to run.
+# Each task is ONE endpoint outcome; 'horizons' are reporting horizons only
+# (predicted risk 1 - S(horizon), AUROC/AP/IPCW-Brier at each horizon), which
+# keeps results directly comparable with the binary classification pipeline.
+# Endpoints read straight from the v3.9 datasets (no computation in this repo):
+#   plain : infection, death, graft_loss        -> label_{task}_time / _status
+#   group : grp_{group} (21 groups)             -> label_grp_{group}_time / _status
+#           bacteria: anaerobic_bacteria, clostridium, enterobacterales,
+#                     gn_nonfermenters, gram_positive, other_bacteria,
+#                     other_gn_bacteria, other_opportunistic
+#           fungi   : aspergillus, candida, other_fungi, pneumocystis
+#           virus   : bkpyv, cmv, enteric_viruses, hepatitis_viruses,
+#                     herpes_viruses, influenza, other_resp_viruses,
+#                     other_viruses, sars_cov_2
+#   category : infection_bacteria, infection_virus, infection_fungi
+#           -> label_infection_{cat}_time / _status, ALSO stored since v3.9.
+#           The pool-the-groups fallback in src/data/survival_labels.py is dormant
+#           on v3.9 (it only fires if those columns are missing, and prints a WARN).
+# NOTE on naming: the BINARY pipeline uses 'infection_grp_{group}' for the same
+# groups (columns label_infection_grp_{group}_{H}d), while survival uses 'grp_{group}'.
+train_data_augment: all                # default: "all" (pool every fup folder into one training set; config 'fups' then only affect run names). "none" = one model per fup, "valid" = pool only the listed fups
+target_undersampling_ratio: null       # keep null for survival
+undersampling_balancing_label: status  # balance on the event-status label when undersampling
+drop_unlabeled: true                   # drop rows whose labels are all -100 (no training signal for any outcome)
+early_stopping_metric: cindex          # metric to early-stop on ("cindex" or e.g. "roc_auc"/"pr_auc" averaged over horizons)
+prediction_tasks:
+  infection_bacteria: {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
+  # infection_virus:    {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
+  # infection:          {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
+  # death:              {fups: [0, 360, 720, 1080, 1800], horizons: [360, 720, 1080, 1800]}
+  # graft_loss:         {fups: [0, 360, 720, 1080, 1800], horizons: [360, 720, 1080, 1800]}
+  # grp_cmv:            {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
+
+# Arguments for HF's trainer for the fine-tuning phase
+finetuner:
+  seed: 1234
+  ft_subdir: "finetuning"
+  logging_steps: 10
+  warmup_steps: 100
+  num_train_epochs: 10  # maximum number of epochs (loses to max_steps)
+  max_steps: 10000  # maximum number of steps (training + validation)
+  eval_strategy: steps
+  save_strategy: steps
+  eval_steps: 50
+  save_steps: 50
+  save_total_limit: 1
+  eval_accumulation_steps: 100
+  gradient_accumulation_steps: 4
+  per_device_train_batch_size: 48
+  per_device_eval_batch_size: 48
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  # Gradient clipping: HF logs the PRE-clip norm and clips to max_grad_norm
+  # afterwards, so 60-100 in the logs means every step was rescaled ~60-100x.
+  # AdamW absorbs a constant rescale but not a fluctuating one, and
+  # reduction="events" divides by the few events per micro-batch -> the gradient
+  # scale itself swings, so the cap punished low-event steps instead of outliers.
+  # The trainer now also logs clip_frac / clip_ratio / grad_norm_med.
+  max_grad_norm: 1.0  # global-norm cap, applied after gradient accumulation (0 disables)
+  adam_beta1: 0.9
+  adam_beta2: 0.98  # 0.999 -> 0.98: shorter 2nd-moment memory, spikes decay faster
+  adam_epsilon: 1.0e-6  # bf16-safe (the 1e-8 default underflows on small grads)
+  loss_name: cox  # cox -> Breslow negative log partial likelihood
+  loss_args:  # kwargs for CoxNLLLoss (popped here, never passed to TrainingArguments)
+    reduction: samples  # constant denominator -> constant gradient scale (events|samples|sum)
+    max_risk: 30.0  # clamp on shifted log hazard ratios, bounds exp() overflow
+  bf16: true
+  report_to: none
+  remove_unused_columns: false  # crucial for custom collators
+  load_best_model_at_end: true
+  metric_for_best_model: eval_all_early_stopping_metric
+  greater_is_better: true
+  early_stopping_patience: 5  # evaluations without improvement before stopping
+
+# LoRA configuration for fine-tuning
+use_lora: false  # false for full fine-tuning
+lora_config:
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.1
+  bias: "none"
+  task_type: SEQ_CLS
+  target_modules: all-linear
+
+# Embedding model (identical to the classification setup; survival only swaps
+# the loss and the label format: 1 logit = log hazard ratio)
+model:
+  model_id: answerdotai/ModernBERT-base
+  load_backbone_weights: false
+  config_args:
+    max_position_embeddings: 1024
+    output_hidden_states: true
+    classifier_pooling: mean
+    pad_token_id: 0
+    bos_token_id: 2
+    cls_token_id: 2
+    eos_token_id: 3
+    sep_token_id: 3
+    dropout_embedding: 0.0
+    dropout_attention: 0.1
+    dropout_mlp: 0.1
+    dropout_classifier: 0.1
+  model_args:
+    dtype: bfloat16
+    attn_implementation: sdpa
+  embedding_layer_config:
+    sentence_embedding_model: NeuML/pubmedbert-base-embeddings
+
+# ---------------------------------------------------------------
+# Comparison / evaluation configuration (used by
+# scripts/analysis_survival_comparison.py; ignored by train_survival.py).
+# Compares classic ML vs binary transformer vs survival transformer on the
+# SAME survival ground truth (time/status from the raw t-EAV datasets):
+# AUROC/AP @ horizon (binarized labels), IPCW-Brier/IBS, C-index stratified
+# by fup, and paired bootstrap p-values vs the reference model.
+# ---------------------------------------------------------------
+comparison:
+  dataset_split: test            # "test" or "validation"
+  output_dir: results/analysis/survival_comparison
+  # Model used as reference for the paired bootstrap tests:
+  #   transformer_survival | transformer_binary | classic_<model_type>
+  reference_model: transformer_survival
+  n_bootstrap: 1000
+  # Pre-training run id used to locate both transformer families' results
+  # (derived from mlm_masking_rules above: e/a/v masking probabilities).
+  run_id: e00-a15-v60
+  binary_transformer:
+    enabled: true
+    results_dir: results/transformer
+  survival_transformer:
+    enabled: true
+    results_dir: results/survival_transformer
+  classic_ml:
+    results_dir: results/classic_ml
+  classic_ml_models: [logistic_regression, random_forest, xgboost]
+  # Tasks to compare. Defaults to the top-level prediction_tasks; uncomment
+  # to compare more endpoints than trained (predictions are skipped when
+  # absent). 'horizons' is the shared evaluation grid: binary targets are
+  # derived by binarizing the survival labels at each horizon, C-index uses
+  # the largest one, and IBS integrates IPCW Brier over the full grid.
+  # prediction_tasks:
+  #   infection_bacteria: {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
+  #   infection_virus:    {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
+  # Survival ground truth is read from data_dir (same t-EAV datasets as
+  # training); set teav_root only to override that:
+  # teav_root: /home/shares/ds4dh/aiidkit_project/data_new/processed/v3.9/teav

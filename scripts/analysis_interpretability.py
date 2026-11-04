@@ -33,7 +33,9 @@ from matplotlib.offsetbox import AnchoredOffsetbox, HPacker, VPacker, TextArea, 
 from src.data.patient_dataset import load_hf_data_and_metadata
 from src.model.patient_embedder import PatientEmbeddingModelFactory, PatientDataCollatorForClassification
 from src.evaluation.evaluate_models import ModelInterpreter
-from scripts.script_utils import find_best_checkpoint, extract_horizons_from_path, get_best_optuna_run
+from scripts.script_utils import (
+    find_best_checkpoint, find_best_checkpoint_multitask, extract_horizons_from_path, get_best_optuna_run,
+)
 
 CLI_CFG = {}
 SAFE_NUM_PROC = 4
@@ -45,7 +47,7 @@ GENERATE_SANITIZE_PLOTS = False
 
 # Parse CLI arguments
 parser = argparse.ArgumentParser(description="Run Captum attribution analysis.")
-parser.add_argument("--results-dir", type=Path, default=Path("results_final"), help="Base directory for results")
+parser.add_argument("--results-dir", type=Path, default=Path("results"), help="Base directory for results")
 parser.add_argument("--data-split-type", type=str, default="temporal_split", help="Data split strategy (e.g., temporal)")
 parser.add_argument("--top-k", type=int, default=15, help="Top K features to analyze/display")
 parser.add_argument("--min-freq", type=int, default=20, help="Minimum feature frequency threshold")
@@ -54,15 +56,44 @@ parser.add_argument("--agg-method", type=str, default="mean", choices=["mean", "
 parser.add_argument("--num-samples", type=int, default=1000, help="Number of samples to analyze")
 parser.add_argument("--num-steps", type=int, default=200, help="Number of Integrated Gradients steps")
 parser.add_argument("--data-dir", "--data_dir", type=Path, default=Path(os.environ.get("TEAV_DATA_DIR", "/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6/teav")), help="Path to tEAV dataset directory")
+parser.add_argument("--proposed-model", "--proposed_model", type=str, default="transformer",
+                    help="Model analyzed by this script (the 'proposed model' shared across analysis scripts). "
+                         "Must be a transformer-family model with a binary classification checkpoint.")
+parser.add_argument("--run-id", "--run_id", type=str, default="",
+                    help="Pre-training run id subfolder (e.g. e00-a15-v60). Default: the only folder present.")
+parser.add_argument("--config", "-c", type=str, default="configs/discriminative_training.yaml",
+                    help="Training config providing model/collator settings for checkpoint loading.")
+parser.add_argument("--tasks", nargs="+", default=None,
+                    help="Outcome tasks to attribute (each gets the five clinical-window "
+                         "configs). Default: infection_bacteria. Multi-task checkpoints are "
+                         "supported: the matching (task, horizon) head is selected per task. "
+                         "E.g. --tasks infection_bacteria infection_virus infection_grp_cmv")
 args, _ = parser.parse_known_args()
 
 # Run configuration
 RESULTS_DIR = args.results_dir
 DATA_SPLIT_TYPE = args.data_split_type
-TRANSFORMER_BASE_DIR = RESULTS_DIR / "transformer"
-OUTPUT_DIR_BASE_NAME = RESULTS_DIR / "analysis" / "interpretability"
+PROPOSED_MODEL = args.proposed_model
+RUN_ID = args.run_id.strip()
+
+# Captum attribution runs directly on the model checkpoint, so only
+# transformer-family models with a binary classification head can be
+# interpreted here (classic ML contenders have no checkpoints/embeddings,
+# and the Cox survival variant uses a regression head, not wired in yet).
+INTERPRETABLE_MODELS = {
+    # model key -> (results subfolder, force multi-task head resolution)
+    "transformer": ("transformer", False),
+    "transformer_multitask": ("transformer", True),
+}
+if PROPOSED_MODEL not in INTERPRETABLE_MODELS:
+    print(f"[SKIP] Interpretability analysis supports only {sorted(INTERPRETABLE_MODELS)}; "
+          f"got proposed model '{PROPOSED_MODEL}'. Nothing to do.")
+    sys.exit(0)
+TRANSFORMER_BASE_DIR = RESULTS_DIR / INTERPRETABLE_MODELS[PROPOSED_MODEL][0]
+MULTITASK_ONLY = INTERPRETABLE_MODELS[PROPOSED_MODEL][1]
+OUTPUT_DIR_BASE_NAME = RESULTS_DIR / "analysis" / "interpretability" / PROPOSED_MODEL
 DATA_DIR = args.data_dir
-CONFIG_PATH = Path("configs/discriminative_training.yaml")
+CONFIG_PATH = Path(args.config)
 FROM_OPTUNA = "optuna" in TRANSFORMER_BASE_DIR.name
 PLOT_ONLY = False  # run downstream plots directly from cache
 MAX_LEGEND_VALUES_TO_SHOW = 5  # threshold capping distinct legend item limits
@@ -111,6 +142,23 @@ TASK_CONFIG = {
         "horizon": 30, "fup_min": 1080, "fup_max": MAX_FUP, "fup_step": 30,
     },
 }
+
+# Optional task-list override (--tasks): builds the SAME five clinical-window
+# configs for each requested outcome task, with matching output names.
+if args.tasks:
+    _WINDOWS = {
+        "perioperative": (0, 0),
+        "opportunistic": (30, 150),
+        "maintenance": (180, 330),
+        "long_term": (360, 1050),
+        "very_long_term": (1080, MAX_FUP),
+    }
+    TASK_CONFIG = {
+        f"{t.removeprefix('infection_').removeprefix('grp_') or t}_{w}": {
+            "task": t, "horizon": 30, "fup_min": lo, "fup_max": hi, "fup_step": 30,
+        }
+        for t in args.tasks for w, (lo, hi) in _WINDOWS.items()
+    }
 
 # Medications
 MED_ROLES = {
@@ -266,6 +314,10 @@ def main():
             if FROM_OPTUNA:
                 trial_name, pt_config = get_best_optuna_run(TRANSFORMER_BASE_DIR, DATA_SPLIT_TYPE, task_key)
                 base_dir_for_ckpt = TRANSFORMER_BASE_DIR / DATA_SPLIT_TYPE / task_key / trial_name / DATA_SPLIT_TYPE / pt_config
+            elif RUN_ID:
+                base_dir_for_ckpt = TRANSFORMER_BASE_DIR / DATA_SPLIT_TYPE / RUN_ID
+                if not base_dir_for_ckpt.is_dir():
+                    raise FileNotFoundError(f"Run-id folder not found: {base_dir_for_ckpt}")
             else:
                 [base_dir_for_ckpt] = (d for d in (TRANSFORMER_BASE_DIR / DATA_SPLIT_TYPE).iterdir() if d.is_dir())
         except Exception as e:
@@ -273,20 +325,42 @@ def main():
             continue 
         
         try:
-            checkpoint_path = find_best_checkpoint(base_dir_for_ckpt, task_key, hrz)
-            print(f"\n>>> Using Checkpoint: {checkpoint_path}")
+            try:
+                if MULTITASK_ONLY:
+                    # Always address the shared multi-task checkpoint (a task may
+                    # ALSO have an older single-task run on disk).
+                    checkpoint_path, run_meta = find_best_checkpoint_multitask(base_dir_for_ckpt, task_key, hrz)
+                else:
+                    checkpoint_path = find_best_checkpoint(base_dir_for_ckpt, task_key, hrz)
+                    run_meta = None
+            except FileNotFoundError:
+                # Multi-task runs store a head per (task, horizon) under one
+                # alias folder (e.g. multitask_infections): locate that run and
+                # address this task through its head index instead.
+                checkpoint_path, run_meta = find_best_checkpoint_multitask(base_dir_for_ckpt, task_key, hrz)
+            print(f"\n>>> Using Checkpoint: {checkpoint_path}"
+                  + (f"  [multi-task run '{run_meta['task_key']}', head task '{task_key}']" if run_meta else ""))
         except Exception as e:
             print(f"[Error] Checkpoint error: {e}")
             continue
 
-        ckpt_hrzs = extract_horizons_from_path(checkpoint_path)
+        ckpt_hrzs = list(run_meta["horizons"]) if run_meta else extract_horizons_from_path(checkpoint_path)
         if hrz not in ckpt_hrzs:
             print(f"[Error] Requested horizon {hrz} not found in: {ckpt_hrzs}")
             continue
             
-        target_idx = ckpt_hrzs.index(hrz)
         label_key = f"label_{task_key}_{hrz:04d}d"
-        all_required_labels = [f"label_{task_key}_{h:04d}d" for h in ckpt_hrzs]
+        if run_meta:
+            if label_key not in run_meta.get("label_keys", []):
+                print(f"[Error] {label_key} is not a head of multi-task run '{run_meta['task_key']}'")
+                continue
+            # Head/column index in the multi-label output (task-major order);
+            # the collator must expose ALL heads so labels align with logits.
+            target_idx = run_meta["label_keys"].index(label_key)
+            all_required_labels = list(run_meta["label_keys"])
+        else:
+            target_idx = ckpt_hrzs.index(hrz)
+            all_required_labels = [f"label_{task_key}_{h:04d}d" for h in ckpt_hrzs]
         print(f"\n>>> Target index: {target_idx} (horizon: {hrz}d)")
 
         print("\n>>> Loading dataset...")
@@ -313,6 +387,11 @@ def main():
         model_cfg_base = config["model"].copy()
         if "model_args" not in model_cfg_base:
             model_cfg_base["model_args"] = {}
+        # Head layout (num_labels / problem_type) always comes from the
+        # checkpoint itself, never from the yaml (multi-task checkpoints have
+        # one head per (task, horizon) pair).
+        model_cfg_base["model_args"].pop("num_labels", None)
+        model_cfg_base["model_args"].pop("problem_type", None)
             
         for key in ["dtype", "torch_dtype"]:
             if isinstance(model_cfg_base["model_args"].get(key), str):

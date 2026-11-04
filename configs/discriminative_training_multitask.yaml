@@ -1,0 +1,214 @@
+# =============================================================================
+# MULTI-TASK variant: ONE fine-tuning run with a classification head per
+# (task, horizon) pair (currently 9 tasks x 3 horizons = 27 heads; see the
+# prevalence-annotated tasks list below — commented tasks stay defined and can
+# be re-enabled any time). All heads share the
+# same transformer trunk; -100 (unknown) labels are masked per head, so each
+# row only trains the heads whose outcome is knowable at that follow-up.
+# Label columns come from v3.9: label_infection_grp_{group}_{H}d (groups) and
+# label_infection_{bacteria,virus,fungi}_{H}d (general classes).
+# Launch like the single-task run, e.g.:
+#   python scripts/train_classification.py -c configs/discriminative_training_multitask.yaml
+# Results: results/transformer/<split>/<run_id>/finetuning/multitask_infections/...
+# (predictions CSV gains a 'task' column; see run_metadata.json for the layout)
+# =============================================================================
+
+# Run configuration and task (data collator) definition
+data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v3.9/teav
+data_split_type: temporal_split  # random_split, center_split, temporal_split
+result_dir: results/transformer  # base directory name for all results
+data_collator:
+  eav_mappings:
+    entity_id: entity
+    attribute_id: attribute
+    value_id: value_binned
+  time_mapping:
+    days_since_tpx: time
+  mlm_label_keys:
+    - entity_id         # mlm task must predict 'entity_id' labels
+    - attribute_id      # mlm task must predict 'attribute_id' labels
+    - value_id          # mlm task must predict 'value_id' labels
+  mlm_masking_rules:    # these numbers will set the result subdirectory name
+    entity_id: 0.00     # probability of masking an entity sub-token
+    attribute_id: 0.15  # probability of masking an entity sub-token
+    value_id: 0.60      # probability of masking an entity sub-token
+
+# Configuration for finetuning tasks to run
+train_data_augment: all           # default: "all" (pool every fup folder; 'fups' then only affect run names). "none" = one model per fup, "valid" = pool listed fups
+target_undersampling_ratio: 15.0  # maximum ("worst") ratio of positive to negative samples during finetuning (null for not using under-sampling)
+drop_unlabeled: true              # drop rows whose horizon labels are all -100 (unknown outcome; the loss masks them anyway)
+early_stopping_metric: roc_auc    # metric to use for early stopping (per label, then averaged)
+early_stopping_subset: [infection_bacteria, infection_virus]
+                                  # tasks whose heads VOTE on early stopping / checkpoint
+                                  # selection (all 27 heads are still computed and reported).
+                                  # null = every valid head votes.
+                                  # NOTE: every listed task MUST exist in the
+                                  # multitask_infections.tasks list (a task with
+                                  # no matching head raises at eval time).
+early_stopping_mean: harmonic     # aggregation over voting heads: harmonic | mean | geometric
+prediction_tasks:                 # horizon elements can be lists (multi-label) or integers / singletons (binary)
+  multitask_infections:           # 'tasks' bundles all outcomes into ONE multi-head run
+    tasks: [
+      # general classes
+      infection_bacteria,                  # 888 train / 185 val pos patients
+      infection_virus,                     # 723 / 163
+      # infection_fungi,                   # 123 /  21  -- dropped: too rare for now
+
+      # pathogen groups: bacteria
+      infection_grp_enterobacterales,      # 636 / 135
+      infection_grp_gram_positive,         # 328 /  51
+      infection_grp_gn_nonfermenters,      #  79 /  17  (borderline, clinically actionable)
+      infection_grp_clostridium,           #  64 /  12  (borderline)
+      # infection_grp_anaerobic_bacteria,  #  11 /   2  -- too rare
+      # infection_grp_other_bacteria,      # 102 /  20  -- catch-all
+      # infection_grp_other_gn_bacteria,   #  17 /   5  -- catch-all + rare
+
+      # pathogen groups: viruses
+      infection_grp_herpes_viruses,        # 235 /  57
+      infection_grp_cmv,                   # 170 /  43
+      infection_grp_bkpyv,                 # 146 /  29
+      # infection_grp_enteric_viruses,     #  40 /   8  -- too rare
+      # infection_grp_hepatitis_viruses,   #   4 /   3  -- unlearnable
+      # infection_grp_influenza,
+      # infection_grp_sars_cov_2,
+      # infection_grp_other_viruses,
+      # infection_grp_other_resp_viruses,
+
+      # pathogen groups: fungi and other opportunistic -- all dropped for now
+      # infection_grp_candida,             #  64 /  14
+      # infection_grp_aspergillus,         #  17 /   3
+      # infection_grp_pneumocystis,        #  18 /   1
+      # infection_grp_other_fungi,
+      # infection_grp_other_opportunistic,
+    ]
+    fups: [0, 30, 60, 90, 180, 360]
+    horizons: [[30, 60, 90]]
+  # Single-task examples (classic per-task runs, unchanged):
+  # infection_bacteria: {fups: [0, 30, 60, 90, 180, 360], horizons: [[30, 60, 90]]}
+  # death:              {fups: [0, 360, 720, 1080, 1800], horizons: [[360, 720, 1080, 1800]]}
+
+  # --- Variant A (example): bacteria-only multi-task run. Uncomment to make it
+  # selectable, then run WITHOUT editing via:  --tasks multitask_bacteria
+  # multitask_bacteria:
+  #   tasks: [
+  #     infection_bacteria,
+  #     infection_grp_gram_positive, infection_grp_enterobacterales,
+  #     infection_grp_gn_nonfermenters, infection_grp_clostridium,
+  #     infection_grp_anaerobic_bacteria,
+  #   ]
+  #   fups: [0, 30, 60, 90, 180, 360]
+  #   horizons: [[30, 60, 90]]
+
+  # --- Variant B (example): one pathogen group alone (single-task run, 3 heads):
+  # infection_grp_cmv: {fups: [0, 30, 60, 90, 180, 360], horizons: [[30, 60, 90]]}
+
+# Arguments for optuna run (perform both pretraining and finetuning for different hyper-parameters)
+optuna:
+  metric_to_optimize: val_all_roc_auc  # if possible, will add prediction tasks common denominator
+  num_trials: 50
+  num_trials_debug: 2
+  db_name: optuna_study.db
+  study_name: pretraining_finetuning_hp_optimization
+
+# Arguments for HF's trainer for the pre-training phase
+pretrainer:
+  seed: 1234
+  logging_steps: 10
+  warmup_steps: 100
+  num_train_epochs: 100  # maximum number of epochs (loses to max_steps)
+  max_steps: 100000  # maximum number of steps (training + validation)
+  eval_strategy: steps
+  save_strategy: steps
+  eval_steps: 100
+  save_steps: 100
+  save_total_limit: 1
+  gradient_accumulation_steps: 4
+  per_device_train_batch_size: 48
+  per_device_eval_batch_size: 48
+  learning_rate: 1.0e-4  # careful! "1e-4" will be read as a string, use 1.0e-4
+  weight_decay: 0.1
+  bf16: true
+  report_to: none
+  remove_unused_columns: false  # crucial for custom collators
+  load_best_model_at_end: true  # required for early stopping
+  metric_for_best_model: eval_mlm_accuracy  # format: "eval_" + metric name
+  greater_is_better: true
+  early_stopping_patience: 5  # evaluations without improvement before stopping
+
+# Arguments for HF's trainer for the fine-tuning phase
+finetuner:
+  seed: 1234
+  ft_subdir: "finetuning"
+  logging_steps: 10
+  warmup_steps: 50
+  num_train_epochs: 10  # maximum number of epochs (loses to max_steps)
+  max_steps: 10000  # maximum number of steps (training + validation)
+  eval_strategy: steps
+  save_strategy: steps
+  eval_steps: 50
+  save_steps: 50
+  save_total_limit: 1
+  eval_accumulation_steps: 500
+  gradient_accumulation_steps: 4
+  per_device_train_batch_size: 48
+  per_device_eval_batch_size: 48
+  learning_rate: 4.0e-5
+  weight_decay: 0.01
+  max_grad_norm: 1.0  # global-norm cap, applied after gradient accumulation (0 disables)
+  adam_beta1: 0.9
+  adam_beta2: 0.99  # a bit more spike-tolerant than the 0.999 default
+  adam_epsilon: 1.0e-6  # bf16-safe (the 1e-8 default underflows on small grads)
+  loss_name: ce  # ce, weighted_ce, focal, poly1 -> ce optimizes calibration!
+  # loss_args: {gamma: 2.0, epsilon: 1.0, alpha: [3.0]}  # extra kwargs for the loss
+  # class, merged over the data-derived class weights (popped, not TrainerArguments)
+  enforce_monotonicity: true  # probabilities increase with horizon (in multi-task
+                              # runs this is enforced per task, within each task's
+                              # horizon block; automatically disabled for 1 horizon)
+  bf16: true
+  report_to: none
+  remove_unused_columns: false  # crucial for custom collators
+  load_best_model_at_end: true
+  metric_for_best_model: eval_all_early_stopping_metric  # see evaluator arguments
+  greater_is_better: true
+  early_stopping_patience: 10  # evaluations without improvement before stopping
+
+# LoRA configuration for fine-tuning (experimentally, it did not improve results)
+use_lora: false  # false for full fine-tuning
+lora_config:
+  r: 16
+  lora_alpha: 32  # good guess: twice the rank
+  lora_dropout: 0.1
+  bias: "none"
+  task_type: SEQ_CLS
+  target_modules: all-linear
+
+# Embedding model
+model:
+  model_id: answerdotai/ModernBERT-base
+  load_backbone_weights: false
+  config_args:
+    # vocab_size: 1024  # set when dataset is build (depends on the data vocabulary)
+    max_position_embeddings: 1024  # original value in ModernBERT-base: 8192 // max t-EAV length: 1010
+    output_hidden_states: true  # required for plotting embeddings
+    classifier_pooling: mean  # to classify sequences during the fine-tuning phase
+    pad_token_id: 0
+    bos_token_id: 2  # 1 being mask_token_id
+    cls_token_id: 2
+    eos_token_id: 3
+    sep_token_id: 3
+    dropout_embedding: 0.0
+    dropout_attention: 0.1
+    dropout_mlp: 0.1
+    dropout_classifier: 0.1
+    # Comment below for default ModernBERT config (so far provided better results)
+    # Careful! Layer types should match num_hidden_layers and end with full_attention!
+    # num_hidden_layers: 4      #   4 //    8 //   12
+    # num_attention_heads: 4    #   4 //    8 //   12
+    # hidden_size: 128          # 128 //  256 //  512
+    # intermediate_size: 512    # 512 // 1024 // 2048
+    # layer_types: [full_attention, sliding_attention, sliding_attention, full_attention]
+  model_args:
+    dtype: bfloat16
+    attn_implementation: sdpa  # flash_attention_2 will create a shape mismatch in ModernBERT, with input_embeds as input
+  embedding_layer_config:
+    sentence_embedding_model: NeuML/pubmedbert-base-embeddings

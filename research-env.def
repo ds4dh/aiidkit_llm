@@ -27,9 +27,20 @@ From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
     # Disable rapid TTY/progress-bar redraws over network stderr
     export UV_NO_PROGRESS=1
 
+    # Base build tools, utilities, and search tools (ripgrep used by pi)
     apt-get update && apt-get install -y \
-      python3-pip python3-venv git curl build-essential ninja-build nvtop screen
+      python3-pip python3-venv git curl ca-certificates build-essential \
+      ninja-build nvtop screen ripgrep
 
+    # Install Node.js LTS and npm via NodeSource
+    curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+    apt-get install -y nodejs
+
+    # Install pi coding agent and qmd (for memory search) globally
+    npm install -g --allow-scripts=@google/genai,esbuild,protobufjs \
+      @earendil-works/pi-coding-agent @tobilu/qmd
+
+    # Install uv and set up Python environment
     curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="/usr/local/bin" sh
 
     uv venv /opt/venv
@@ -38,12 +49,16 @@ From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
     cd /opt
     uv pip install --no-cache --no-progress -e ".[dev]"
     uv pip install --no-cache --no-progress -r /opt/web_tool_requirements.txt
-    uv pip install flash-attn --no-build-isolation --no-progress
 
+    # Cleanup temporary caches and apt lists to keep image size lean
     rm -rf /tmp/uv-cache
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 %test
     . /opt/venv/bin/activate
+    node -v
+    npm -v
+    pi --version
     python3 -c "import sklearn; print('sklearn', sklearn.__version__)"
     python3 -c "import cuml; print('cuml import OK')"
     python3 -c "import torch; print(f'Torch: {torch.__version__}, CUDA: {torch.version.cuda}')"

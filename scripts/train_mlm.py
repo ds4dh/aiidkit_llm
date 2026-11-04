@@ -10,12 +10,17 @@ import wandb
 from transformers import Trainer, TrainingArguments, EarlyStoppingCallback
 from src.utils import apply_config_overrides
 from src.data.patient_dataset import load_hf_data_and_metadata
+from src.model.model_utils import GradientClippingGuard
 from src.model.patient_embedder import PatientEmbeddingModelFactory
 from src.model.patient_embedder import PatientDataCollatorForMaskedLanguageModelling
 from src.evaluation.evaluate_models import (
     DiscriminativeEmbeddingEvaluatorForMaskedLanguageModelling as CustomEvaluator,
     preprocess_logits_for_mlm_metrics,
 )
+
+class GuardedMLMTrainer(GradientClippingGuard, Trainer):
+    """Trainer with gradient clipping diagnostics + non-finite gradient guard."""
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Pre-train patient sequence model via Masked Language Modeling.")
@@ -87,8 +92,8 @@ def main():
         workspace = Path(__file__).stem
         wandb.init(project=workspace, name=run_id, config=cfg)
 
-    # Trainer (standard HuggingFace)
-    trainer = Trainer(
+    # Trainer (standard HuggingFace, plus gradient clipping diagnostics)
+    trainer = GuardedMLMTrainer(
         model=model,
         args=pt_args,
         train_dataset=dataset["train"],
@@ -112,4 +117,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()

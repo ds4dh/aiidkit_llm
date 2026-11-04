@@ -3,7 +3,7 @@ import json
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from datasets import Dataset, load_from_disk
+from datasets import Dataset
 from scipy.special import logit
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score
@@ -41,6 +41,146 @@ def prepare_dataset_fup_dict(dataset: Dataset, fup_list: list[int]):
     return out_dict
 
 
+def save_predictions_table(
+    all_predictions: dict,
+    split_label: str,
+    horizons: list[int],
+    output_dir: Path,
+    csv_name: str | None = None,
+    task_keys: list[str] | None = None,
+) -> pd.DataFrame | None:
+    """
+    Flatten the per-FUP prediction arrays saved by the final test pass into a
+    tidy (long-format) table with one row per (patient, fup, [task,] horizon):
+
+        patient_id, fup, horizon, label, prob [, prob_cal, time, status,
+                                               risk, pred_median_time]
+        (multi-task runs add a 'task' column: one row per patient, fup, task,
+         horizon, with the label/prob of that task's head)
+
+    - Reads keys of the form '{split_label}_fup_{XXXX}_labels', '..._probs'
+      and (optionally) '..._patientid', '..._probs_cal', '..._times',
+      '..._statuses', '..._risks', '..._median_times' from the dict built by
+      the test passes of train_classification.py / train_survival.py /
+      train_classic_ml.py.
+    - 'task_keys': for multi-task runs, the ordered list of tasks owning the
+      matrix columns (task-major: [t1_h1..t1_hK, t2_h1..t2_hK, ...]). When
+      given, every matrix column becomes a (task, horizon) row and a 'task'
+      column is written. When None (classic single-task runs) the columns are
+      interpreted as the horizon list, as before.
+    - 'label' is 0/1 (binary tasks) or the horizon-binarized survival label
+      (1 = event within horizon, 0 = known event-free at horizon). Rows whose
+      label is unknown at that horizon (-100, i.e. censored before horizon)
+      are skipped.
+    - 'prob' is the model's predicted probability of the positive case
+      (sigmoid output for binary tasks; 1 - S(horizon) for survival).
+    - Survival runs additionally expose the raw ground truth and model output
+      per row: 'time'/'status' = observed (censored) time to next event and
+      event indicator from the fup observation point; 'risk' = Cox log hazard
+      ratio; 'pred_median_time' = model-predicted median time to the next
+      event (NaN when no median is reached within the observed baseline).
+    - Writes a plain CSV (one file per split, per training run).
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fup_re = re.compile(rf"^{re.escape(split_label)}_fup_(\d+)_labels$")
+
+    # Optional per-row (horizon-independent) arrays: npz key suffix -> CSV column
+    extras_map = {"times": "time", "statuses": "status", "risks": "risk",
+                  "median_times": "pred_median_time"}
+
+    frames = []
+    for key in sorted(all_predictions.keys()):
+        match = fup_re.match(key)
+        if not match:
+            continue
+        fup_str, fup_val = match.group(1), int(match.group(1))
+        prefix = f"{split_label}_fup_{fup_str}"
+        if f"{prefix}_probs" not in all_predictions:
+            continue
+
+        labels = np.asarray(all_predictions[key])
+        probs = np.asarray(all_predictions[f"{prefix}_probs"])
+        if labels.ndim == 1:
+            labels = labels[:, None]
+        if probs.ndim == 1:
+            probs = probs[:, None]
+        n_rows = labels.shape[0]
+
+        patient_ids = all_predictions.get(f"{prefix}_patientid", None)
+        if patient_ids is not None:
+            patient_ids = np.asarray(patient_ids)
+            if len(patient_ids) != n_rows:
+                print(f"    [WARN] {prefix}: patient ids ({len(patient_ids)}) "
+                      f"misaligned with scored rows ({n_rows}); using row indices")
+                patient_ids = None
+        if patient_ids is None:
+            patient_ids = np.arange(n_rows)
+
+        probs_cal = all_predictions.get(f"{prefix}_probs_cal", None)
+        extras = {}
+        for suffix, col in extras_map.items():
+            arr = all_predictions.get(f"{prefix}_{suffix}", None)
+            if arr is not None and len(np.asarray(arr)) == n_rows:
+                extras[col] = np.asarray(arr)
+
+        # Map each matrix column to its (task, horizon) pair. Multi-task runs
+        # store one column per (task, horizon), task-major ordered.
+        n_h = len(horizons)
+        if task_keys:
+            if labels.shape[1] != len(task_keys) * n_h:
+                print(f"    [WARN] {prefix}: {labels.shape[1]} label columns but "
+                      f"{len(task_keys)} tasks x {n_h} horizons expected; skipping extras")
+            col_map = [(task_keys[c // n_h], horizons[c % n_h])
+                       for c in range(min(labels.shape[1], len(task_keys) * n_h))]
+        else:
+            col_map = [(None, horizons[c]) for c in range(min(labels.shape[1], n_h))]
+
+        for c, (task_name, horizon_val) in enumerate(col_map):
+            lab_col = labels[:, c]
+            prob_col = probs[:, c] if probs.shape[1] > c else probs[:, -1]
+            valid = lab_col != -100  # drop rows with unknown label at this horizon
+            if valid.sum() == 0:
+                continue
+            n_valid = int(valid.sum())
+            row = {
+                "patient_id": patient_ids[valid],
+                "fup": np.full(n_valid, fup_val, dtype=np.int32),
+                "horizon": np.full(n_valid, int(horizon_val), dtype=np.int32),
+                "label": lab_col[valid].astype(np.int8),
+                "prob": prob_col[valid].astype(np.float32),
+            }
+            if task_name is not None:
+                row["task"] = np.full(n_valid, task_name, dtype=object)
+            if probs_cal is not None:
+                probs_cal = np.asarray(probs_cal)
+                cal_col = (probs_cal[:, c] if probs_cal.ndim > 1 and probs_cal.shape[1] > c
+                           else probs_cal.reshape(-1))
+                row["prob_cal"] = np.asarray(cal_col)[valid].astype(np.float32)
+            for col, arr in extras.items():
+                row[col] = arr[valid]
+            frames.append(pd.DataFrame(row))
+
+    if not frames:
+        print(f"    [WARN] No per-FUP prediction arrays found for split '{split_label}'; "
+              f"tidy table not written.")
+        return None
+
+    table = pd.concat(frames, ignore_index=True)
+    try:  # patient ids are numeric strings in this dataset -> store as int
+        table["patient_id"] = table["patient_id"].astype(np.int64)
+    except (TypeError, ValueError):
+        pass  # keep original dtype if not parseable as int
+    sort_cols = [c for c in ["patient_id", "fup", "task", "horizon"] if c in table.columns]
+    table = table.sort_values(sort_cols).reset_index(drop=True)
+
+    if csv_name:
+        table.to_csv(output_dir / csv_name, index=False, float_format="%.6f")
+        print(f"    [SUCCESS] Saved tidy predictions CSV: {output_dir / csv_name} "
+              f"({len(table)} rows, columns: {', '.join(table.columns)})")
+    return table
+
+
 def find_best_checkpoint(base_dir: Path, task_key: str, horizon: int) -> Path:
     """Locates the final model training checkpoint inside structured execution logs."""
     task_dir = base_dir / "finetuning" / task_key
@@ -76,6 +216,51 @@ def extract_horizons_from_path(checkpoint_path: Path) -> list[int]:
         raise ValueError(f"Could not parse horizon keys from path layout string: {run_dir.name}")
     
     return [int(h) for h in match.group(1).split("-")] 
+
+
+def load_run_metadata(run_dir: Path) -> dict | None:
+    """Read the run_metadata.json written by train_classification.py, if present.
+
+    Contains {"task_key", "tasks", "horizons", "label_keys"} describing the head
+    layout of the run (one classifier head per (task, horizon) pair, task-major).
+    """
+    meta_path = Path(run_dir) / "run_metadata.json"
+    if meta_path.exists():
+        return json.loads(meta_path.read_text())
+    return None
+
+
+def find_best_checkpoint_multitask(base_dir: Path, task_key: str, horizon: int) -> tuple[Path, dict]:
+    """Locate a checkpoint of a MULTI-TASK run that contains heads for `task_key`.
+
+    Multi-task fine-tuning stores all heads under one alias folder per config
+    entry: base_dir/'finetuning'/<alias>/hrz(...)/ with a run_metadata.json
+    listing every trained task. Scans those and returns
+    (last checkpoint, metadata) for the first run containing `task_key` at the
+    requested horizon. Raises FileNotFoundError otherwise (callers can then
+    fall back to the classic single-task layout via find_best_checkpoint).
+    """
+    base_dir = Path(base_dir)
+    ft_root = base_dir / "finetuning"
+    if not ft_root.exists():
+        raise FileNotFoundError(f"Task directory missing: {ft_root}")
+
+    h_str = f"{horizon:04d}"
+    pattern = re.compile(rf"hrz\(([^)]*\b{h_str}\b[^)]*)\)")
+    for run_dir in sorted(p for p in ft_root.iterdir() if p.is_dir()):
+        for hrz_dir in sorted(p for p in run_dir.iterdir() if p.is_dir() and pattern.search(p.name)):
+            meta = load_run_metadata(hrz_dir)
+            if not meta or task_key not in meta.get("tasks", []):
+                continue
+            checkpoint_dirs = sorted(
+                hrz_dir.glob("checkpoint-*"),
+                key=lambda p: int(p.name.split("-")[-1]),
+            )
+            if checkpoint_dirs:
+                return checkpoint_dirs[-1], meta
+    raise FileNotFoundError(
+        f"No multi-task run with heads for task '{task_key}' (horizon {h_str}) under {ft_root}"
+    )
 
 
 def _pr_auc_diff_chunk(y_true, p_tf, p_base, index_chunk):
@@ -248,211 +433,3 @@ def get_best_optuna_run(results_dir: Path, split_type: str, task_key: str) -> tu
     
     pt_config = f"e{e_val:02d}-a{a_val:02d}-v{v_val:02d}"
     return f"trial_{best_trial_id:03d}", pt_config
-
-
-def extract_flat_split_csv(
-    data_raw_path: Path,
-    raw_pool: dict,
-    model: str,
-    task: str,
-    split: str,
-    horizon: int,
-    dataset_split: str,
-) -> pd.DataFrame:
-    """
-    Unpacks nested pool records and reconstructs tracking keys from disk.
-    Guarantees index alignment across multi-label targets.
-    """
-    # Defensive slicing catch bounds
-    if (split not in raw_pool or 
-        model not in raw_pool[split] or 
-        task not in raw_pool[split][model] or 
-        horizon not in raw_pool[split][model][task]):
-        return pd.DataFrame()
-        
-    fup_dict = raw_pool[split][model][task][horizon]
-    flat_records = []
-    
-    for fup_day, records in fup_dict.items():
-        y_true = np.asarray(records["labels"]).flatten()
-        y_prob = np.asarray(records.get("probs_cal", records["probs"])).flatten()
-        
-        raw_fup_dir = data_raw_path / split / f"fup_{fup_day:04d}"
-        if not raw_fup_dir.exists():
-            raw_fup_dir = data_raw_path / split / f"fup_{fup_day:04d}d"
-        if not raw_fup_dir.exists():
-            continue
-            
-        try:
-            raw_ds = load_from_disk(str(raw_fup_dir))[dataset_split]
-            raw_keys = raw_ds["patientkey"]
-            
-            # Reconstruct keep_mask used during training/validation filtering steps
-            target_col = f"label_{task}_{horizon:04d}d"
-            if target_col in raw_ds.column_names:
-                # If checking a single specific target label column directly
-                keep_mask = np.array(raw_ds[target_col]) != -100
-            else:
-                # Multi-label task fallback matching full sequence array allocations
-                hrz_cols = [c for c in raw_ds.column_names if c.startswith(f"label_{task}_") and c.endswith("d")]
-                label_matrix = np.stack([raw_ds[c] for c in hrz_cols], axis=1)
-                keep_mask = (label_matrix != -100).any(axis=1)
-        except Exception:
-            continue
-            
-        # Core Index Alignment Fix:
-        # Filter patient keys down *first* to match true valid rows passed to the model
-        valid_indices = np.where(keep_mask)[0]
-        
-        # Guard check to avoid length crashes if files are corrupted or cropped
-        eval_len = min(len(valid_indices), len(y_prob), len(y_true))
-        
-        for idx in range(eval_len):
-            row_ds_idx = valid_indices[idx]
-            current_target_label = int(y_true[idx])
-            
-            # Skip records if the specific label array holds censored targets
-            if current_target_label == -100:
-                continue
-                
-            flat_records.append({
-                "patientkey": raw_keys[row_ds_idx],
-                "time_step": fup_day,
-                "y_true": current_target_label,
-                "y_prob": float(y_prob[idx])
-            })
-            
-    if not flat_records:
-        return pd.DataFrame()
-        
-    df = pd.DataFrame(flat_records)
-    return df.sort_values(by=["patientkey", "time_step"]).reset_index(drop=True)    
-
-
-def load_all_raw_predictions(
-    transformer_base_dir: Path, 
-    classic_ml_base_dir: Path, 
-    from_optuna: bool, 
-    split_types: list, 
-    tasks: list, 
-    classic_ml_models: list, 
-    dataset_split: str = "test"
-) -> dict:
-    """
-    Crawls output directories and builds a structured predictions dictionary pool.
-    Isolates discrete follow-up tracking slices to prevent multi-label overwrites.
-    """
-    pool = {split: {} for split in split_types}
-    prefix = f"{dataset_split}_" if dataset_split == "validation" else "test_"
-    fup_pattern = re.compile(rf"^{prefix}fup_(\d+)_labels$")
-    file_name = "validation_probs.npz" if dataset_split == "validation" else "test_probs.npz"
-    ml_file_name = "val_predictions.npz" if dataset_split == "validation" else "test_predictions.npz"
-    
-    # 1. Gather Transformer Predictions
-    for split in split_types:
-        pool[split]["transformer"] = {t: {} for t in tasks}
-            
-        for task in tasks:
-            if from_optuna:
-                try:
-                    trial_folder, pt_config = get_best_optuna_run(transformer_base_dir, split, task)
-                    run_base_path = transformer_base_dir / split / task / trial_folder / split / pt_config / "finetuning" / task
-                except Exception:
-                    continue
-            else:
-                pt_config = "e00-a15-v60"
-                run_base_path = transformer_base_dir / split / pt_config / "finetuning" / task
-                
-            if not run_base_path.exists():
-                continue
-                
-            for hrz_folder in run_base_path.iterdir():
-                if not hrz_folder.is_dir() or not hrz_folder.name.startswith("hrz("):
-                    continue
-                    
-                hrz_match = re.search(r"hrz\(([\d-]+)\)", hrz_folder.name)
-                if not hrz_match:
-                    continue
-                horizons = [int(h) for h in hrz_match.group(1).split("-")]
-                
-                npz_path = hrz_folder / file_name
-                if not npz_path.exists():
-                    continue
-                    
-                npz_data = np.load(npz_path, allow_pickle=True)
-                
-                for key in npz_data.files:
-                    match = fup_pattern.match(key)
-                    if not match:
-                        continue
-                    fup_day = int(match.group(1))
-                    
-                    fup_label_key = f"{prefix}fup_{fup_day:04d}_labels"
-                    fup_probs_key = f"{prefix}fup_{fup_day:04d}_probs"
-                    fup_probs_cal_key = f"{prefix}fup_{fup_day:04d}_probs_cal"
-                    
-                    for h in horizons:
-                        if h not in pool[split]["transformer"][task]:
-                            pool[split]["transformer"][task][h] = {}
-                            
-                        h_idx = horizons.index(h)
-                        
-                        record = {
-                            "labels": npz_data[fup_label_key][:, h_idx],
-                            "probs": npz_data[fup_probs_key][:, h_idx],
-                            "row_mask_mode": "any_declared_horizon",
-                            "horizons": horizons,
-                            "source_archive": str(npz_path)
-                        }
-                        if fup_probs_cal_key in npz_data.files:
-                            record["probs_cal"] = npz_data[fup_probs_cal_key][:, h_idx]
-                            
-                        pool[split]["transformer"][task][h][fup_day] = record
-
-    # 2. Gather Classic ML Baseline Predictions
-    for split in split_types:
-        for model in classic_ml_models:
-            pool[split][model] = {t: {} for t in tasks}
-                
-            for task in tasks:
-                base_task_dir = classic_ml_base_dir / split / model / task
-                if not base_task_dir.exists():
-                    continue
-                    
-                for hrz_folder in base_task_dir.iterdir():
-                    if not hrz_folder.is_dir() or not hrz_folder.name.startswith("hrz("):
-                        continue
-                        
-                    hrz_match = re.search(r"hrz\(([\d-]+)\)", hrz_folder.name)
-                    if not hrz_match:
-                        continue
-                    horizon = int(hrz_match.group(1))
-                    
-                    if horizon not in pool[split][model][task]:
-                        pool[split][model][task][horizon] = {}
-                        
-                    npz_path = hrz_folder / ml_file_name
-                    if not npz_path.exists():
-                        continue
-                        
-                    npz_data = np.load(npz_path, allow_pickle=True)
-                    
-                    for key in npz_data.files:
-                        match = fup_pattern.match(key)
-                        if not match:
-                            continue
-                        fup_day = int(match.group(1))
-                        
-                        record = {
-                            "labels": npz_data[f"{prefix}fup_{fup_day:04d}_labels"].flatten(),
-                            "probs": npz_data[f"{prefix}fup_{fup_day:04d}_probs"].flatten(),
-                            "row_mask_mode": "target_horizon_only",
-                            "source_archive": str(npz_path)
-                        }
-                        fup_probs_cal_key = f"{prefix}fup_{fup_day:04d}_probs_cal"
-                        if fup_probs_cal_key in npz_data.files:
-                            record["probs_cal"] = npz_data[fup_probs_cal_key].flatten()
-                            
-                        pool[split][model][task][horizon][fup_day] = record
-
-    return pool

@@ -174,9 +174,11 @@ cython_debug/
 .pypirc
 
 # Custom
+.pi/
 temp.py
 tmp/
-data/
+/data/
+scratch/
 *.sif
 archives
 results*

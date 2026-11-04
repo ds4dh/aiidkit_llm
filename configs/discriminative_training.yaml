@@ -1,7 +1,7 @@
 # Run configuration and task (data collator) definition
 data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v3.9/teav
 data_split_type: temporal_split  # random_split, center_split, temporal_split
-result_dir: results_final/transformer  # base directory name for all results
+result_dir: results/transformer  # base directory name for all results
 data_collator:
   eav_mappings:
     entity_id: entity
@@ -19,12 +19,13 @@ data_collator:
     value_id: 0.60      # probability of masking an entity sub-token
 
 # Configuration for finetuning tasks to run
-train_data_augment: all           # "all", "none", "valid", which other fups are added to finetuning samples
+train_data_augment: all           # default: "all" (pool every fup folder; 'fups' then only affect run names). "none" = one model per fup, "valid" = pool listed fups
 target_undersampling_ratio: 15.0  # maximum ("worst") ratio of positive to negative samples during finetuning (null for not using under-sampling)
+drop_unlabeled: true              # drop rows whose horizon labels are all -100 (unknown outcome; the loss masks them anyway)
 early_stopping_metric: roc_auc    # metric to use for early stopping (per label, then averaged)
 prediction_tasks:                 # horizon elements can be lists (multi-label) or integers / singletons (binary)
   infection_bacteria: {fups: [0, 30, 60, 90, 180, 360], horizons: [[30, 60, 90]]}
-  infection_virus:    {fups: [0, 30, 60, 90, 180, 360], horizons: [[30, 60, 90]]}
+  # infection_virus:    {fups: [0, 30, 60, 90, 180, 360], horizons: [[30, 60, 90]]}
   # death:              {fups: [0, 360, 720, 1080, 1800], horizons: [[360, 720, 1080, 1800]]}
   # graft_loss:         {fups: [0, 360, 720, 1080, 1800], horizons: [[360, 720, 1080, 1800]]}
 
@@ -40,17 +41,17 @@ optuna:
 pretrainer:
   seed: 1234
   logging_steps: 10
-  warmup_steps: 1000
+  warmup_steps: 100
   num_train_epochs: 100  # maximum number of epochs (loses to max_steps)
   max_steps: 100000  # maximum number of steps (training + validation)
   eval_strategy: steps
   save_strategy: steps
-  eval_steps: 250
-  save_steps: 250
+  eval_steps: 100
+  save_steps: 100
   save_total_limit: 1
-  gradient_accumulation_steps: 1
-  per_device_train_batch_size: 32
-  per_device_eval_batch_size: 32
+  gradient_accumulation_steps: 4
+  per_device_train_batch_size: 48
+  per_device_eval_batch_size: 48
   learning_rate: 1.0e-4  # careful! "1e-4" will be read as a string, use 1.0e-4
   weight_decay: 0.1
   bf16: true
@@ -66,21 +67,27 @@ finetuner:
   seed: 1234
   ft_subdir: "finetuning"
   logging_steps: 10
-  warmup_steps: 1000
+  warmup_steps: 50
   num_train_epochs: 10  # maximum number of epochs (loses to max_steps)
   max_steps: 10000  # maximum number of steps (training + validation)
   eval_strategy: steps
   save_strategy: steps
-  eval_steps: 100
-  save_steps: 100
+  eval_steps: 50
+  save_steps: 50
   save_total_limit: 1
-  eval_accumulation_steps: 100
-  gradient_accumulation_steps: 1
-  per_device_train_batch_size: 32
-  per_device_eval_batch_size: 32
+  eval_accumulation_steps: 500
+  gradient_accumulation_steps: 4
+  per_device_train_batch_size: 48
+  per_device_eval_batch_size: 48
   learning_rate: 4.0e-5
   weight_decay: 0.01
+  max_grad_norm: 1.0  # global-norm cap, applied after gradient accumulation (0 disables)
+  adam_beta1: 0.9
+  adam_beta2: 0.99  # a bit more spike-tolerant than the 0.999 default
+  adam_epsilon: 1.0e-6  # bf16-safe (the 1e-8 default underflows on small grads)
   loss_name: ce  # ce, weighted_ce, focal, poly1 -> ce optimizes calibration!
+  # loss_args: {gamma: 2.0, epsilon: 1.0, alpha: [3.0]}  # extra kwargs for the loss
+  # class, merged over the data-derived class weights (popped, not TrainerArguments)
   enforce_monotonicity: true  # if True, classifier probabilities increase with horizon
   bf16: true
   report_to: none

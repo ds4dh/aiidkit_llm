@@ -11,9 +11,18 @@ from pathlib import Path
 from filelock import FileLock
 from tqdm import tqdm
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datasets import Dataset, DatasetDict, load_from_disk, concatenate_datasets
 
-SAFE_NUM_PROCS = 1  # 4  # max(1, len(os.sched_getaffinity(0)) - 2)
+# Worker count for the (CPU-bound) preprocessing map passes. Override with
+# AIIDKIT_MAP_NUM_PROCS=1 if the container runs into shared-memory/memory limits.
+SAFE_NUM_PROCS = int(os.environ.get(
+    "AIIDKIT_MAP_NUM_PROCS",
+    max(1, min(8, (os.cpu_count() or 4) - 2)),
+))
+# Worker threads for the parallel raw follow-up folder loading (arrow IO releases
+# the GIL, so threads parallelize the reads/copies well without pickling datasets).
+LOAD_NUM_THREADS = int(os.environ.get("AIIDKIT_LOAD_NUM_THREADS", 8))
 MAP_BATCH_SIZE = 256
 BIN_LABELS = ["Lowest", "Lower", "Low", "Middle", "High", "Higher", "Highest"]
 
@@ -36,6 +45,8 @@ def _make_processed_cache_path(
     time_mapping,
     eav_mappings,
     is_pretraining: bool,
+    undersampling_balancing_label: str | None = None,
+    drop_unlabeled: bool = False,
 ):
     cache_config = {
         "mode": "pretraining" if is_pretraining else "finetuning",
@@ -44,6 +55,8 @@ def _make_processed_cache_path(
         "fup_test": _fup_key(fup_test),
         "label_keys": sorted(label_keys) if label_keys else [],
         "target_undersampling_ratio": target_undersampling_ratio,
+        "undersampling_balancing_label": undersampling_balancing_label,
+        "drop_unlabeled": drop_unlabeled,
         "time_mapping": time_mapping,
         "eav_mappings": eav_mappings,
         "bin_labels": BIN_LABELS,
@@ -73,6 +86,8 @@ def load_hf_data_and_metadata(
         "attribute_id": "attribute",
         "value_id": "value_binned",
     },
+    undersampling_balancing_label: str | None = None,
+    drop_unlabeled: bool = False,
 ) -> tuple[DatasetDict, dict[str, pd.IntervalIndex], dict[str, int]]:
     """
     Build data and metadata, with persistent processed-dataset caching.
@@ -101,21 +116,35 @@ def load_hf_data_and_metadata(
         time_mapping=time_mapping,
         eav_mappings=eav_mappings,
         is_pretraining=is_pretraining,
+        undersampling_balancing_label=undersampling_balancing_label,
+        drop_unlabeled=drop_unlabeled,
     )
 
-    # Load raw data
-    print("Loading raw data from disk...")
-    dataset = DatasetDict({
-        "train": _load_and_tag(
-            root_path,
-            fup_train,
-            "train",
-            label_keys=label_keys,
-            target_undersampling_ratio=target_undersampling_ratio,
-        ),
-        "validation": _load_and_tag(root_path, fup_valid, "validation"),
-        "test": _load_and_tag(root_path, fup_test, "test"),
-    })
+    # Check the processed-dataset cache FIRST: on a hit we can skip the slow
+    # raw folder loading entirely (except when pretraining still needs to scan
+    # the raw data to compute vocabulary/binning metadata).
+    cache_hit = processed_cache_path.exists()
+    need_raw_data = (not cache_hit) or (is_pretraining and not metadata_path.exists())
+
+    dataset = None
+    if need_raw_data:
+        # Load raw data
+        print("Loading raw data from disk...")
+        dataset = DatasetDict({
+            "train": _load_and_tag(
+                root_path,
+                fup_train,
+                "train",
+                label_keys=label_keys,
+                target_undersampling_ratio=target_undersampling_ratio,
+                balancing_label_key=undersampling_balancing_label,
+                drop_unlabeled=drop_unlabeled,
+            ),
+            "validation": _load_and_tag(root_path, fup_valid, "validation", label_keys=label_keys, drop_unlabeled=drop_unlabeled),
+            "test": _load_and_tag(root_path, fup_test, "test", label_keys=label_keys, drop_unlabeled=drop_unlabeled),
+        })
+    else:
+        print(f"Processed dataset cache hit: {processed_cache_path} (raw loading skipped)")
 
     # Metadata: load or compute
     if not is_pretraining:
@@ -124,6 +153,12 @@ def load_hf_data_and_metadata(
             raise FileNotFoundError(
                 f"Metadata not found at {metadata_path}. Run pre-training first."
             )
+        with open(metadata_path / "vocab.pkl", "rb") as f:
+            vocab = pickle.load(f)
+        with open(metadata_path / "bin_intervals.pkl", "rb") as f:
+            bin_intervals = pickle.load(f)
+    elif metadata_path.exists():
+        print(f"Pretraining metadata found at {metadata_path}, loading...")
         with open(metadata_path / "vocab.pkl", "rb") as f:
             vocab = pickle.load(f)
         with open(metadata_path / "bin_intervals.pkl", "rb") as f:
@@ -444,37 +479,64 @@ def _load_and_tag(
     split: str,
     label_keys: list[str] | None = None,
     target_undersampling_ratio: float | None = None,
+    balancing_label_key: str | None = None,
+    drop_unlabeled: bool = False,
+    num_threads: int | None = None,
 ):
-    """Loads specific follow-up folders, tags follow-up, concatenates in-memory."""
+    """
+    Loads specific follow-up folders in parallel (order preserved), tags the
+    follow-up, and concatenates in-memory. Each per-folder step (parquet read,
+    undersampling, flattening, column copy) materializes lazily-loaded arrow
+    data, so parallelizing across folders gives a near-linear walltime win.
+    """
     fups = fup_input if isinstance(fup_input, list) else [fup_input]
-    datasets = []
-    
-    for fup in tqdm(fups, desc=f"Loading {split} data from listed follow-up periods"):
+
+    def _load_one(fup):
         suffix = f"{fup:04d}" if fup is not None else "None"
         folder_path = root_path / f"fup_{suffix}"
         if not folder_path.exists():
             raise FileNotFoundError(f"Dataset not found: {folder_path}")
-        
+
         # Load the dataset (initially memory-mapped from disk)
         ds = load_from_disk(str(folder_path))[split]
-        
+
+        # Drop rows carrying no training signal for ANY requested label
+        # (all label keys == -100 means the outcome is unknown at this
+        # decision point; the losses mask them anyway, so keeping them only
+        # wastes forward-pass compute and shrinks the effective batch size).
+        if drop_unlabeled and label_keys:
+            lab = np.stack([np.asarray(ds[k]) for k in label_keys], axis=1)
+            keep = np.where((lab != -100).any(axis=1))[0]
+            if len(keep) < len(ds):
+                ds = ds.select(keep)
+
         # Soft undersampling, usually only for training data
         if target_undersampling_ratio is not None:
-            ds = undersample_dataset(ds, label_keys, target_undersampling_ratio)
+            ds = undersample_dataset(ds, label_keys, target_undersampling_ratio,
+                                     balancing_label_key=balancing_label_key)
             ds = ds.flatten_indices()  # (keep_in_memory=True)
-        
+
         # Tag samples with fup-integer (use -1 for None)
         fup_val = fup if fup is not None else -1
-        ds = ds.add_column("fup", [fup_val] * len(ds))        
-        datasets.append(ds)
-        
+        ds = ds.add_column("fup", [fup_val] * len(ds))
+        return ds
+
+    # Validate folder existence upfront so errors surface without thread noise
+    for fup in fups:
+        suffix = f"{fup:04d}" if fup is not None else "None"
+        if not (root_path / f"fup_{suffix}").exists():
+            raise FileNotFoundError(f"Dataset not found: {root_path / f'fup_{suffix}'}")
+
+    workers = min(max(1, num_threads or LOAD_NUM_THREADS), max(1, len(fups)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        datasets = list(tqdm(
+            executor.map(_load_one, fups),
+            total=len(fups),
+            desc=f"Loading {split} data from listed follow-up periods",
+        ))
+
     # Concatenation is now a fast memory copy operation
     return concatenate_datasets(datasets) if len(datasets) > 0 else Dataset.from_dict({})
-    # if len(datasets) > 0:
-    #     concatenated = concatenate_datasets(datasets)
-    #     return concatenated.flatten_indices()  # flatten to realign PyArrow chunks
-    # else:
-    #     return Dataset.from_dict({})
     
 
 def undersample_dataset(
@@ -495,6 +557,7 @@ def undersample_dataset(
     rng = np.random.default_rng(seed)
     
     # Balance on a specific key
+    unlabeled_indices = np.empty(0, dtype=int)
     if balancing_label_key is not None:
         if balancing_label_key not in label_keys:
             raise ValueError(f"Balancing key {balancing_label_key} not in label_keys")
@@ -503,24 +566,32 @@ def undersample_dataset(
         labels = np.array(dataset[balancing_label_key])
         pos_indices = np.where(labels == 1)[0]
         neg_indices = np.where(labels == 0)[0]
+        # Rows that are neither class (e.g. -100 "unknown outcome" masks) carry
+        # no training signal; never treat them as a class nor silently drop them.
+        unlabeled_indices = np.where((labels != 0) & (labels != 1))[0]
         
     # Clever Union (balance "any Positive" vs "all negative")
     else:
         # Identify "Any Positive" (The valuable minority)
         label_matrix = np.stack([dataset[k] for k in label_keys], axis=1)
         any_positive_mask = (np.max(label_matrix, axis=1) == 1)
-        pos_indices = np.where(any_positive_mask)[0]
-        neg_indices = np.where(~any_positive_mask)[0]  # all zeros (or -100s)
+        fully_unlabeled = (label_matrix == -100).all(axis=1)
+        pos_indices = np.where(any_positive_mask & ~fully_unlabeled)[0]
+        neg_indices = np.where(~any_positive_mask & ~fully_unlabeled)[0]
+        unlabeled_indices = np.where(fully_unlabeled)[0]  # no known label at all
 
     # Common undersampling logic
     n_pos = len(pos_indices)
     n_neg = len(neg_indices)
-    # print(f"Undersampling: Found {n_pos} any-pos samples and {n_neg} all-neg samples.")
     if n_pos < n_neg:
         majority_indices = neg_indices
         minority_indices = pos_indices
         keep_n = int(n_pos * target_ratio)
     else:
+        if balancing_label_key is not None and n_pos > n_neg:
+            print(f"Undersampling warning: '{balancing_label_key}' events ({n_pos}) are the "
+                  f"MAJORITY over censored/negative rows ({n_neg}); undersampling will drop "
+                  f"event rows. This is usually not what you want for survival training.")
         majority_indices = pos_indices
         minority_indices = neg_indices
         keep_n = int(n_neg * target_ratio)
@@ -533,8 +604,8 @@ def undersample_dataset(
     # Select random subset of majority
     selected_majority = rng.choice(majority_indices, size=keep_n, replace=False)
     
-    # Combine and shuffle
-    final_indices = np.concatenate([selected_majority, minority_indices])
+    # Combine and shuffle (unlabeled rows are passed through untouched)
+    final_indices = np.concatenate([selected_majority, minority_indices, unlabeled_indices])
     rng.shuffle(final_indices)
     
     return dataset.select(final_indices)  # (..., keep_in_memory=True)

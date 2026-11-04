@@ -31,28 +31,58 @@ from src.model.patient_embedder import PatientEmbeddingModelFactory, PatientData
 from src.evaluation.evaluate_models import UMAP_HDBSCAN_Clusterer, ModelInterpreter
 from src.data.patient_dataset import load_hf_data_and_metadata
 from scripts.analysis_interpretability import find_best_checkpoint, extract_horizons_from_path
-from scripts.script_utils import scan_all_fups, get_best_optuna_run, calibrate_array_pair
+from scripts.script_utils import scan_all_fups, get_best_optuna_run, calibrate_array_pair, find_best_checkpoint_multitask
 
 import argparse
 import os
 
 parser = argparse.ArgumentParser(description="Run patient stratification and survival analysis.")
-parser.add_argument("--results-dir", type=Path, default=Path("results_final"), help="Base directory for results")
+parser.add_argument("--results-dir", type=Path, default=Path("results"), help="Base directory for results")
 parser.add_argument("--data-split-type", "--data_split_type", type=str, default="temporal_split", help="Data split strategy")
 parser.add_argument("--data-dir", "--data_dir", type=Path, default=Path(os.environ.get("TEAV_DATA_DIR", "/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6/teav")), help="Path to tEAV dataset directory")
+parser.add_argument("--proposed-model", "--proposed_model", type=str, default="transformer",
+                    help="Model analyzed by this script (the 'proposed model' shared across analysis scripts). "
+                         "Must be a transformer-family model with a binary classification checkpoint.")
+parser.add_argument("--run-id", "--run_id", type=str, default="",
+                    help="Pre-training run id subfolder (e.g. e00-a15-v60). Default: the only folder present.")
+parser.add_argument("--config", "-c", type=str, default="configs/discriminative_training.yaml",
+                    help="Training config providing model/collator settings for checkpoint loading.")
+parser.add_argument("--tasks", nargs="+", default=None,
+                    help="Outcome tasks to stratify patients for (one analysis per task). "
+                         "Default: infection_bacteria. Multi-task checkpoints are supported: "
+                         "the matching (task, horizon) head is selected per task.")
 args, _ = parser.parse_known_args()
 
 # Model selection
 RESULTS_DIR = args.results_dir
-TRANSFORMER_BASE_DIR = RESULTS_DIR / "transformer"
-OUTPUT_DIR = RESULTS_DIR / Path("analysis/stratification")
-CONFIG_PATH = Path("configs/discriminative_training.yaml") 
+PROPOSED_MODEL = args.proposed_model
+RUN_ID = args.run_id.strip()
+
+# Stratification clusters and scores patients with the fine-tuned transformer
+# embeddings + classification head, so only transformer-family binary models
+# are supported (classic ML contenders have no embeddings; the Cox survival
+# variant uses a regression head, not wired in yet).
+STRATIFIABLE_MODELS = {
+    # model key -> (results subfolder, force multi-task head resolution)
+    "transformer": ("transformer", False),
+    "transformer_multitask": ("transformer", True),
+}
+if PROPOSED_MODEL not in STRATIFIABLE_MODELS:
+    print(f"[SKIP] Stratification analysis supports only {sorted(STRATIFIABLE_MODELS)}; "
+          f"got proposed model '{PROPOSED_MODEL}'. Nothing to do.")
+    sys.exit(0)
+TRANSFORMER_BASE_DIR = RESULTS_DIR / STRATIFIABLE_MODELS[PROPOSED_MODEL][0]
+MULTITASK_ONLY = STRATIFIABLE_MODELS[PROPOSED_MODEL][1]
+# Split included in the output path so the three split types don't overwrite
+# each other (consistent with the interpretability analysis layout).
+OUTPUT_DIR = RESULTS_DIR / Path("analysis/stratification") / PROPOSED_MODEL / DATA_SPLIT_TYPE
+CONFIG_PATH = Path(args.config) 
 DATA_DIR = args.data_dir
 
 # Configuration
 FROM_OPTUNA = "optuna" in TRANSFORMER_BASE_DIR.name
 DATA_SPLIT_TYPE = args.data_split_type
-TASKS = [
+TASKS = args.tasks if args.tasks else [
     "infection_bacteria",
     # "infection_virus",
     # "death",
@@ -782,17 +812,42 @@ def main():
         
     for task_key in TASKS:
         print(f"\nStratifying task: {task_key}")
+        run_meta = None
         
         try:
             if FROM_OPTUNA:
                 trial_name, pt_config = get_best_optuna_run(TRANSFORMER_BASE_DIR, DATA_SPLIT_TYPE, task_key)
                 base_dir_for_ckpt = TRANSFORMER_BASE_DIR / DATA_SPLIT_TYPE / task_key / trial_name / DATA_SPLIT_TYPE / pt_config
+            elif RUN_ID:
+                base_dir_for_ckpt = TRANSFORMER_BASE_DIR / DATA_SPLIT_TYPE / RUN_ID
+                if not base_dir_for_ckpt.is_dir():
+                    raise FileNotFoundError(f"Run-id folder not found: {base_dir_for_ckpt}")
             else:
                 [base_dir_for_ckpt] = (d for d in (TRANSFORMER_BASE_DIR / DATA_SPLIT_TYPE).iterdir() if d.is_dir())
             
-            checkpoint_path_ft = find_best_checkpoint(base_dir_for_ckpt, task_key, PREDICTION_HORIZON)
-            ckpt_horizons = extract_horizons_from_path(checkpoint_path_ft)
-            target_idx = ckpt_horizons.index(PREDICTION_HORIZON)
+            try:
+                if MULTITASK_ONLY:
+                    # Always address the shared multi-task checkpoint (a task may
+                    # ALSO have an older single-task run on disk).
+                    checkpoint_path_ft, run_meta = find_best_checkpoint_multitask(
+                        base_dir_for_ckpt, task_key, PREDICTION_HORIZON)
+                else:
+                    checkpoint_path_ft = find_best_checkpoint(base_dir_for_ckpt, task_key, PREDICTION_HORIZON)
+            except FileNotFoundError:
+                # Multi-task run: the task is one HEAD under a shared alias
+                # folder (e.g. finetuning/multitask_infections/...).
+                checkpoint_path_ft, run_meta = find_best_checkpoint_multitask(
+                    base_dir_for_ckpt, task_key, PREDICTION_HORIZON)
+            ckpt_horizons = list(run_meta["horizons"]) if run_meta else extract_horizons_from_path(checkpoint_path_ft)
+            if run_meta:
+                _label_key = f"label_{task_key}_{PREDICTION_HORIZON:04d}d"
+                if _label_key not in run_meta.get("label_keys", []):
+                    raise FileNotFoundError(f"{_label_key} is not a head of multi-task run '{run_meta['task_key']}'")
+                target_idx = run_meta["label_keys"].index(_label_key)
+            else:
+                target_idx = ckpt_horizons.index(PREDICTION_HORIZON)
+            print(f">>> Checkpoint: {checkpoint_path_ft}"
+                  + (f"  [multi-task run '{run_meta['task_key']}', head task '{task_key}']" if run_meta else ""))
             
             pretrain_dir = base_dir_for_ckpt / "pretraining"
             checkpoint_path_pt = get_last_checkpoint(str(pretrain_dir))
@@ -809,7 +864,12 @@ def main():
 
         print("Loading patient sequences...")
         label_key = f"label_{task_key}_{PREDICTION_HORIZON:04d}d"
-        all_required_labels = [f"label_{task_key}_{h:04d}d" for h in ckpt_horizons]
+        if run_meta:
+            # All heads of the multi-task checkpoint, task-major order (keeps
+            # label columns aligned with logits columns / target_idx).
+            all_required_labels = list(run_meta["label_keys"])
+        else:
+            all_required_labels = [f"label_{task_key}_{h:04d}d" for h in ckpt_horizons]
         
         data_dir_split = DATA_DIR / DATA_SPLIT_TYPE
         all_fups = scan_all_fups(data_dir_split)
@@ -880,8 +940,12 @@ def main():
         ft_model_cfg["task"] = "classification"
         ft_model_cfg["pretrained_dir"] = str(checkpoint_path_ft)
         ft_model_cfg["embedding_layer_config"]["vocab_size"] = len(vocab)
-        ft_model_cfg["enforce_monotonicity"] = enforce_monotonicity
-        ft_model_cfg["model_args"]["num_labels"] = len(ckpt_horizons)
+        ft_model_cfg["enforce_monotonicity"] = (
+            # multi-task checkpoint: monotone horizon blocks PER TASK (task-major
+            # columns), mirroring the layout used at training time
+            [len(ckpt_horizons)] * len(run_meta["tasks"]) if run_meta else enforce_monotonicity
+        )
+        ft_model_cfg["model_args"].pop("num_labels", None)  # head layout comes from the checkpoint config (multi-task-aware)
         ft_model_cfg["model_args"]["problem_type"] = "multi_label_classification"
 
         model_ft = PatientEmbeddingModelFactory.from_pretrained(**ft_model_cfg)
