@@ -30,6 +30,7 @@ class TimeEmbedding(nn.Module):
             raise ValueError("Embedding dimension must be even")
         self.half_dim = embedding_dim // 2
         self.ratio = math.log(time_scale) / self.half_dim
+        self.register_buffer("inv_freq", torch.exp(-self.ratio * torch.arange(self.half_dim, dtype=torch.float32)), persistent=False)
 
     def forward(self, times: torch.Tensor) -> torch.Tensor:
         """
@@ -39,8 +40,8 @@ class TimeEmbedding(nn.Module):
             x: Tensor, shape [batch_size, seq_len, embedding_dim]
             times: Tensor, shape [batch_size, seq_len]
         """
-        freq_indices = torch.arange(self.half_dim, device=times.device)
-        times_scaled = times.unsqueeze(-1) * torch.exp(-self.ratio * freq_indices)
+        inv_freq = self.inv_freq.to(device=times.device)
+        times_scaled = times.unsqueeze(-1) * inv_freq
         time_embeddings = torch.cat([torch.sin(times_scaled), torch.cos(times_scaled)], dim=-1)
         
         return time_embeddings
@@ -454,6 +455,9 @@ def make_loss_func(loss_name: str, loss_args: dict = None):
         # loss_cls = nn.BCEWithLogitsLoss
         loss_cls = WeightedCELoss
         loss_args["class_weights"] = None  # equivalent to classic CE loss
+    elif loss_name == "dampened_ce":
+        loss_cls = WeightedCELoss
+        loss_args["class_weights"] = loss_args.get("alpha")
     elif loss_name == "weighted_ce":
         loss_cls = WeightedCELoss
     elif loss_name == "focal":

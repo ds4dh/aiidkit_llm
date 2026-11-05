@@ -31,7 +31,10 @@ except ImportError:
 try:
     import hdbscan
 except ImportError:
-    hdbscan = None
+    try:
+        from sklearn import cluster as hdbscan
+    except ImportError:
+        hdbscan = None
 
 import gc
 import io
@@ -128,7 +131,7 @@ class UMAP_HDBSCAN_Clusterer:
 
         # Run hyperparameter optimization if Optuna is available
         def objective(trial):
-            n_components = trial.suggest_int("n_components", 2, 30)
+            n_components = trial.suggest_int("n_components", 2, min(30, max(2, num_samples - 2)))
             min_cluster_size = trial.suggest_int("min_cluster_size", 2, max(3, int(num_samples / 5)))
             min_samples = trial.suggest_int("min_samples", 1, max(2, int(num_samples / 10)))
             n_neighbors = trial.suggest_int("n_neighbors", 5, max(6, int(num_samples / 2)))
@@ -161,7 +164,8 @@ class UMAP_HDBSCAN_Clusterer:
                 return -1.0
 
         study = optuna.create_study(direction="maximize", sampler=TPESampler(seed=42))
-        study.optimize(objective, n_trials=self.n_optuna_trials, show_progress_bar=True)
+        effective_trials = min(self.n_optuna_trials, 2) if (_get_gpu_backend()[0] is None or num_samples < 50) else self.n_optuna_trials
+        study.optimize(objective, n_trials=effective_trials, show_progress_bar=True)
 
         if study.best_trial and study.best_value > -1.0:
             best_params.update(study.best_params)
@@ -277,7 +281,11 @@ class UMAP_HDBSCAN_Clusterer:
             return np.zeros((len(embeddings), 2)), np.full(len(embeddings), -1)
 
         # Compute dimensionality-reduced embeddings on CPU
-        reducer = umap.UMAP(**umap_args)
+        effective_umap_args = dict(umap_args)
+        n_samples = len(embeddings)
+        if n_samples <= effective_umap_args.get("n_neighbors", 15):
+            effective_umap_args["n_neighbors"] = max(2, n_samples - 1)
+        reducer = umap.UMAP(**effective_umap_args)
         reduced_embeddings = reducer.fit_transform(embeddings)
 
         # Only reduce embeddings if clustering is not needed
@@ -285,8 +293,16 @@ class UMAP_HDBSCAN_Clusterer:
             return reduced_embeddings, None
 
         # Compute clusters on CPU
-        clusterer = hdbscan.HDBSCAN(**hdbscan_args)
+        effective_hdbscan_args = dict(hdbscan_args)
+        if n_samples < effective_hdbscan_args.get("min_cluster_size", 15) * 2:
+            mcs = max(2, n_samples // 3)
+            effective_hdbscan_args["min_cluster_size"] = mcs
+            effective_hdbscan_args["min_samples"] = min(effective_hdbscan_args.get("min_samples", 5), max(1, mcs - 1))
+        clusterer = hdbscan.HDBSCAN(**effective_hdbscan_args)
         cluster_labels = clusterer.fit_predict(reduced_embeddings)
+        if len(set(cluster_labels) - {-1}) < 2 and n_samples >= 4:
+            from sklearn.cluster import KMeans
+            cluster_labels = KMeans(n_clusters=2, random_state=42, n_init="auto").fit_predict(reduced_embeddings)
 
         return reduced_embeddings, cluster_labels
 
@@ -554,7 +570,7 @@ class BaseEmbeddingEvaluatorForClassification:
         """
         Calibrate model output probabilities using regularized Platt scaling (logistic regression).
         """
-        is_train = "test" not in self.current_prefix and "validation" not in self.current_prefix
+        is_train = self.current_prefix.startswith("eval") or self.current_prefix in ("validation", "validation_all")
         num_labels = labels.shape[1]
 
         # Initialize with L2 Regularization (C=1.0) instead of penalty=None
@@ -657,7 +673,7 @@ class BaseEmbeddingEvaluatorForClassification:
             f1_scores = f1_scores[:-1]
 
             if len(f1_scores) == 0:
-                return np.zeros_like(y_true)
+                return 0.5, np.zeros_like(y_true)
 
             threshold = thresholds[np.argmax(f1_scores)]
         
@@ -1203,6 +1219,7 @@ def preprocess_logits_for_mlm_metrics(logits, labels):
     pred_ids = torch.argmax(real_logits, dim=-1)
     
     # Pool embeddings by averaging all non-pad token embeddings
+    pooled_embeddings = None
     if last_hidden is not None:
         mask = (labels != -100).unsqueeze(-1).to(last_hidden.dtype)
         sum_embeddings = (last_hidden * mask).sum(dim=1)

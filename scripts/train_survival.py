@@ -42,6 +42,7 @@ def parse_args():
     parser.add_argument("--reset_weights", "-r", action="store_true", help="Whether to reset model weights before fine-tuning.")
     parser.add_argument("--silent", "-s", action="store_true", help="Disable wandb logging.")
     parser.add_argument("--overrides", "-o", action="append", default=[], help="Overrides config (JSON string or key=value).")
+    parser.add_argument("--tasks", "-t", type=str, default="", help="Comma-separated prediction_tasks keys to run.")
     return parser.parse_args()
 
 
@@ -60,6 +61,9 @@ def main():
     with open(cli_args.config, 'r') as f:
         cfg = yaml.safe_load(f)
     cfg = apply_config_overrides(cfg, cli_args.overrides)
+    if cli_args.tasks:
+        wanted = [t.strip() for t in cli_args.tasks.split(",") if t.strip()]
+        cfg["prediction_tasks"] = {t: cfg["prediction_tasks"][t] for t in wanted if t in cfg["prediction_tasks"]}
 
     # Identify pretraining and finetuning directories (same convention as classification)
     train_data_augment = cfg.get("train_data_augment", "all")
@@ -308,6 +312,7 @@ def test_survival_model(
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    trainer.remove_callback(EarlyStoppingCallback)
 
     split_configs = []
     if "validation" in dataset_dict:

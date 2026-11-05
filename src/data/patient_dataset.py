@@ -191,7 +191,7 @@ def load_hf_data_and_metadata(
                 batched=True,
                 batch_size=MAP_BATCH_SIZE,
                 desc=f"Preprocessing {split} set",
-                num_proc=SAFE_NUM_PROCS,
+                num_proc=(SAFE_NUM_PROCS if (os.name != "nt" and len(ds) >= 2000 and SAFE_NUM_PROCS > 1) else None),
                 load_from_cache_file=True,
                 keep_in_memory=False,
                 fn_kwargs={
@@ -368,7 +368,7 @@ def preprocess_batch(batch, vocab, bin_intervals, time_mapping, eav_mappings, bi
     # Process (entity, attribute, value) entries by batch
     ent_in = eav_mappings["entity_id"]      # usually "entity"
     attr_in = eav_mappings["attribute_id"]  # usually "attribute"
-    val_in = "value"                        # Raw values
+    val_in = "value" if "value" in batch else eav_mappings.get("value_id", "value_binned")
     out_ent_ids, out_attr_ids, out_val_ids = [], [], []
     for entities, attributes, values in zip(batch[ent_in], batch[attr_in], batch[val_in]):
         
@@ -425,6 +425,8 @@ def scan_and_compute_metadata(dataset, attribute_key="attribute", value_key="val
     unique_tokens = set()
     attribute_types = defaultdict(lambda: "numerical")
     
+    if hasattr(dataset, "column_names") and value_key not in dataset.column_names and "value_binned" in dataset.column_names:
+        value_key = "value_binned"
     # Single pass to collect data
     for sample in tqdm(dataset, desc="Compute dataset metadata"):
         unique_tokens.update(sample["entity"])  # add any entity immediately
@@ -504,14 +506,14 @@ def _load_and_tag(
         # (all label keys == -100 means the outcome is unknown at this
         # decision point; the losses mask them anyway, so keeping them only
         # wastes forward-pass compute and shrinks the effective batch size).
-        if drop_unlabeled and label_keys:
+        if drop_unlabeled and label_keys and all(k in ds.column_names for k in label_keys):
             lab = np.stack([np.asarray(ds[k]) for k in label_keys], axis=1)
             keep = np.where((lab != -100).any(axis=1))[0]
             if len(keep) < len(ds):
                 ds = ds.select(keep)
 
         # Soft undersampling, usually only for training data
-        if target_undersampling_ratio is not None:
+        if target_undersampling_ratio is not None and all(k in ds.column_names for k in (label_keys or [])) and (balancing_label_key is None or balancing_label_key in ds.column_names):
             ds = undersample_dataset(ds, label_keys, target_undersampling_ratio,
                                      balancing_label_key=balancing_label_key)
             ds = ds.flatten_indices()  # (keep_in_memory=True)

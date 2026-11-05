@@ -45,6 +45,7 @@ def parse_args():
     parser.add_argument("--config", "-c", type=str, default="configs/discriminative_classic_ml.yaml")
     parser.add_argument("--fixed_hp", "-f", action="store_true", help="Skip Optuna hyperparameter search.")
     parser.add_argument("--overrides", "-o", action="append", default=[], help="Overrides config (JSON string or key=value).")
+    parser.add_argument("--tasks", "-t", nargs="+", default=[], help="Comma- or space-separated prediction_tasks keys to run.")
     return parser.parse_args()
 
 
@@ -53,7 +54,7 @@ def scan_all_fups(data_root: Path) -> list[int]:
     fups = []
     if not data_root.exists(): return []
     for path in data_root.iterdir():
-        if path.is_dir() and path.name.startswith("fup_") and path.name.endswith("d"):
+        if path.is_dir() and path.name.startswith("fup_"):
             try:
                 # Extract integer from "fup_0090d" -> 90
                 val = int(path.name.split("_")[-1].replace("d", ""))
@@ -77,6 +78,9 @@ def main():
         cfg = yaml.safe_load(f)
     from src.utils import apply_config_overrides
     cfg = apply_config_overrides(cfg, args.overrides)
+    if args.tasks:
+        wanted = [t.strip() for arg in (args.tasks if isinstance(args.tasks, list) else [args.tasks]) for t in arg.split(",") if t.strip()]
+        cfg["prediction_tasks"] = {t: cfg["prediction_tasks"][t] for t in wanted if t in cfg["prediction_tasks"]}
 
     # Run all models
     model_types = cfg['model_types']
@@ -159,6 +163,8 @@ def load_combined_data(
     dfs = []    
     for fup in fups:
         fup_dir = data_root / f"fup_{fup:04d}d"
+        if not fup_dir.exists():
+            fup_dir = data_root / f"fup_{fup:04d}"
         file_path = fup_dir / filename
         if file_path.exists():
             df_chunk = pd.read_parquet(file_path)
@@ -166,14 +172,14 @@ def load_combined_data(
                 df_chunk = df_chunk[df_chunk[label_key] != -100]
             dfs.append(df_chunk)
 
-    if not dfs: return None, None, None
+    if not dfs: return None, None, None, None
     full_df = pd.concat(dfs, ignore_index=True)
 
     # Feature selection logic
     if enforced_features is None:
         # Dynamic detection (training phase)
         feats = [c for c in full_df.columns if c not in ignore_cols and not c.startswith("label_")]
-        X_df = full_df[feats]
+        X_df = full_df[feats].copy()
     else:
         # Strict enforcement (validation/test phase)
         feats = enforced_features
@@ -181,6 +187,8 @@ def load_combined_data(
         # Missing columns in 'full_df' become NaNs (which SimpleImputer will handle).
         X_df = full_df.reindex(columns=feats)
 
+    for obj_col in X_df.select_dtypes(include=["object", "category"]).columns:
+        X_df[obj_col] = X_df[obj_col].astype("category").cat.codes
     X = X_df.values
     y = full_df[label_key].values if label_key in full_df.columns else None
     patient_ids = (
@@ -364,13 +372,17 @@ class OptunaTrainer:
         Runs Optuna optimization to find best params, then retrains on full data.
         """
         # Define objective function
+        base_pipe = build_model_pipeline(X_train, y_train, self.model_type, self._merge_fixed_params({}), self.target_ratio)
+        prep_only = Pipeline([base_pipe.steps[0], base_pipe.steps[1]])
+        X_train_prep = prep_only.fit_transform(X_train, y_train)
+        X_val_prep = prep_only.transform(X_val)
         def objective(trial):
             # Sample parameters
             params = self._suggest_params(trial)
             
             # Build temporary pipeline
             pipeline = build_model_pipeline(
-                X_train, y_train, self.model_type, params, self.target_ratio,
+                X_train_prep, y_train, self.model_type, params, self.target_ratio, include_preprocessor=False,
             )
             
             # Fit on train, score on validation (simple hold-out optimization)
@@ -379,9 +391,9 @@ class OptunaTrainer:
             # return a valid fallback score, otherwise the whole study has no
             # completed trials and study.best_trial raises.
             try:
-                pipeline.fit(X_train, y_train)
+                pipeline.fit(X_train_prep, y_train)
                 if hasattr(pipeline, "predict_proba"):
-                    probs = pipeline.predict_proba(X_val)[:, 1]
+                    probs = pipeline.predict_proba(X_val_prep)[:, 1]
                     if np.isnan(probs).any():
                         return 0.5
                     score = roc_auc_score(y_val, probs)
@@ -501,7 +513,11 @@ def infer_feature_types(X, cat_threshold=20):
         elif n_unique <= cat_threshold:
             # Heuristic: Small integer range = categorical
             # (Check if values are essentially integers)
-            if np.all(np.mod(valid_values, 1) == 0):
+            try:
+                is_int_like = np.all(np.mod(valid_values.astype(float), 1) == 0)
+            except (TypeError, ValueError):
+                is_int_like = True
+            if is_int_like:
                  categorical_cols.append(i)
             else:
                  numerical_cols.append(i)
@@ -511,12 +527,12 @@ def infer_feature_types(X, cat_threshold=20):
     return binary_cols, categorical_cols, numerical_cols
 
 
-def build_model_pipeline(X_train, y_train, model_type, model_params, target_ratio=None):
+def build_model_pipeline(X_train, y_train, model_type, model_params, target_ratio=None, include_preprocessor=True):
     """
     Constructs a ColumnTransformer pipeline that treats features differently.
     """
     # Infer types
-    bin_idx, cat_idx, num_idx = infer_feature_types(X_train)
+    bin_idx, cat_idx, num_idx = infer_feature_types(X_train) if include_preprocessor else ([], [], [])
     # print(f"   [Auto-Preprocessing] Detected: {len(bin_idx)} Binary, {len(cat_idx)} Categorical, {len(num_idx)} Numerical features.")
 
     # Numerical: median impute -> standard scale (robust to outliers/skew)
@@ -550,6 +566,7 @@ def build_model_pipeline(X_train, y_train, model_type, model_params, target_rati
     dropper = VarianceThreshold(threshold=0)
 
     # Feature selector (keeps top N-% of features based on ANOVA F-value
+    model_params = dict(model_params)
     percentile = model_params.pop('feature_fraction', 100)
     selector = SelectPercentile(score_func=f_classif, percentile=percentile)
 
@@ -572,7 +589,7 @@ def build_model_pipeline(X_train, y_train, model_type, model_params, target_rati
     # ])
     
     # Initialize pipeline step list
-    steps = [
+    steps = [('selector', selector)] if not include_preprocessor else [
         ('preprocessor', preprocessor),
         ('dropper', dropper),
         ('selector', selector),
@@ -623,6 +640,8 @@ def test_classic_ml_model(
     for config in split_configs:
         # Check if the target source files actually exist on disk before launching the pass
         file_check_sample = data_root / f"fup_{all_possible_fups[0]:04d}d" / config["filename"]
+        if not file_check_sample.exists():
+            file_check_sample = data_root / f"fup_{all_possible_fups[0]:04d}" / config["filename"]
         if not file_check_sample.exists():
             print(f"    [Skip] Partition data missing for split: [{config['split_label']}]")
             continue

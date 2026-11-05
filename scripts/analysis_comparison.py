@@ -27,6 +27,7 @@ import argparse
 import hashlib
 import json
 import re
+import yaml
 from concurrent.futures import ThreadPoolExecutor
 
 import matplotlib
@@ -75,9 +76,15 @@ parser.add_argument(
     help="Number of threads used for bootstrap resampling (does not affect results).",
 )
 parser.add_argument(
-    "--tasks",
+    "--config", "-c",
+    default=None,
+    help="YAML training config used to discover active tasks when --tasks is omitted.",
+)
+parser.add_argument(
+    "--tasks", "-t",
     nargs="+",
-    default=["infection_bacteria", "infection_virus"],
+    default=None,
+    # default from config when --tasks is omitted
     help="Outcome tasks to analyze (one comparison report per task). When the proposed "
          "model's predictions CSV carries a 'task' column (multi-task runs), this "
          "selects the corresponding head per task. E.g. --tasks infection_bacteria "
@@ -103,6 +110,12 @@ parser.add_argument(
     "--results-dir",
     default="results",
     help="Directory containing all results.",
+)
+parser.add_argument(
+    "--splits",
+    nargs="+",
+    default=["random_split", "temporal_split", "center_split"],
+    help="Data split strategies to include in the comparison.",
 )
 args = parser.parse_args()
 
@@ -271,8 +284,32 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 ALL_MODELS = [PROPOSED_MODEL, *CONTENDER_MODELS]
 PROPOSED_DISP = MODEL_ENTRIES[PROPOSED_MODEL]["display"]
-TASKS = list(args.tasks)  # overridable via --tasks (one report per task)
-SPLIT_TYPES = ["random_split", "temporal_split", "center_split"]
+def _resolve_tasks_from_config(config_arg: str | None) -> list[str]:
+    """Extract individual task keys from a training YAML config (expanding multi-task entries)."""
+    candidates = (
+        [Path(config_arg)] if config_arg else [
+            # Default training config (Option 1 multi-task)
+            Path("configs/discriminative_training.yaml"),
+            Path("configs/discriminative_classic_ml.yaml"),
+        ]
+    )
+    resolved: list[str] = []
+    for cfg_path in candidates:
+        if not cfg_path.exists():
+            continue
+        with open(cfg_path, "r") as f:
+            cfg = yaml.safe_load(f) or {}
+        for t_key, t_specs in (cfg.get("prediction_tasks") or {}).items():
+            sub_tasks = t_specs.get("tasks", [t_key]) if isinstance(t_specs, dict) else [t_key]
+            for st in sub_tasks:
+                if st not in resolved:
+                    resolved.append(st)
+        if config_arg and resolved:
+            break
+    return resolved or ["infection_bacteria", "infection_virus"]
+
+TASKS = list(args.tasks) if args.tasks else _resolve_tasks_from_config(args.config)
+SPLIT_TYPES = list(args.splits)
 TARGET_HORIZONS = [30, 60, 90]
 N_BOOTSTRAP = 1000
 
@@ -323,7 +360,31 @@ def _predictions_csv(model: str, split: str, task: str, dataset_split: str, hori
     rel = MODEL_ENTRIES[model]["path_template"].format(
         split=split, run_id=MODEL_RUN_ID, task=task, model=model, horizon=horizon,
     )
-    return RESULTS_DIR / rel / f"{dataset_split}_predictions.csv"
+    cand = RESULTS_DIR / rel / f"{dataset_split}_predictions.csv"
+    if not cand.exists() and (task.startswith("infection_grp_") or task.startswith("grp_")):
+        alt_task = task.replace("infection_grp_", "grp_", 1) if task.startswith("infection_grp_") else f"infection_{task}"
+        alt_rel = MODEL_ENTRIES[model]["path_template"].format(
+            split=split, run_id=MODEL_RUN_ID, task=alt_task, model=model, horizon=horizon,
+        )
+        alt_cand = RESULTS_DIR / alt_rel / f"{dataset_split}_predictions.csv"
+        if alt_cand.exists():
+            return alt_cand
+    if model in ("transformer", "transformer_multitask"):
+        valid_cands = [cand] if cand.exists() else []
+        ft_root = RESULTS_DIR / "transformer" / split / MODEL_RUN_ID / "finetuning"
+        if ft_root.exists():
+            for meta_file in sorted(ft_root.glob("*/*/run_metadata.json")):
+                try:
+                    meta = json.loads(meta_file.read_text())
+                    if task in meta.get("tasks", []):
+                        mt_cand = meta_file.parent / f"{dataset_split}_predictions.csv"
+                        if mt_cand.exists():
+                            valid_cands.append(mt_cand)
+                except Exception:
+                    continue
+        if valid_cands:
+            return max(valid_cands, key=lambda p: p.stat().st_mtime_ns)
+    return cand
 
 def _input_csv_fingerprint() -> str:
     """Fingerprint every input predictions CSV (path + mtime + size).

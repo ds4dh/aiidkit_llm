@@ -30,7 +30,7 @@ from transformers.trainer_utils import get_last_checkpoint
 from src.model.patient_embedder import PatientEmbeddingModelFactory, PatientDataCollatorForClassification
 from src.evaluation.evaluate_models import UMAP_HDBSCAN_Clusterer, ModelInterpreter
 from src.data.patient_dataset import load_hf_data_and_metadata
-from scripts.analysis_interpretability import find_best_checkpoint, extract_horizons_from_path
+from scripts.script_utils import find_best_checkpoint, extract_horizons_from_path
 from scripts.script_utils import scan_all_fups, get_best_optuna_run, calibrate_array_pair, find_best_checkpoint_multitask
 
 import argparse
@@ -47,6 +47,8 @@ parser.add_argument("--run-id", "--run_id", type=str, default="",
                     help="Pre-training run id subfolder (e.g. e00-a15-v60). Default: the only folder present.")
 parser.add_argument("--config", "-c", type=str, default="configs/discriminative_training.yaml",
                     help="Training config providing model/collator settings for checkpoint loading.")
+parser.add_argument("--task", "-t", type=str, default=None,
+                    help="Single outcome task to stratify patients for (e.g. infection_bacteria or infection_grp_cmv). Default: infection_bacteria.")
 parser.add_argument("--tasks", nargs="+", default=None,
                     help="Outcome tasks to stratify patients for (one analysis per task). "
                          "Default: infection_bacteria. Multi-task checkpoints are supported: "
@@ -55,6 +57,7 @@ args, _ = parser.parse_known_args()
 
 # Model selection
 RESULTS_DIR = args.results_dir
+DATA_SPLIT_TYPE = args.data_split_type
 PROPOSED_MODEL = args.proposed_model
 RUN_ID = args.run_id.strip()
 
@@ -82,12 +85,7 @@ DATA_DIR = args.data_dir
 # Configuration
 FROM_OPTUNA = "optuna" in TRANSFORMER_BASE_DIR.name
 DATA_SPLIT_TYPE = args.data_split_type
-TASKS = args.tasks if args.tasks else [
-    "infection_bacteria",
-    # "infection_virus",
-    # "death",
-    # "graft_loss",
-]
+TASKS = [args.task] if args.task else (args.tasks[:1] if args.tasks else ['infection_bacteria'])
 MAX_FUP = 3600
 if DATA_SPLIT_TYPE == "temporal_split":
     MAX_FUP = 2400
@@ -502,6 +500,8 @@ def plot_scatter_unsupervised(ax, reduced, hue_labels, style_labels, cluster_col
 
 
 def plot_test_calibration_curve(y_test_true, raw_probs, cal_probs, task_key, output_dir, n_bins=10):
+    valid_m = y_test_true >= 0
+    y_test_true, raw_probs, cal_probs = y_test_true[valid_m], raw_probs[valid_m], cal_probs[valid_m]
     fig, ax = plt.subplots(figsize=(8, 8))
     
     ax.plot([0, 1], [0, 1], linestyle="--", color="gray", label="Perfect Calibration")
@@ -580,7 +580,7 @@ def compute_cluster_enrichment_profiles(base_test_ds, cluster_labels, true_label
                 elif not ent_name.lower().startswith("previous"):
                     ent_name = f"Previous {ent_name.lower()}"
             
-            full_feature_name = f"{ent_name} - {attr_name}"
+            full_feature_name = f"{ent_name} - {attr_name}" if e_id >= 5 else attr_name
             f_set.add(f"{full_feature_name} : {val_name}")
             
         patient_features[pid] = f_set
@@ -683,7 +683,7 @@ def export_exact_cluster_comparison_csv(base_test_ds, cluster_labels, vocab, glo
                 elif not ent_name.lower().startswith("previous"):
                     ent_name = f"Previous {ent_name.lower()}"
             
-            full_feature_name = f"{ent_name} - {attr_name} : {val_name}"
+            full_feature_name = f"{ent_name} - {attr_name} : {val_name}" if e_id >= 5 else f"{attr_name} : {val_name}"
             f_set.add(full_feature_name)
             all_unique_features.add(full_feature_name)
             
@@ -833,6 +833,12 @@ def main():
                         base_dir_for_ckpt, task_key, PREDICTION_HORIZON)
                 else:
                     checkpoint_path_ft = find_best_checkpoint(base_dir_for_ckpt, task_key, PREDICTION_HORIZON)
+                    try:
+                        mt_ckpt, mt_meta = find_best_checkpoint_multitask(base_dir_for_ckpt, task_key, PREDICTION_HORIZON)
+                        if mt_ckpt.stat().st_mtime_ns >= checkpoint_path_ft.stat().st_mtime_ns:
+                            checkpoint_path_ft, run_meta = mt_ckpt, mt_meta
+                    except FileNotFoundError:
+                        pass
             except FileNotFoundError:
                 # Multi-task run: the task is one HEAD under a shared alias
                 # folder (e.g. finetuning/multitask_infections/...).
@@ -884,6 +890,8 @@ def main():
             fup_valid=[BASE_FUP_FOR_PREDICTION],
             fup_test=all_fups, 
             label_keys=all_required_labels,
+            time_mapping=config["data_collator"].get("time_mapping", None),
+            eav_mappings=config["data_collator"].get("eav_mappings", None),
         )
         
         val_ds = dataset["validation"].add_column("split", ["validation"] * len(dataset["validation"]))
@@ -901,8 +909,9 @@ def main():
         enforce_monotonicity = config.get("finetuner", {}).get("enforce_monotonicity", False)
         
         collator = PatientDataCollatorForClassification(
+            **config["data_collator"],
             label_keys=all_required_labels,
-            max_position_embeddings=config["data_collator"].get("max_position_embeddings", 512)
+            max_position_embeddings=model_cfg_base["model_args"].get("max_position_embeddings", 512),
         )
 
         base_test_ds = test_ds.filter(lambda x: x["fup"] == BASE_FUP_FOR_PREDICTION)
@@ -1021,7 +1030,7 @@ def main():
         plot_combined_stratification_grid(
             test_ds=test_ds,
             patient_ids=patient_ids,
-            probs=raw_probs_test,
+            probs=probs_ft,
             reduced_pt=reduced_pt,
             reduced_ft=reduced_ft,
             labels_pt=labels_pt,

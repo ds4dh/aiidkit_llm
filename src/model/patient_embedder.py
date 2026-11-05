@@ -42,6 +42,8 @@ class PatientEmbeddingModelFactory:
                 model_args[key] = getattr(torch, model_args[key])
 
         # Load model configuration from huggingface's directory
+        if isinstance(config_args.get("layer_types"), list) and len(config_args["layer_types"]) >= 2 and "sliding_attention" not in config_args["layer_types"]:
+            config_args["layer_types"] = ["sliding_attention"] + list(config_args["layer_types"][1:])
         config = AutoConfig.from_pretrained(model_id, **config_args, **model_args)
         config.enforce_monotonicity = enforce_monotonicity
 
@@ -80,7 +82,16 @@ class PatientEmbeddingModelFactory:
         """
         print(f"From pretrained unused arguments: {kwargs}")
         # Load Config from the local directory
-        model_args.update(kwargs)  # in case some were given as top-level arguments
+        model_args = {k: v for k, v in model_args.items() if k not in ("model_id", "load_backbone_weights", "config_args")}
+        cfg_json_path = os.path.join(pretrained_dir, "config.json")
+        if os.path.exists(cfg_json_path):
+            import json as _json
+            with open(cfg_json_path, "r") as _f:
+                _cdict = _json.load(_f)
+            if isinstance(_cdict.get("layer_types"), list) and len(_cdict["layer_types"]) >= 2 and "sliding_attention" not in _cdict["layer_types"]:
+                _cdict["layer_types"] = ["sliding_attention"] + list(_cdict["layer_types"][1:])
+                with open(cfg_json_path, "w") as _f:
+                    _json.dump(_cdict, _f, indent=2)
         config = AutoConfig.from_pretrained(pretrained_dir, **model_args)
         config.enforce_monotonicity = enforce_monotonicity
 
@@ -296,7 +307,7 @@ class PatientEmbeddingLayer(nn.Module):
                 new_triplets_to_encode.append(triplet)
 
         # If there are new, unseen triplets, encode them
-        event_embedding_model = self.event_sentence_embedding_model_list[0]
+        event_embedding_model = self.sentence_model
         if new_triplets_to_encode:
 
             # Build sentences from unseen event triplets
@@ -448,7 +459,8 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
         Separate non-feature labels (e.g., for classification) from the samples
         """
         # Identify which keys are the non-features
-        sample_keys = samples[0].keys()
+        samples = [dict(s) for s in samples]
+        sample_keys = list(samples[0].keys())
         non_processed_keys = [k for k in sample_keys if k not in self.feature_keys]
         if not non_processed_keys or not samples: return samples, {}  # useful?
 
@@ -561,7 +573,7 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
         given the data it contains
         """
         if data_key == self.time_key:
-            to_add = ([sequence[0]], [sequence[-1]])
+            to_add = ([sequence[0] if len(sequence) > 0 else 0], [sequence[-1] if len(sequence) > 0 else 0])
         else:
             to_add = ([self.bos_token_id], [self.eos_token_id])
 
@@ -598,7 +610,9 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
             )
 
         # Compute attention mask, given the padding performed on the sequences
-        attention_mask = padded_batch[self.feature_keys[0]] != self.pad_token_id
+        seq_lengths = np.array([len(s[self.feature_keys[0]]) for s in samples], dtype=np.int64)
+        max_len = int(seq_lengths.max()) if len(seq_lengths) > 0 else 0
+        attention_mask = (np.arange(max_len)[None, :] < seq_lengths[:, None])
         attention_mask = attention_mask.astype(int)
 
         return padded_batch, attention_mask
@@ -721,6 +735,7 @@ class PatientDataCollatorForClassification(PatientDataCollatorForMaskedLanguageM
         Collate patient sequences and create labels for supervised fine-tuning
         Used by HuggingFace's trainer
         """
+        samples = [dict(s) for s in samples]
         batch_labels = []
         for s in samples:
             try:

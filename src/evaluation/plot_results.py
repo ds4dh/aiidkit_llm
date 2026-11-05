@@ -58,6 +58,7 @@ def plot_task_results(
     task_specs: dict,
     finetuning_dir: Path,
     train_data_augment: str = "all",
+    sub_task: str | None = None,
 ):
     """Generates and saves the bar plot for a single task_key."""
     task_dir = finetuning_dir / task_key
@@ -94,7 +95,8 @@ def plot_task_results(
             for h in current_horizons:
                 for metric in METRICS_TO_PLOT:
                     # Construct strict key: e.g. test_fup_0030_roc_auc_label_infection_bacteria_0060d
-                    key = f"test_fup_{fup:04d}_{metric}_label_{task_key}_{h:04d}d"
+                    label_task = sub_task if sub_task is not None else task_key
+                    key = f"test_fup_{fup:04d}_{metric}_label_{label_task}_{h:04d}d"
                     val = results.get(key, 0.0)
                     plot_data[metric][h].append(val)
 
@@ -130,7 +132,14 @@ def plot_task_results(
 
         # Styling
         ax.set_ylabel(cfg["label"], fontsize=11, fontweight='bold')
-        ax.set_ylim(cfg["lim"])
+        all_vals = [v for h in flat_horizons for v in plot_data[metric][h] if v > 0.0]
+        y_low, y_high = cfg["lim"]
+        if all_vals:
+            if min(all_vals) < y_low:
+                y_low = max(0.0, round(min(all_vals) - 0.05, 2))
+            if max(all_vals) > y_high - 0.03:
+                y_high = min(1.06, round(max(all_vals) + 0.06, 2))
+        ax.set_ylim((y_low, y_high))
         ax.grid(axis='y', linestyle='--', alpha=0.4)
         ax.set_xticks(x_pos)
         ax.set_xticklabels([f"FUP {f}d" for f in fups], fontsize=10)
@@ -142,7 +151,8 @@ def plot_task_results(
 
     # Save
     task_dir.mkdir(parents=True, exist_ok=True)
-    fname = task_dir / f"results_tda-{train_data_augment}.png"
+    suffix = f"_{sub_task}" if sub_task is not None else ""
+    fname = task_dir / f"results_tda-{train_data_augment}{suffix}.png"
     plt.tight_layout()
     plt.savefig(fname)
     plt.close()

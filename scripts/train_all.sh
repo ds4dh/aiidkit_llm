@@ -37,7 +37,7 @@ mkdir -p "$LOG_DIR"
 # ==============================================================================
 MLM_CONFIG=${MLM_CONFIG:-"configs/discriminative_training.yaml"}                  # Step 1: MLM pre-training
 SURVIVAL_FT_CONFIG=${SURVIVAL_FT_CONFIG:-"configs/survival_training.yaml"}        # Step 2: Survival (Cox) fine-tuning
-FT_CONFIG=${FT_CONFIG:-"configs/discriminative_training_multitask.yaml"}          # Single-task: configs/discriminative_training.yaml
+FT_CONFIG=${FT_CONFIG:-"configs/discriminative_training.yaml"}                    # Domain-grouped multi-task default (Option 1)
 CLASSIC_ML_CONFIG=${CLASSIC_ML_CONFIG:-"configs/discriminative_classic_ml.yaml"}  # Step 4: LR / RF / XGBoost baselines
 SURV_COMP_CONFIG=${SURV_COMP_CONFIG:-"configs/survival_training.yaml"}            # Step 6: Cross-family comparison
 ANALYSIS_CONFIG=${ANALYSIS_CONFIG:-"configs/discriminative_training.yaml"}        # Steps 7 & 8: model/collator settings for interpretability + stratification
@@ -68,10 +68,10 @@ RUN_SPLITS=(${RUN_SPLITS:-"random_split" "center_split" "temporal_split"})      
 # only support transformer-family proposed models and skip with a message for
 # classic ML or unsupported models. The survival model is an optional bonus.
 # ==============================================================================
-ANALYSIS_PROPOSED_MODEL=${ANALYSIS_PROPOSED_MODEL:-"transformer_multitask"}       # Single-task analyses: "transformer"
+ANALYSIS_PROPOSED_MODEL=${ANALYSIS_PROPOSED_MODEL:-"transformer"}                 # Resolves both single-task and multi-task runs
 # Baselines compared against the proposed model. Only LR is currently trained
 # on the group tasks; add random_forest / xgboost after Step 4 runs with them:
-ANALYSIS_CONTENDER_MODELS=${ANALYSIS_CONTENDER_MODELS:-"logistic_regression"}     # Full: "logistic_regression random_forest xgboost"
+ANALYSIS_CONTENDER_MODELS=${ANALYSIS_CONTENDER_MODELS:-"logistic_regression random_forest xgboost"}
 # Pre-training run id used to locate transformer-family result folders
 # (must match run_id in configs / results layout)
 ANALYSIS_RUN_ID=${ANALYSIS_RUN_ID:-"e00-a15-v60"}
@@ -86,8 +86,8 @@ ANALYSIS_TASKS=${ANALYSIS_TASKS:-"infection_bacteria infection_virus infection_g
 # Per-analysis overrides (default: ANALYSIS_TASKS). Steps 7/8 are expensive
 # per task -> curated to the two showcase groups (one bacterial, one viral):
 COMPARISON_TASKS=${COMPARISON_TASKS:-"$ANALYSIS_TASKS"}
-INTERPRET_TASKS=${INTERPRET_TASKS:-"infection_grp_enterobacterales infection_grp_cmv"}
-STRATIFICATION_TASKS=${STRATIFICATION_TASKS:-"infection_grp_enterobacterales infection_grp_cmv"}
+INTERPRET_TASKS=${INTERPRET_TASKS:-"infection_bacteria"}
+STRATIFICATION_TASKS=${STRATIFICATION_TASKS:-"infection_bacteria"}
 if [ "$ANALYSIS_TASKS" = "all_pathogens" ]; then
     ANALYSIS_TASKS=$(python - <<PY 2>/dev/null
 import json

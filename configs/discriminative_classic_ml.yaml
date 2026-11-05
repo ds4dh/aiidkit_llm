@@ -2,10 +2,10 @@
 data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v3.9/classic_ml
 data_split_type: center_split  # random_split, center_split, temporal_split
 result_dir: results/classic_ml
-model_types: [random_forest, xgboost]  # [logistic_regression]  # LR only for now (speed); add random_forest, xgboost later
+model_types: [logistic_regression, random_forest, xgboost]
 prediction_tasks:
-  # Keep this list in sync with 'multitask_infections.tasks' in
-  # configs/discriminative_training_multitask.yaml so the comparison can match
+  # Keep this list in sync with 'multitask_bacteria' and 'multitask_viruses' in
+  # configs/discriminative_training.yaml so the comparison can match
   # the transformer heads one-to-one.
   infection_bacteria:   {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
   infection_virus:      {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}

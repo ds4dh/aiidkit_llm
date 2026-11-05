@@ -34,11 +34,11 @@ from src.data.patient_dataset import load_hf_data_and_metadata
 from src.model.patient_embedder import PatientEmbeddingModelFactory, PatientDataCollatorForClassification
 from src.evaluation.evaluate_models import ModelInterpreter
 from scripts.script_utils import (
-    find_best_checkpoint, find_best_checkpoint_multitask, extract_horizons_from_path, get_best_optuna_run,
+    find_best_checkpoint, find_best_checkpoint_multitask, extract_horizons_from_path, get_best_optuna_run, scan_all_fups,
 )
 
 CLI_CFG = {}
-SAFE_NUM_PROC = 4
+SAFE_NUM_PROC = None if os.name == "nt" else 4
 GENERATE_SANITIZE_PLOTS = False
 
 # =================================
@@ -63,6 +63,8 @@ parser.add_argument("--run-id", "--run_id", type=str, default="",
                     help="Pre-training run id subfolder (e.g. e00-a15-v60). Default: the only folder present.")
 parser.add_argument("--config", "-c", type=str, default="configs/discriminative_training.yaml",
                     help="Training config providing model/collator settings for checkpoint loading.")
+parser.add_argument("--task", "-t", type=str, default=None,
+                    help="Single outcome task to analyze (e.g. infection_bacteria or infection_grp_cmv). Default: infection_bacteria.")
 parser.add_argument("--tasks", nargs="+", default=None,
                     help="Outcome tasks to attribute (each gets the five clinical-window "
                          "configs). Default: infection_bacteria. Multi-task checkpoints are "
@@ -145,7 +147,8 @@ TASK_CONFIG = {
 
 # Optional task-list override (--tasks): builds the SAME five clinical-window
 # configs for each requested outcome task, with matching output names.
-if args.tasks:
+_selected_tasks = [args.task] if args.task else (args.tasks[:1] if args.tasks else ["infection_bacteria"])
+if _selected_tasks:
     _WINDOWS = {
         "perioperative": (0, 0),
         "opportunistic": (30, 150),
@@ -157,7 +160,7 @@ if args.tasks:
         f"{t.removeprefix('infection_').removeprefix('grp_') or t}_{w}": {
             "task": t, "horizon": 30, "fup_min": lo, "fup_max": hi, "fup_step": 30,
         }
-        for t in args.tasks for w, (lo, hi) in _WINDOWS.items()
+        for t in _selected_tasks for w, (lo, hi) in _WINDOWS.items()
     }
 
 # Medications
@@ -304,7 +307,11 @@ def main():
         fup_min = task_params["fup_min"]
         fup_max = task_params["fup_max"]
         fup_step = task_params["fup_step"]
-        fups = list(range(fup_min, fup_max + 1, fup_step))
+        avail_fups = set(scan_all_fups(DATA_DIR / DATA_SPLIT_TYPE))
+        fups = [f for f in range(fup_min, fup_max + 1, fup_step) if not avail_fups or f in avail_fups]
+        if not fups:
+            print(f"[Skip] No available FUP folders in [{fup_min}, {fup_max}] for '{config_name}'")
+            continue
 
         print(f"\n{'='*60}")
         print(f">>> Executing Config: '{config_name}' (Task: {task_key}, Horizon: {hrz})")
@@ -333,6 +340,12 @@ def main():
                 else:
                     checkpoint_path = find_best_checkpoint(base_dir_for_ckpt, task_key, hrz)
                     run_meta = None
+                    try:
+                        mt_ckpt, mt_meta = find_best_checkpoint_multitask(base_dir_for_ckpt, task_key, hrz)
+                        if mt_ckpt.stat().st_mtime_ns >= checkpoint_path.stat().st_mtime_ns:
+                            checkpoint_path, run_meta = mt_ckpt, mt_meta
+                    except FileNotFoundError:
+                        pass
             except FileNotFoundError:
                 # Multi-task runs store a head per (task, horizon) under one
                 # alias folder (e.g. multitask_infections): locate that run and
@@ -397,12 +410,18 @@ def main():
             if isinstance(model_cfg_base["model_args"].get(key), str):
                 model_cfg_base["model_args"][key] = getattr(torch, model_cfg_base["model_args"][key])
         
-        target_dtype = model_cfg_base["model_args"].get("torch_dtype", torch.float32)
+        target_dtype = torch.float32 if DEVICE == "cpu" else model_cfg_base["model_args"].get("torch_dtype", model_cfg_base["model_args"].get("dtype", torch.float32))
+        if DEVICE == "cpu":
+            model_cfg_base["model_args"]["dtype"] = torch.float32
 
         emb_cfg = model_cfg_base["embedding_layer_config"].copy()
         emb_cfg["vocab_size"] = len(vocab)
         
+        enforce_monotonicity = config.get("finetuner", {}).get("enforce_monotonicity", False)
+        if run_meta:
+            enforce_monotonicity = [len(ckpt_hrzs)] * len(run_meta["tasks"]) if (enforce_monotonicity and len(ckpt_hrzs) > 1) else False
         model = PatientEmbeddingModelFactory.from_pretrained(
+            enforce_monotonicity=enforce_monotonicity,
             task="classification",
             pretrained_dir=str(checkpoint_path),
             embedding_layer_config=emb_cfg,
@@ -451,6 +470,7 @@ class ForwardWrapperForCaptum(torch.nn.Module):
         super().__init__()
         self.model = model
         self.pad_id = pad_id
+        self.fixed_attention_mask = None
     
     def forward(self, entity_id, attribute_id, value_id, days_since_tpx):
         input_dict = {
@@ -459,12 +479,20 @@ class ForwardWrapperForCaptum(torch.nn.Module):
             "value_id": value_id,
             "days_since_tpx": days_since_tpx
         }
-        attention_mask = (entity_id != self.pad_id).long()            
+        attention_mask = (
+            self.fixed_attention_mask.repeat(max(1, entity_id.shape[0] // self.fixed_attention_mask.shape[0]), 1)[:entity_id.shape[0]]
+            if self.fixed_attention_mask is not None
+            else ((entity_id != self.pad_id) | (attribute_id != self.pad_id) | (value_id != self.pad_id)).long()
+        )
         outputs = self.model(input_dict=input_dict, attention_mask=attention_mask)
         return torch.sigmoid(outputs.logits)
 
 
-def _build_baseline(ent, attr, val, days, pad_id=0, bos_id=2, time_neutral=False):
+def _build_baseline(ent, attr, val, days, pad_id=0, bos_id=2, time_neutral=False, values_only=False):
+    if values_only:
+        baseline_val = torch.full_like(val, pad_id if time_neutral else 0)
+        baseline_val[:, 0] = bos_id
+        return ent.clone(), attr.clone(), baseline_val, (days.clone() if time_neutral else torch.zeros_like(days))
     current_pad = pad_id if time_neutral else 0
 
     baseline_ent = torch.full_like(ent, current_pad)
@@ -521,7 +549,9 @@ def extract_attributions(
             pad_id=pad_token_id, 
             bos_id=bos_token_id,
             time_neutral=USE_TIME_NEUTRAL_BASELINE,
+            values_only=ATTRIBUTIONS_TO_VALUES_ONLY,
         )
+        wrapper.fixed_attention_mask = ((ent != pad_token_id) | (attr != pad_token_id) | (val != pad_token_id)).long()
         baseline_args = (baseline_ent, baseline_attr, baseline_val, baseline_days)
 
         try:
@@ -543,7 +573,7 @@ def extract_attributions(
         attr_np = args[1].cpu().numpy()
         val_np = args[2].cpu().numpy()
         days_np = args[3].cpu().numpy()
-        mask_np = (ent_np != 0).astype(int)
+        mask_np = ((ent_np != 0) | (attr_np != 0) | (val_np != 0)).astype(int)
         delta_np = delta.detach().cpu().numpy()
 
         for i in range(ent_np.shape[0]):
@@ -562,7 +592,7 @@ def extract_attributions(
             for k, (e_id, a_id, v_id, score, day) in enumerate(
                 zip(seq_ent, seq_attr, seq_val, seq_score, seq_days)
             ):
-                if e_id < 5: continue
+                if max(e_id, a_id, v_id) < 5: continue
                 ent_name = id2word.get(e_id, f"Ent_{e_id}")
                 if entity_filter is not None:
                     if not ent_name.startswith(entity_filter): continue
@@ -574,7 +604,7 @@ def extract_attributions(
                         ent_name = f"Previous {ent_name.lower()}"
                 
                 attr_name = id2word.get(a_id, f"Attr_{a_id}")
-                full_feature_name = f"{ent_name} - {attr_name}"
+                full_feature_name = f"{ent_name} - {attr_name}" if e_id >= 5 else attr_name
                 val_name = id2word.get(v_id, f"Val_{v_id}")
 
                 val_name_str = str(val_name).strip()

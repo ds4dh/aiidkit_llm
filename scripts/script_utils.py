@@ -1,5 +1,6 @@
 import re
 import json
+import src.utils  # activates UTF-8 log tee when AIIDKIT_LOG_FILE is set
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -247,6 +248,7 @@ def find_best_checkpoint_multitask(base_dir: Path, task_key: str, horizon: int) 
 
     h_str = f"{horizon:04d}"
     pattern = re.compile(rf"hrz\(([^)]*\b{h_str}\b[^)]*)\)")
+    matches: list[tuple[Path, dict]] = []
     for run_dir in sorted(p for p in ft_root.iterdir() if p.is_dir()):
         for hrz_dir in sorted(p for p in run_dir.iterdir() if p.is_dir() and pattern.search(p.name)):
             meta = load_run_metadata(hrz_dir)
@@ -257,7 +259,9 @@ def find_best_checkpoint_multitask(base_dir: Path, task_key: str, horizon: int) 
                 key=lambda p: int(p.name.split("-")[-1]),
             )
             if checkpoint_dirs:
-                return checkpoint_dirs[-1], meta
+                matches.append((checkpoint_dirs[-1], meta))
+    if matches:
+        return max(matches, key=lambda item: item[0].stat().st_mtime_ns)
     raise FileNotFoundError(
         f"No multi-task run with heads for task '{task_key}' (horizon {h_str}) under {ft_root}"
     )

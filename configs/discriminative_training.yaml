@@ -1,3 +1,16 @@
+# =============================================================================
+# t-EAV Transformer Training & Fine-Tuning Configuration
+#
+# Default fine-tuning mode: Domain-grouped multi-task runs (Option 1):
+#   - multitask_bacteria (5 tasks x 3 horizons = 15 heads)
+#   - multitask_viruses  (4 tasks x 3 horizons = 12 heads)
+# All heads within a domain group share the same transformer trunk; -100
+# (unknown) labels are masked per head, so each row only trains the heads whose
+# outcome is knowable at that follow-up.
+# Label columns come from v3.9: label_infection_grp_{group}_{H}d (groups) and
+# label_infection_{bacteria,virus,fungi}_{H}d (general classes).
+# =============================================================================
+
 # Run configuration and task (data collator) definition
 data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v3.9/teav
 data_split_type: temporal_split  # random_split, center_split, temporal_split
@@ -15,19 +28,41 @@ data_collator:
     - value_id          # mlm task must predict 'value_id' labels
   mlm_masking_rules:    # these numbers will set the result subdirectory name
     entity_id: 0.00     # probability of masking an entity sub-token
-    attribute_id: 0.15  # probability of masking an entity sub-token
-    value_id: 0.60      # probability of masking an entity sub-token
+    attribute_id: 0.15  # probability of masking an attribute sub-token
+    value_id: 0.60      # probability of masking a value sub-token
 
 # Configuration for finetuning tasks to run
 train_data_augment: all           # default: "all" (pool every fup folder; 'fups' then only affect run names). "none" = one model per fup, "valid" = pool listed fups
 target_undersampling_ratio: 15.0  # maximum ("worst") ratio of positive to negative samples during finetuning (null for not using under-sampling)
 drop_unlabeled: true              # drop rows whose horizon labels are all -100 (unknown outcome; the loss masks them anyway)
 early_stopping_metric: roc_auc    # metric to use for early stopping (per label, then averaged)
-prediction_tasks:                 # horizon elements can be lists (multi-label) or integers / singletons (binary)
-  infection_bacteria: {fups: [0, 30, 60, 90, 180, 360], horizons: [[30, 60, 90]]}
-  # infection_virus:    {fups: [0, 30, 60, 90, 180, 360], horizons: [[30, 60, 90]]}
-  # death:              {fups: [0, 360, 720, 1080, 1800], horizons: [[360, 720, 1080, 1800]]}
-  # graft_loss:         {fups: [0, 360, 720, 1080, 1800], horizons: [[360, 720, 1080, 1800]]}
+early_stopping_subset: null       # tasks whose heads VOTE on early stopping / checkpoint selection (null = every valid head in the group votes)
+early_stopping_mean: geometric    # aggregation over voting heads: harmonic | mean | geometric
+prediction_tasks:                 # Domain-grouped multi-task default (Option 1: bacteria + viruses)
+  multitask_bacteria:
+    tasks: [
+      infection_bacteria,                  # 888 train / 185 val pos patients
+      infection_grp_enterobacterales,      # 636 / 135
+      infection_grp_gram_positive,         # 328 /  51
+      infection_grp_gn_nonfermenters,      #  79 /  17  (borderline, clinically actionable)
+      infection_grp_clostridium,           #  64 /  12  (borderline)
+    ]
+    fups: [0, 30, 60, 90, 180, 360]
+    horizons: [[30, 60, 90]]
+
+  multitask_viruses:
+    tasks: [
+      infection_virus,                     # 723 / 163
+      infection_grp_herpes_viruses,        # 235 /  57
+      infection_grp_cmv,                   # 170 /  43
+      infection_grp_bkpyv,                 # 146 /  29
+    ]
+    fups: [0, 30, 60, 90, 180, 360]
+    horizons: [[30, 60, 90]]
+
+  # --- Optional single-task examples (uncomment or pass via --tasks to run individually):
+  # infection_bacteria: {fups: [0, 30, 60, 90, 180, 360], horizons: [[30, 60, 90]]}
+  # infection_grp_cmv:  {fups: [0, 30, 60, 90, 180, 360], horizons: [[30, 60, 90]]}
 
 # Arguments for optuna run (perform both pretraining and finetuning for different hyper-parameters)
 optuna:
@@ -85,10 +120,12 @@ finetuner:
   adam_beta1: 0.9
   adam_beta2: 0.99  # a bit more spike-tolerant than the 0.999 default
   adam_epsilon: 1.0e-6  # bf16-safe (the 1e-8 default underflows on small grads)
-  loss_name: ce  # ce, weighted_ce, focal, poly1 -> ce optimizes calibration!
+  loss_name: dampened_ce  # ce, dampened_ce, weighted_ce, focal, poly1 (dampened_ce = sqrt(N_neg/N_pos) capped at 10.0)
   # loss_args: {gamma: 2.0, epsilon: 1.0, alpha: [3.0]}  # extra kwargs for the loss
   # class, merged over the data-derived class weights (popped, not TrainerArguments)
-  enforce_monotonicity: true  # if True, classifier probabilities increase with horizon
+  enforce_monotonicity: true  # probabilities increase with horizon (in multi-task
+                              # runs this is enforced per task, within each task's
+                              # horizon block; automatically disabled for 1 horizon)
   bf16: true
   report_to: none
   remove_unused_columns: false  # crucial for custom collators

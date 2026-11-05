@@ -37,7 +37,7 @@ def parse_args():
     parser.add_argument("--plot_only", "-p", action="store_true", help="Skip run and goes directly to the plot.")
     parser.add_argument("--silent", "-s", action="store_true", help="Disable wandb logging.")
     parser.add_argument("--overrides", "-o", action="append", default=[], help="Overrides config (JSON string or key=value).")
-    parser.add_argument("--tasks", "-t", type=str, default="",
+    parser.add_argument("--tasks", "-t", nargs="*", default=[],
                         help="Comma-separated prediction_tasks keys to run (default: all active entries in the config). "
                              "Lets you run a subset (e.g. a single group task or the multi-task entry) without editing the config.")
     return parser.parse_args()
@@ -56,7 +56,13 @@ def main():
     # defined in the config (e.g. --tasks infection_grp_cmv or
     # --tasks multitask_bacteria,multitask_infections).
     if cli_args.tasks:
-        wanted = [t.strip() for t in cli_args.tasks.split(",") if t.strip()]
+        wanted = [t.strip() for arg in (cli_args.tasks if isinstance(cli_args.tasks, list) else [cli_args.tasks]) for t in arg.split(",") if t.strip()]
+        for t in list(wanted):
+            if t not in cfg["prediction_tasks"]:
+                for parent_specs in cfg["prediction_tasks"].values():
+                    if isinstance(parent_specs, dict) and t in parent_specs.get("tasks", []):
+                        cfg["prediction_tasks"][t] = {"fups": parent_specs["fups"], "horizons": parent_specs["horizons"]}
+                        break
         missing = [t for t in wanted if t not in cfg["prediction_tasks"]]
         if missing:
             sys.exit(f"Error: --tasks entries {missing} not found in config "
@@ -126,8 +132,18 @@ def main():
         
         # After all runs for this task, generate plots (single-task entries only:
         # multi-task runs store per-(task, horizon) metrics in their JSON/CSVs)
+        # multi-task runs: plot each sub-task individually
+        # multi-task runs: plot each sub-task individually
         if len(task_keys) > 1:
-            print(f"[plot] Skipping summary plots for multi-task entry '{task_key}'.")
+            for sub_task in task_keys:
+                plot_task_results(
+                    task_key=task_key,
+                    task_specs=task_specs,
+                    finetuning_dir=finetuning_dir,
+                    train_data_augment=train_data_augment,
+                    sub_task=sub_task,
+                )
+            continue
             continue
         plot_task_results(
             task_key=task_key,
@@ -246,7 +262,8 @@ def finetune_disciminative_model(
     )
 
     # Evaluation pipelines
-    patience = cfg["finetuner"].pop("early_stopping_patience", 20)
+    ft_cfg = cfg["finetuner"].copy()
+    patience = ft_cfg.pop("early_stopping_patience", 20)
     callbacks = [EarlyStoppingCallback(early_stopping_patience=patience)]
     evaluator = CustomEvaluator(
         do_clustering=False,
@@ -254,12 +271,12 @@ def finetune_disciminative_model(
         enforce_monotonicity=enforce_monotonicity,
         monotonic_groups=monotonic_groups,
         early_stopping_metric=cfg["early_stopping_metric"],
-        early_stopping_subset=cfg.get("early_stopping_subset"),
+        early_stopping_subset=([t for t in ((cfg.get("prediction_tasks", {}).get(task_key, {}) or {}).get("early_stopping_subset") or cfg.get("early_stopping_subset") or []) if t in task_keys] or None),
         early_stopping_mean=cfg.get("early_stopping_mean", "harmonic"),
     )
 
     # Setup loss function
-    ft_cfg = cfg["finetuner"].copy()
+    loss_name = ft_cfg.pop("loss_name", "poly1")
     loss_name = ft_cfg.pop("loss_name", "poly1")
     loss_args = compute_loss_args(train_dataset, label_keys)
     loss_args.update(ft_cfg.pop("loss_args", {}) or {})  # optional manual override
@@ -336,6 +353,11 @@ class PrefixAwareTrainer(GradientClippingGuard, Trainer):
     Trainer that keeps per-FUP evaluation prefixes in sync and adds gradient
     clipping diagnostics + a non-finite gradient guard (see GradientClippingGuard).
     """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.compute_loss_func is not None:
+            self.model_accepts_loss_kwargs = False
+
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
         if hasattr(self.compute_metrics, "current_prefix"):
             self.compute_metrics.current_prefix = metric_key_prefix
@@ -355,6 +377,7 @@ def test_model(
     """    
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    trainer.remove_callback(EarlyStoppingCallback)
     
     val_fup_datasets = prepare_dataset_fup_dict(dataset_dict["validation"], all_possible_fups)
     split_configs = []

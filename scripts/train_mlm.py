@@ -70,7 +70,7 @@ def main():
     # Evaluation pipelines
     patience = cfg["pretrainer"].pop("early_stopping_patience", 10)
     callbacks = [EarlyStoppingCallback(early_stopping_patience=patience)]
-    evaluator = CustomEvaluator(do_clustering=True)
+    evaluator = CustomEvaluator(do_clustering=cfg.get("do_clustering", True))
 
     # Training arguments, with the correct output directory
     mlm_masking_rules = cfg["data_collator"]["mlm_masking_rules"]
