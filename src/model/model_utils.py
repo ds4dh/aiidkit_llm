@@ -1,6 +1,8 @@
+import json
 import math
 import inspect
 from collections import deque
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -8,8 +10,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Any
 from datasets import DatasetDict
-from transformers import TrainerState, TrainerControl, TrainingArguments
-from transformers.trainer_callback import EarlyStoppingCallback
 
 
 # -------------------------------------------------------------------
@@ -47,82 +47,126 @@ class TimeEmbedding(nn.Module):
         return time_embeddings
 
 
-class PositionalEncoding(nn.Module):
+class NumericalValueEmbedding(nn.Module):
     """
-    Encode token position using sines and cosines of different frequencies
+    Continuous numerical value embedder for quantile-normalized scalars in [-1, 1].
+    Combines direct linear magnitude with multi-scale sinusoidal (Fourier) features
+    followed by a 2-layer SiLU MLP and LayerNorm.
     """
     def __init__(
         self,
         embedding_dim: int,
-        dropout: float=0.1,
-        max_len: int=1000,  # in AIIDKIT data, longest sequence has 843 events
+        n_frequencies: int = 64,
+        max_freq: float = 16.0,
     ):
         super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
+        self.embedding_dim = embedding_dim
+        self.n_frequencies = n_frequencies
+        freqs = torch.exp(
+            torch.linspace(
+                math.log(0.5 * math.pi),
+                math.log(max_freq * math.pi),
+                n_frequencies,
+                dtype=torch.float32,
+            )
+        )
+        self.register_buffer("freqs", freqs, persistent=False)
+        in_dim = 1 + 2 * n_frequencies
+        self.proj = nn.Sequential(
+            nn.Linear(in_dim, embedding_dim),
+            nn.SiLU(),
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.LayerNorm(embedding_dim),
+        )
 
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, embedding_dim, 2) * (-math.log(10000.0) / embedding_dim))
-        
-        pe = torch.zeros(max_len, 1, embedding_dim)
-        pe[:, 0, 0::2] = torch.sin(position * div_term)
-        pe[:, 0, 1::2] = torch.cos(position * div_term)
-        
-        self.register_buffer("pe", pe.transpose(0, 1))  # shape [1, max_len, embedding_dim]
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
         """
-        Add positional encoding to the input tensor, with dropout
-
         Args:
-            x: Tensor, shape [batch_size, seq_len, embedding_dim]
+            values: Tensor of shape [batch_size, seq_len] with normalized values in [-1, 1].
+        Returns:
+            Tensor of shape [batch_size, seq_len, embedding_dim].
         """
-        x = x + self.pe[:, :x.size(1), :]
-        return self.dropout(x)
+        v = values.float().unsqueeze(-1)
+        freqs = self.freqs.to(device=values.device, dtype=torch.float32)
+        angles = v * freqs
+        fourier = torch.cat([v, torch.sin(angles), torch.cos(angles)], dim=-1)
+        target_dtype = self.proj[0].weight.dtype
+        return self.proj(fourier.to(dtype=target_dtype))
 
 
 # -------------------------------------------------------------------
-# Potentially useful custom callbacks
+# Shared Checkpoint & Multi-Task Monotonicity Helpers
 # -------------------------------------------------------------------
 
-def preprocess_logits_for_metrics(logits, labels):
+def resolve_best_checkpoint(run_dir: str | Path) -> Path | None:
+    """Resolve the best HF Trainer checkpoint inside `run_dir` via `trainer_state.json`.
+
+    Checks `trainer_state.json['best_model_checkpoint']` in the latest `checkpoint-*`
+    folder (remapping paths if the run folder was moved across mounts), falls back to
+    the highest-numbered `checkpoint-*`, or `run_dir` itself if `model.safetensors` /
+    `config.json` sits directly inside `run_dir`.
     """
-    Align logits and labels for metric computation (useful for causal language models)
+    rd = Path(run_dir)
+    if not rd.exists():
+        return None
+    if rd.name.startswith("checkpoint-") and (rd / "config.json").exists():
+        return rd
+
+    ckpts = sorted(
+        (p for p in rd.glob("checkpoint-*") if p.is_dir()),
+        key=lambda p: int(p.name.split("-")[-1]) if p.name.split("-")[-1].isdigit() else -1,
+    )
+    if ckpts:
+        state_file = ckpts[-1] / "trainer_state.json"
+        if state_file.exists():
+            try:
+                best_raw = json.loads(state_file.read_text(encoding="utf-8")).get("best_model_checkpoint")
+                if best_raw:
+                    best_p = Path(best_raw)
+                    if best_p.exists():
+                        return best_p
+                    remapped = rd / best_p.name
+                    if remapped.exists():
+                        return remapped
+            except Exception:
+                pass
+        return ckpts[-1]
+
+    if (rd / "config.json").exists():
+        return rd
+    return None
+
+
+def build_monotonic_groups(
+    run_meta: dict | None,
+    fallback_monotonic: bool | list[int] = False,
+) -> bool | list[int]:
+    """Compute per-task horizon group sizes `[n_h_t1, n_h_t2, ...]` for `enforce_monotonicity`.
+
+    Handles both uniform `horizons` and heterogeneous `task_horizons` in `run_metadata.json`,
+    and automatically disables monotonicity when `fallback_monotonic` is falsy or every task has <= 1 horizon.
     """
-    # The first element of the tuple is the prediction scores
-    if isinstance(logits, tuple): logits = logits[0]
+    if isinstance(fallback_monotonic, (list, tuple)):
+        return [int(g) for g in fallback_monotonic]
+    if not fallback_monotonic:
+        return False
+    if not run_meta:
+        return bool(fallback_monotonic)
 
-    # For causal LM, last logit not needed for prediction and first label not predicted
-    return logits[:, :-1, :].argmax(dim=-1), labels[:, 1:]
-
-
-class EarlyStoppingCallbackWithWarmup(EarlyStoppingCallback):
-    """
-    An EarlyStoppingCallback that disables early stopping for some warm-up steps
-    """
-    def __init__(self, warmup_steps: int, early_stopping_patience: int = 1, early_stopping_threshold: float = 0.0):
-        # Initialize the parent class with its parameters
-        super().__init__(early_stopping_patience, early_stopping_threshold)
-        
-        # Store the new warmup_steps parameter
-        self.warmup_steps = warmup_steps
-
-    def on_evaluate(
-        self,
-        args: TrainingArguments,
-        state: TrainerState,
-        control: TrainerControl,
-        metrics,
-        **kwargs,
-    ):
-        """
-        Overrides the on_evaluate method to check for the warmup condition.
-        """
-        if state.global_step < self.warmup_steps:
-            self.early_stopping_patience_counter = 0
-            return
-
-        # If the warm-up phase is over, execute the original early stopping logic
-        super().on_evaluate(args, state, control, metrics, **kwargs)
+    tasks = run_meta.get("tasks") or []
+    default_hs = run_meta.get("horizons") or []
+    task_hs = run_meta.get("task_horizons") or {}
+    if len(tasks) > 1:
+        groups = []
+        for t in tasks:
+            hs = task_hs.get(t, default_hs)
+            groups.append(len(hs) if isinstance(hs, list) else 1)
+        return groups if any(g > 1 for g in groups) else False
+    if len(tasks) == 1:
+        hs = task_hs.get(tasks[0], default_hs)
+        n_h = len(hs) if isinstance(hs, list) else 1
+        return True if n_h > 1 else False
+    return bool(fallback_monotonic)
 
 
 # -------------------------------------------------------------------
@@ -237,7 +281,11 @@ class FocalLoss(nn.Module):
         else:
             self.register_buffer("alpha", alpha)
 
-    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
         """
         inputs: Logits [Batch, Num_Labels]
         targets: Binary Targets [Batch, Num_Labels] (float), can contain -100
@@ -261,19 +309,17 @@ class FocalLoss(nn.Module):
         focal_term = (1 - pt) ** self.gamma
         loss = focal_term * bce_loss
 
-        # Apply alpha (simple scalar weighting)
+        # Apply positive-class alpha weighting without mutating buffer in-place
         if self.alpha is not None:
-             if self.alpha.device != inputs.device:
-                 self.alpha = self.alpha.to(inputs.device)
-             loss = loss * self.alpha
+            alpha = self.alpha.to(device=inputs.device, dtype=loss.dtype)
+            loss = loss * torch.where(safe_targets > 0.5, alpha, torch.ones_like(loss))
         
         # Apply mask to zero out contributions from invalid labels
         loss = loss * valid_mask
 
         # Reduction
         if self.reduction == "mean":
-            # Sum loss and divide by the number of valid elements
-            return loss.sum() / valid_mask.sum().clamp(min=1.0)
+            return loss.sum() / valid_mask.sum().clamp(min=1e-6)
         elif self.reduction == "sum":
             return loss.sum()
         
@@ -300,7 +346,11 @@ class WeightedCELoss(nn.Module):
             
         self.reduction = reduction
 
-    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
         # Create mask for valid labels
         valid_mask = (targets != -100).float()
 
@@ -325,7 +375,7 @@ class WeightedCELoss(nn.Module):
 
         # Reduction
         if self.reduction == "mean":
-            return loss.sum() / valid_mask.sum().clamp(min=1.0)
+            return loss.sum() / valid_mask.sum().clamp(min=1e-6)
         elif self.reduction == "sum":
             return loss.sum()
         
@@ -357,7 +407,11 @@ class Poly1FocalLoss(nn.Module):
         else:
             self.register_buffer("alpha", alpha)
 
-    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
         # Create mask for valid labels
         valid_mask = (targets != -100).float()
 
@@ -375,18 +429,17 @@ class Poly1FocalLoss(nn.Module):
         poly1_loss = self.epsilon * (1 - pt)
         loss = fl_loss + poly1_loss
 
-        # Alpha weighting
+        # Positive-class alpha weighting without mutating buffer in-place
         if self.alpha is not None:
-            if self.alpha.device != inputs.device:
-                self.alpha = self.alpha.to(inputs.device)
-            loss = loss * self.alpha
+            alpha = self.alpha.to(device=inputs.device, dtype=loss.dtype)
+            loss = loss * torch.where(safe_targets > 0.5, alpha, torch.ones_like(loss))
 
         # Apply mask
         loss = loss * valid_mask
 
         # Reduction
         if self.reduction == "mean":
-            return loss.sum() / valid_mask.sum().clamp(min=1.0)
+            return loss.sum() / valid_mask.sum().clamp(min=1e-6)
         elif self.reduction == "sum":
             return loss.sum()
         
@@ -408,19 +461,19 @@ def compute_loss_args(
     """
     pos_counts = []
     neg_counts = []
-    
+
     # Count positives and negatives for each label
     for key in label_keys:
-        labels = np.array(dataset[key])
+        labels = np.asarray(dataset.data.column(key)) if hasattr(dataset, "data") else np.array(dataset[key])
         labels = labels[labels != -100]  # filter valid (-100) if not done
-        n_pos = np.sum(labels == 1)
-        n_neg = np.sum(labels == 0)
+        n_pos = int(np.sum(labels == 1))
+        n_neg = int(np.sum(labels == 0))
         pos_counts.append(n_pos)
         neg_counts.append(n_neg)
 
-    print(f"Label statistics (pos/neg):")
+    print("Label statistics (pos/neg):")
     for k, p, n in zip(label_keys, pos_counts, neg_counts):
-        print(f"  {k}: {p}/{n} (ratio: {n/max(p,1):.1f})")
+        print(f"  {k}: {p}/{n} (ratio: {n/max(p, 1):.1f})")
 
     # Compute weights (with capping to prevent gradient explosions)
     # - standard BCE uses neg/pos (linear).
@@ -483,7 +536,7 @@ def make_loss_func(loss_name: str, loss_args: dict = None):
         if labels.dtype != torch.float:
             labels = labels.float()
             
-        # The loss classes now handle masking of -100 internally
+        # The loss classes handle masking of -100 internally
         return loss_fct(logits, labels)
 
     return compute_loss
