@@ -20,10 +20,9 @@ import hashlib
 import warnings
 warnings.filterwarnings("ignore")
 
-from pathlib import Path
+import json
 from tqdm.auto import tqdm
 from adjustText import adjust_text
-from scipy.stats import fisher_exact
 from torch.utils.data import DataLoader, Subset
 from captum.attr import LayerIntegratedGradients
 from matplotlib.patches import PathPatch
@@ -31,14 +30,17 @@ from matplotlib.markers import MarkerStyle
 from matplotlib.offsetbox import AnchoredOffsetbox, HPacker, VPacker, TextArea, DrawingArea
 
 from src.data.patient_dataset import load_hf_data_and_metadata
+from src.model.model_utils import build_monotonic_groups
 from src.model.patient_embedder import PatientEmbeddingModelFactory, PatientDataCollatorForClassification
-from src.evaluation.evaluate_models import ModelInterpreter
+from src.tasks import abbreviate_feature_name, format_eav_feature_name
 from scripts.script_utils import (
-    find_best_checkpoint, find_best_checkpoint_multitask, extract_horizons_from_path, get_best_optuna_run, scan_all_fups,
+    find_best_checkpoint,
+    find_best_checkpoint_multitask,
+    extract_horizons_from_path,
+    resolve_base_dir_for_ckpt,
+    scan_all_fups,
 )
 
-CLI_CFG = {}
-SAFE_NUM_PROC = None if os.name == "nt" else 4
 GENERATE_SANITIZE_PLOTS = False
 
 # =================================
@@ -48,17 +50,16 @@ GENERATE_SANITIZE_PLOTS = False
 # Parse CLI arguments
 parser = argparse.ArgumentParser(description="Run Captum attribution analysis.")
 parser.add_argument("--results-dir", type=Path, default=Path("results"), help="Base directory for results")
-parser.add_argument("--data-split-type", type=str, default="temporal_split", help="Data split strategy (e.g., temporal)")
+parser.add_argument("--data-split-type", "--data_split_type", type=str, default="random_split", help="Data split strategy (e.g., random_split, temporal_split)")
 parser.add_argument("--top-k", type=int, default=15, help="Top K features to analyze/display")
 parser.add_argument("--min-freq", type=int, default=20, help="Minimum feature frequency threshold")
 parser.add_argument("--max-delta", type=float, default=0.10, help="Maximum allowed Captum delta error")
 parser.add_argument("--agg-method", type=str, default="mean", choices=["mean", "sum"], help="Aggregation method")
 parser.add_argument("--num-samples", type=int, default=1000, help="Number of samples to analyze")
 parser.add_argument("--num-steps", type=int, default=200, help="Number of Integrated Gradients steps")
-parser.add_argument("--data-dir", "--data_dir", type=Path, default=Path(os.environ.get("TEAV_DATA_DIR", "/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6/teav")), help="Path to tEAV dataset directory")
-parser.add_argument("--proposed-model", "--proposed_model", type=str, default="transformer",
-                    help="Model analyzed by this script (the 'proposed model' shared across analysis scripts). "
-                         "Must be a transformer-family model with a binary classification checkpoint.")
+parser.add_argument("--data-dir", "--data_dir", type=Path, default=Path(os.environ.get("TEAV_DATA_DIR", "/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.9/teav")), help="Path to tEAV dataset directory")
+parser.add_argument("--proposed-model", "--proposed_model", type=str, default="tf_raw_mt",
+                    help="Model analyzed by this script (tf_raw_mt, tf_raw_st, tf_bin_mt, tf_bin_st).")
 parser.add_argument("--run-id", "--run_id", type=str, default="",
                     help="Pre-training run id subfolder (e.g. e00-a15-v60). Default: the only folder present.")
 parser.add_argument("--config", "-c", type=str, default="configs/discriminative_training.yaml",
@@ -70,6 +71,12 @@ parser.add_argument("--tasks", nargs="+", default=None,
                          "configs). Default: infection_bacteria. Multi-task checkpoints are "
                          "supported: the matching (task, horizon) head is selected per task. "
                          "E.g. --tasks infection_bacteria infection_virus infection_grp_cmv")
+parser.add_argument("--horizon", type=int, default=None,
+                    help="Prediction horizon in days to attribute (default: 30 for infections, 360 for death/graft_loss, or first available checkpoint horizon).")
+parser.add_argument("--binning-mode", "--binning_mode", type=str, default="slice", choices=["slice", "global"],
+                    help="How numerical feature values are binned for SHAP/bar plots: "
+                         "'slice' (default) re-bins numerical values relative to the active clinical window slice; "
+                         "'global' uses the whole-dataset pretraining quantile bins.")
 args, _ = parser.parse_known_args()
 
 # Run configuration
@@ -77,15 +84,30 @@ RESULTS_DIR = args.results_dir
 DATA_SPLIT_TYPE = args.data_split_type
 PROPOSED_MODEL = args.proposed_model
 RUN_ID = args.run_id.strip()
+BINNING_MODE = args.binning_mode
 
 # Captum attribution runs directly on the model checkpoint, so only
 # transformer-family models with a binary classification head can be
 # interpreted here (classic ML contenders have no checkpoints/embeddings,
 # and the Cox survival variant uses a regression head, not wired in yet).
 INTERPRETABLE_MODELS = {
-    # model key -> (results subfolder, force multi-task head resolution)
-    "transformer": ("transformer", False),
-    "transformer_multitask": ("transformer", True),
+    # model key -> (results subfolder, force multi-task head resolution, value embedding tag, mt_scope)
+    "tf_raw": ("transformer", False, "raw", "any"),
+    "tf_raw_st": ("transformer", False, "raw", "any"),
+    "tf_raw_mt": ("transformer", True, "raw", "domain"),
+    "tf_raw_unified": ("transformer", True, "raw", "unified"),
+    "tf_bin": ("transformer", False, "bin", "any"),
+    "tf_bin_st": ("transformer", False, "bin", "any"),
+    "tf_bin_mt": ("transformer", True, "bin", "domain"),
+    "tf_bin_unified": ("transformer", True, "bin", "unified"),
+    "tfg_raw": ("generative_transformer", False, "raw", "any"),
+    "tfg_raw_st": ("generative_transformer", False, "raw", "any"),
+    "tfg_raw_mt": ("generative_transformer", True, "raw", "domain"),
+    "tfg_raw_unified": ("generative_transformer", True, "raw", "unified"),
+    "tfg_bin": ("generative_transformer", False, "bin", "any"),
+    "tfg_bin_st": ("generative_transformer", False, "bin", "any"),
+    "tfg_bin_mt": ("generative_transformer", True, "bin", "domain"),
+    "tfg_bin_unified": ("generative_transformer", True, "bin", "unified"),
 }
 if PROPOSED_MODEL not in INTERPRETABLE_MODELS:
     print(f"[SKIP] Interpretability analysis supports only {sorted(INTERPRETABLE_MODELS)}; "
@@ -93,6 +115,8 @@ if PROPOSED_MODEL not in INTERPRETABLE_MODELS:
     sys.exit(0)
 TRANSFORMER_BASE_DIR = RESULTS_DIR / INTERPRETABLE_MODELS[PROPOSED_MODEL][0]
 MULTITASK_ONLY = INTERPRETABLE_MODELS[PROPOSED_MODEL][1]
+MODEL_VAL_TAG = INTERPRETABLE_MODELS[PROPOSED_MODEL][2]
+MT_SCOPE = INTERPRETABLE_MODELS[PROPOSED_MODEL][3]
 OUTPUT_DIR_BASE_NAME = RESULTS_DIR / "analysis" / "interpretability" / PROPOSED_MODEL
 DATA_DIR = args.data_dir
 CONFIG_PATH = Path(args.config)
@@ -120,48 +144,26 @@ USE_TIME_NEUTRAL_BASELINE = True
 OUTPUT_SUBDIR = f"{DATA_SPLIT_TYPE}-{NUM_CAPTUM_STEPS}-steps_{int(100 * MAX_DELTA):03d}-delta_{ATTRIBUTIONS_TO_VALUES_ONLY}-values"
 OUTPUT_DIR = OUTPUT_DIR_BASE_NAME / OUTPUT_SUBDIR
 
-# Task configuration
-MAX_FUP = 2400 if DATA_SPLIT_TYPE == "temporal_split" else 3570
-TASK_CONFIG = {
-    "bacteria_perioperative": {
-        "task": "infection_bacteria",
-        "horizon": 30, "fup_min": 0, "fup_max": 0, "fup_step": 30,
-    },
-    "bacteria_opportunistic": {
-        "task": "infection_bacteria",
-        "horizon": 30, "fup_min": 30, "fup_max": 150, "fup_step": 30,
-    },
-    "bacteria_maintenance": {
-        "task": "infection_bacteria",
-        "horizon": 30, "fup_min": 180, "fup_max": 330, "fup_step": 30,
-    },
-    "bacteria_long_term": {
-        "task": "infection_bacteria",
-        "horizon": 30, "fup_min": 360, "fup_max": 1050, "fup_step": 30,
-    },
-    "bacteria_very_long_term": {
-        "task": "infection_bacteria",
-        "horizon": 30, "fup_min": 1080, "fup_max": MAX_FUP, "fup_step": 30,
-    },
+# Task configuration (landmark FUP bounds aligned identically with analysis_comparison.py)
+MAX_FUP = 2400 if DATA_SPLIT_TYPE == "temporal_split" else 3600
+_WINDOWS = {
+    "perioperative": (0, 30),
+    "opportunistic": (31, 180),
+    "maintenance": (181, 360),
+    "long_term": (361, 1080),
+    "very_long_term": (1081, MAX_FUP),
 }
-
-# Optional task-list override (--tasks): builds the SAME five clinical-window
-# configs for each requested outcome task, with matching output names.
-_selected_tasks = [args.task] if args.task else (args.tasks[:1] if args.tasks else ["infection_bacteria"])
-if _selected_tasks:
-    _WINDOWS = {
-        "perioperative": (0, 0),
-        "opportunistic": (30, 150),
-        "maintenance": (180, 330),
-        "long_term": (360, 1050),
-        "very_long_term": (1080, MAX_FUP),
+_selected_tasks = [args.task] if args.task else (list(args.tasks) if args.tasks else ["infection_bacteria"])
+TASK_CONFIG = {
+    f"{t.removeprefix('infection_').removeprefix('grp_') or t}_{w}": {
+        "task": t,
+        "horizon": int(args.horizon) if args.horizon is not None else (360 if t in ("death", "graft_loss") else 30),
+        "fup_min": lo,
+        "fup_max": hi,
+        "fup_step": 30,
     }
-    TASK_CONFIG = {
-        f"{t.removeprefix('infection_').removeprefix('grp_') or t}_{w}": {
-            "task": t, "horizon": 30, "fup_min": lo, "fup_max": hi, "fup_step": 30,
-        }
-        for t in _selected_tasks for w, (lo, hi) in _WINDOWS.items()
-    }
+    for t in _selected_tasks for w, (lo, hi) in _WINDOWS.items()
+}
 
 # Medications
 MED_ROLES = {
@@ -266,14 +268,15 @@ CLINICAL_ROLES = {
 
 # Numeric / boolean
 NUMERIC_ROLES = {
-    'No / Male':                    ['0', 'No', 'False', 'Negative', 'Male', 'M'], 
-    'Yes / Female / Occured':       ['1', 'Yes', 'True', 'Occurred', 'Positive', 'Female', 'F'],
-    'Value 2':                      ['2'], 
+    'No / Male':                    ['0', 'No', 'False', 'Negative', 'Male', 'M'],
+    'Yes / Female / Occurred':      ['1', 'Yes', 'True', 'Occurred', 'Positive', 'Female', 'F'],
+    'Value 2':                      ['2'],
     'Value 3':                      ['3'],
     'Value 4':                      ['4'],
 }
 
 # Ordinal (intensity)
+CORE_ORDINAL_7 = ['Lowest', 'Lower', 'Low', 'Middle', 'High', 'Higher', 'Highest']
 ORDINAL_LEVELS_LIST = ['Below', 'Lowest', 'Lower', 'Low', 'Middle', 'High', 'Higher', 'Highest', 'Measurable']
 ORDINAL_ROLES = {'Ordinal level': ORDINAL_LEVELS_LIST}
 
@@ -297,9 +300,25 @@ def _score_label() -> str:
     return "Token-level attribution (Δ Probability)"
 
 
+def _resolve_base_dir_for_ckpt(task_key: str) -> Path:
+    base_dir, _ = resolve_base_dir_for_ckpt(
+        TRANSFORMER_BASE_DIR, DATA_SPLIT_TYPE, RUN_ID, MODEL_VAL_TAG
+    )
+    return base_dir
+
+
 def main():
-    with open(CONFIG_PATH, 'r') as f:  config = yaml.safe_load(f)
+    with open(CONFIG_PATH, 'r') as f:
+        config = yaml.safe_load(f)
+    use_num_emb = (MODEL_VAL_TAG == "raw")
+    config.setdefault("model", {}).setdefault("embedding_layer_config", {})["use_numerical_embedding"] = use_num_emb
+    config.setdefault("data_collator", {})["use_numerical_embedding"] = use_num_emb
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    avail_fups = set(scan_all_fups(DATA_DIR / DATA_SPLIT_TYPE))
+    resolved_runs = []
+    union_fups: set[int] = set()
+    union_label_keys: list[str] = []
 
     for config_name, task_params in TASK_CONFIG.items():
         task_key = task_params["task"]
@@ -307,160 +326,198 @@ def main():
         fup_min = task_params["fup_min"]
         fup_max = task_params["fup_max"]
         fup_step = task_params["fup_step"]
-        avail_fups = set(scan_all_fups(DATA_DIR / DATA_SPLIT_TYPE))
-        fups = [f for f in range(fup_min, fup_max + 1, fup_step) if not avail_fups or f in avail_fups]
+        if avail_fups:
+            fups = [f for f in sorted(avail_fups) if fup_min <= f <= fup_max and f % fup_step == 0]
+        else:
+            start_fup = ((fup_min + fup_step - 1) // fup_step) * fup_step
+            fups = list(range(start_fup, fup_max + 1, fup_step))
         if not fups:
             print(f"[Skip] No available FUP folders in [{fup_min}, {fup_max}] for '{config_name}'")
             continue
 
-        print(f"\n{'='*60}")
-        print(f">>> Executing Config: '{config_name}' (Task: {task_key}, Horizon: {hrz})")
-        print(f"{'='*60}")
-
         try:
-            if FROM_OPTUNA:
-                trial_name, pt_config = get_best_optuna_run(TRANSFORMER_BASE_DIR, DATA_SPLIT_TYPE, task_key)
-                base_dir_for_ckpt = TRANSFORMER_BASE_DIR / DATA_SPLIT_TYPE / task_key / trial_name / DATA_SPLIT_TYPE / pt_config
-            elif RUN_ID:
-                base_dir_for_ckpt = TRANSFORMER_BASE_DIR / DATA_SPLIT_TYPE / RUN_ID
-                if not base_dir_for_ckpt.is_dir():
-                    raise FileNotFoundError(f"Run-id folder not found: {base_dir_for_ckpt}")
-            else:
-                [base_dir_for_ckpt] = (d for d in (TRANSFORMER_BASE_DIR / DATA_SPLIT_TYPE).iterdir() if d.is_dir())
+            base_dir_for_ckpt = _resolve_base_dir_for_ckpt(task_key)
         except Exception as e:
             print(f"[Error] Could not resolve base directory for {task_key}: {e}")
-            continue 
-        
-        try:
-            try:
-                if MULTITASK_ONLY:
-                    # Always address the shared multi-task checkpoint (a task may
-                    # ALSO have an older single-task run on disk).
-                    checkpoint_path, run_meta = find_best_checkpoint_multitask(base_dir_for_ckpt, task_key, hrz)
-                else:
-                    checkpoint_path = find_best_checkpoint(base_dir_for_ckpt, task_key, hrz)
-                    run_meta = None
-                    try:
-                        mt_ckpt, mt_meta = find_best_checkpoint_multitask(base_dir_for_ckpt, task_key, hrz)
-                        if mt_ckpt.stat().st_mtime_ns >= checkpoint_path.stat().st_mtime_ns:
-                            checkpoint_path, run_meta = mt_ckpt, mt_meta
-                    except FileNotFoundError:
-                        pass
-            except FileNotFoundError:
-                # Multi-task runs store a head per (task, horizon) under one
-                # alias folder (e.g. multitask_infections): locate that run and
-                # address this task through its head index instead.
-                checkpoint_path, run_meta = find_best_checkpoint_multitask(base_dir_for_ckpt, task_key, hrz)
-            print(f"\n>>> Using Checkpoint: {checkpoint_path}"
-                  + (f"  [multi-task run '{run_meta['task_key']}', head task '{task_key}']" if run_meta else ""))
-        except Exception as e:
-            print(f"[Error] Checkpoint error: {e}")
             continue
 
-        ckpt_hrzs = list(run_meta["horizons"]) if run_meta else extract_horizons_from_path(checkpoint_path)
-        if hrz not in ckpt_hrzs:
-            print(f"[Error] Requested horizon {hrz} not found in: {ckpt_hrzs}")
+        try:
+            if MULTITASK_ONLY:
+                checkpoint_path, run_meta = find_best_checkpoint_multitask(
+                    base_dir_for_ckpt, task_key, hrz, scope=MT_SCOPE
+                )
+            else:
+                try:
+                    checkpoint_path = find_best_checkpoint(base_dir_for_ckpt, task_key, hrz)
+                    run_meta = None
+                except FileNotFoundError:
+                    checkpoint_path, run_meta = find_best_checkpoint_multitask(
+                        base_dir_for_ckpt, task_key, hrz, scope=MT_SCOPE
+                    )
+        except Exception as e:
+            print(f"[Error] Checkpoint error for '{config_name}': {e}")
             continue
-            
+
+        ckpt_hrzs = (
+            list(run_meta.get("task_horizons", {}).get(task_key, run_meta["horizons"]))
+            if run_meta
+            else extract_horizons_from_path(checkpoint_path)
+        )
+        if hrz not in ckpt_hrzs:
+            if args.horizon is None and ckpt_hrzs:
+                hrz = int(ckpt_hrzs[0])
+            else:
+                print(f"[Error] Requested horizon {hrz} not found in: {ckpt_hrzs}")
+                continue
+
         label_key = f"label_{task_key}_{hrz:04d}d"
         if run_meta:
             if label_key not in run_meta.get("label_keys", []):
                 print(f"[Error] {label_key} is not a head of multi-task run '{run_meta['task_key']}'")
                 continue
-            # Head/column index in the multi-label output (task-major order);
-            # the collator must expose ALL heads so labels align with logits.
             target_idx = run_meta["label_keys"].index(label_key)
             all_required_labels = list(run_meta["label_keys"])
         else:
             target_idx = ckpt_hrzs.index(hrz)
             all_required_labels = [f"label_{task_key}_{h:04d}d" for h in ckpt_hrzs]
-        print(f"\n>>> Target index: {target_idx} (horizon: {hrz}d)")
 
-        print("\n>>> Loading dataset...")
-        data_dir_split = DATA_DIR / DATA_SPLIT_TYPE
-        sanity_dir = OUTPUT_DIR / "sanity_check" if GENERATE_SANITIZE_PLOTS else None
-        
-        dataset, _, vocab = load_hf_data_and_metadata(
-            data_dir=data_dir_split,
-            fup_train=[360], 
-            fup_valid=[360], 
-            fup_test=fups,
-            label_keys=all_required_labels,
-            time_mapping=config["data_collator"].get("time_mapping", None),
-            eav_mappings=config["data_collator"].get("eav_mappings", None),
-            sanity_check_output_dir=sanity_dir,
-        )
-        
-        test_ds = dataset["test"].filter(
-            lambda x: x[label_key] != -100, num_proc=SAFE_NUM_PROC
-        ).map(
-            lambda x: {"split": "test"}, num_proc=SAFE_NUM_PROC
-        )
+        union_fups.update(fups)
+        for lk in all_required_labels:
+            if lk not in union_label_keys:
+                union_label_keys.append(lk)
 
-        model_cfg_base = config["model"].copy()
-        if "model_args" not in model_cfg_base:
-            model_cfg_base["model_args"] = {}
-        # Head layout (num_labels / problem_type) always comes from the
-        # checkpoint itself, never from the yaml (multi-task checkpoints have
-        # one head per (task, horizon) pair).
-        model_cfg_base["model_args"].pop("num_labels", None)
-        model_cfg_base["model_args"].pop("problem_type", None)
-            
-        for key in ["dtype", "torch_dtype"]:
-            if isinstance(model_cfg_base["model_args"].get(key), str):
-                model_cfg_base["model_args"][key] = getattr(torch, model_cfg_base["model_args"][key])
-        
-        target_dtype = torch.float32 if DEVICE == "cpu" else model_cfg_base["model_args"].get("torch_dtype", model_cfg_base["model_args"].get("dtype", torch.float32))
-        if DEVICE == "cpu":
-            model_cfg_base["model_args"]["dtype"] = torch.float32
+        resolved_runs.append({
+            "config_name": config_name,
+            "task_key": task_key,
+            "hrz": hrz,
+            "fup_min": fup_min,
+            "fup_max": fup_max,
+            "fup_step": fup_step,
+            "fups": fups,
+            "checkpoint_path": checkpoint_path,
+            "run_meta": run_meta,
+            "ckpt_hrzs": ckpt_hrzs,
+            "label_key": label_key,
+            "target_idx": target_idx,
+            "all_required_labels": all_required_labels,
+        })
 
-        emb_cfg = model_cfg_base["embedding_layer_config"].copy()
-        emb_cfg["vocab_size"] = len(vocab)
-        
-        enforce_monotonicity = config.get("finetuner", {}).get("enforce_monotonicity", False)
-        if run_meta:
-            enforce_monotonicity = [len(ckpt_hrzs)] * len(run_meta["tasks"]) if (enforce_monotonicity and len(ckpt_hrzs) > 1) else False
-        model = PatientEmbeddingModelFactory.from_pretrained(
-            enforce_monotonicity=enforce_monotonicity,
-            task="classification",
-            pretrained_dir=str(checkpoint_path),
-            embedding_layer_config=emb_cfg,
-            model_args=model_cfg_base["model_args"]
-        )
-        model = model.to(device=DEVICE, dtype=target_dtype)
-        
-        collator = PatientDataCollatorForClassification(
-            **config["data_collator"], 
-            label_keys=all_required_labels,
-            max_position_embeddings=model.config.max_position_embeddings
-        )
+    if not resolved_runs:
+        print("[Error] No valid interpretability configurations could be resolved.")
+        sys.exit(1)
 
-        print("\n>>> Running inference on test set (for embeddings and selection)...")
-        interpreter = ModelInterpreter(model)
-        loader = DataLoader(test_ds, batch_size=32, collate_fn=collator.torch_call)
-        res = interpreter.get_embeddings_and_predictions(loader)
-        target_labels = res["labels"][:, target_idx]
+    print(f"\n>>> Loading dataset once for {len(union_fups)} FUPs and {len(union_label_keys)} label keys...")
+    data_dir_split = DATA_DIR / DATA_SPLIT_TYPE
+    sanity_dir = OUTPUT_DIR / "sanity_check" if GENERATE_SANITIZE_PLOTS else None
 
-        all_indices = np.arange(len(test_ds))
-        if len(all_indices) > NUM_CAPTUM_SAMPLES:
-            print(f"\n>>> Subsampling {NUM_CAPTUM_SAMPLES} patients from {len(all_indices)} total test samples.")
-            selected_idx = np.random.choice(all_indices, NUM_CAPTUM_SAMPLES, replace=False)
+    dataset, _, vocab = load_hf_data_and_metadata(
+        data_dir=data_dir_split,
+        fup_train=[360],
+        fup_valid=[360],
+        fup_test=sorted(union_fups),
+        label_keys=union_label_keys,
+        time_mapping=config["data_collator"].get("time_mapping", None),
+        eav_mappings=config["data_collator"].get("eav_mappings", None),
+        sanity_check_output_dir=sanity_dir,
+    )
+    full_test_ds = dataset["test"].add_column("split", ["test"] * len(dataset["test"]))
+    test_fup_arr = np.asarray(full_test_ds.data.column("fup"))
+
+    cached_ckpt_path: Path | None = None
+    cached_model = None
+
+    for item in resolved_runs:
+        config_name = item["config_name"]
+        task_key = item["task_key"]
+        hrz = item["hrz"]
+        fup_min = item["fup_min"]
+        fup_max = item["fup_max"]
+        fup_step = item["fup_step"]
+        fups = item["fups"]
+        checkpoint_path = item["checkpoint_path"]
+        run_meta = item["run_meta"]
+        ckpt_hrzs = item["ckpt_hrzs"]
+        label_key = item["label_key"]
+        target_idx = item["target_idx"]
+        all_required_labels = item["all_required_labels"]
+
+        print(f"\n{'='*60}")
+        print(f">>> Executing Config: '{config_name}' (Task: {task_key}, Horizon: {hrz})")
+        print(f"{'='*60}")
+        print(f">>> Using Checkpoint: {checkpoint_path}"
+              + (f"  [multi-task run '{run_meta['task_key']}', head task '{task_key}']" if run_meta else ""))
+        print(f">>> Target index: {target_idx} (horizon: {hrz}d)")
+
+        test_lbl_arr = np.asarray(full_test_ds.data.column(label_key))
+        valid_raw_idx = np.flatnonzero(np.isin(test_fup_arr, fups) & (test_lbl_arr != -100))
+        if len(valid_raw_idx) == 0:
+            print(f"[Skip] No valid test samples in FUPs {fups} for '{config_name}'")
+            continue
+
+        if len(valid_raw_idx) > NUM_CAPTUM_SAMPLES:
+            print(f"\n>>> Subsampling {NUM_CAPTUM_SAMPLES} patients from {len(valid_raw_idx)} valid window samples.")
+            rng = np.random.default_rng(42)
+            chosen_raw_idx = np.sort(rng.choice(valid_raw_idx, NUM_CAPTUM_SAMPLES, replace=False))
         else:
-            print(f"\n>>> Analyzing all {len(all_indices)} test samples.")
-            selected_idx = all_indices
+            print(f"\n>>> Analyzing all {len(valid_raw_idx)} valid window samples.")
+            chosen_raw_idx = valid_raw_idx
+
+        test_ds = full_test_ds.select(chosen_raw_idx.tolist(), keep_in_memory=True)
+        selected_idx = np.arange(len(test_ds))
+
+        if cached_model is None or cached_ckpt_path != checkpoint_path:
+            if cached_model is not None:
+                del cached_model
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            model_cfg_base = config["model"].copy()
+            model_cfg_base["model_args"] = model_cfg_base.get("model_args", {}).copy()
+            model_cfg_base["model_args"].pop("num_labels", None)
+            model_cfg_base["model_args"].pop("problem_type", None)
+
+            # Run Integrated Gradients in float32 so 200-step Riemann integration does not accumulate bfloat16 rounding error
+            target_dtype = torch.float32
+            model_cfg_base["model_args"]["dtype"] = torch.float32
+            model_cfg_base["model_args"].pop("torch_dtype", None)
+
+            emb_cfg = model_cfg_base["embedding_layer_config"].copy()
+            emb_cfg["vocab_size"] = len(vocab)
+
+            enforce_monotonicity = build_monotonic_groups(
+                run_meta, config.get("finetuner", {}).get("enforce_monotonicity", False)
+            )
+            cached_model = PatientEmbeddingModelFactory.from_pretrained(
+                enforce_monotonicity=enforce_monotonicity,
+                task="classification",
+                pretrained_dir=str(checkpoint_path),
+                embedding_layer_config=emb_cfg,
+                model_args=model_cfg_base["model_args"],
+                config_args=model_cfg_base.get("config_args", {}),
+                architecture_type=model_cfg_base.get("architecture_type"),
+            ).to(device=DEVICE, dtype=target_dtype)
+            cached_ckpt_path = checkpoint_path
+
+        collator = PatientDataCollatorForClassification(
+            **config["data_collator"],
+            label_keys=all_required_labels,
+            max_position_embeddings=cached_model.config.max_position_embeddings,
+        )
 
         label_name = f"{config_name}_hrz{hrz:04d}d_fup{fup_min}-{fup_max}-{fup_step}".lower()
+        ckpt_sig = f"{checkpoint_path}:{int(checkpoint_path.stat().st_mtime_ns)}"
         run_captum_analysis(
-            model=model, dataset=test_ds, collator=collator, OUTPUT_DIR=OUTPUT_DIR,
+            model=cached_model, dataset=test_ds, collator=collator, OUTPUT_DIR=OUTPUT_DIR,
             label_name=label_name, fup_max=fup_max, indices=selected_idx, vocab=vocab,
             device=DEVICE, target_idx=target_idx, max_delta=MAX_DELTA, top_k=TOP_K,
-            plot_only=PLOT_ONLY, agg_method=AGG_METHOD, min_freq=MIN_FREQ,
+            plot_only=PLOT_ONLY, agg_method=AGG_METHOD, min_freq=MIN_FREQ, ckpt_sig=ckpt_sig,
         )
 
-        del model, interpreter, loader, res, dataset, test_ds
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    del cached_model, dataset, full_test_ds
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     print(f"\nSuccess! All results can be found in {OUTPUT_DIR}")
 
@@ -472,13 +529,15 @@ class ForwardWrapperForCaptum(torch.nn.Module):
         self.pad_id = pad_id
         self.fixed_attention_mask = None
     
-    def forward(self, entity_id, attribute_id, value_id, days_since_tpx):
+    def forward(self, entity_id, attribute_id, value_id, days_since_tpx, value_num=None):
         input_dict = {
             "entity_id": entity_id,
             "attribute_id": attribute_id,
             "value_id": value_id,
-            "days_since_tpx": days_since_tpx
+            "days_since_tpx": days_since_tpx,
         }
+        if value_num is not None:
+            input_dict["value_num"] = value_num
         attention_mask = (
             self.fixed_attention_mask.repeat(max(1, entity_id.shape[0] // self.fixed_attention_mask.shape[0]), 1)[:entity_id.shape[0]]
             if self.fixed_attention_mask is not None
@@ -489,33 +548,105 @@ class ForwardWrapperForCaptum(torch.nn.Module):
 
 
 def _build_baseline(ent, attr, val, days, pad_id=0, bos_id=2, time_neutral=False, values_only=False):
-    if values_only:
-        baseline_val = torch.full_like(val, pad_id if time_neutral else 0)
-        baseline_val[:, 0] = bos_id
-        return ent.clone(), attr.clone(), baseline_val, (days.clone() if time_neutral else torch.zeros_like(days))
     current_pad = pad_id if time_neutral else 0
+    if values_only:
+        # Preserve all special structural tokens (< 5: PAD, MASK, BOS, EOS, SEP) so EOS/last-token pooling stays intact
+        baseline_val = torch.where(val < 5, val, torch.full_like(val, current_pad))
+        return ent.clone(), attr.clone(), baseline_val, (days.clone() if time_neutral else torch.zeros_like(days))
 
-    baseline_ent = torch.full_like(ent, current_pad)
-    baseline_attr = torch.full_like(attr, current_pad)
-    baseline_val = torch.full_like(val, current_pad)
-    
-    baseline_ent[:, 0] = bos_id
-    baseline_attr[:, 0] = bos_id
-    baseline_val[:, 0] = bos_id
-    
+    baseline_ent = torch.where(ent < 5, ent, torch.full_like(ent, current_pad))
+    baseline_attr = torch.where(attr < 5, attr, torch.full_like(attr, current_pad))
+    baseline_val = torch.where(val < 5, val, torch.full_like(val, current_pad))
     baseline_days = days.clone() if time_neutral else torch.zeros_like(days)
-    
+
     return baseline_ent, baseline_attr, baseline_val, baseline_days
+
+
+def apply_slice_relative_binning(df: pd.DataFrame, mode: str = "slice") -> pd.DataFrame:
+    """
+    Re-bins numerical attributes (`Value_Num` is finite) locally within the current
+    attribution slice `df` (per `Feature`), mapping them onto `CORE_ORDINAL_7`
+    (['Lowest', 'Lower', 'Low', 'Middle', 'High', 'Higher', 'Highest']):
+      - If `mode == 'global'` or `Value_Num` is not present, preserves global bins.
+      - If all values of a feature in the slice are identical (`n_unique == 1`, e.g.,
+        transplant age at a single perioperative FUP=0), smoothly keeps the single
+        global bin label without artificial splitting.
+      - If a feature has `2 <= n_unique <= 7` distinct values in the slice (e.g., 5 FUP
+        steps in the opportunistic window), maps each distinct ordered value to evenly
+        spaced ordinal labels spanning `'Lowest'`..`'Highest'`.
+      - If `n_unique > 7`, applies 7-quantile binning (`pd.qcut(..., duplicates='drop')`)
+        within the slice and maps the resulting bins onto `'Lowest'`..`'Highest'`.
+    """
+    if df.empty or "Value" not in df.columns:
+        return df
+    df = df.copy()
+    if "Value_Global" not in df.columns:
+        df["Value_Global"] = df["Value"]
+    if mode != "slice" or "Value_Num" not in df.columns:
+        df["Value"] = df["Value_Global"]
+        return df
+
+    new_values = df["Value_Global"].astype(object).to_numpy().copy()
+    val_nums = pd.to_numeric(df["Value_Num"], errors="coerce").to_numpy(dtype=np.float64)
+    finite_mask = np.isfinite(val_nums)
+    if not finite_mask.any():
+        return df
+
+    features = df["Feature"].to_numpy()
+    for feat in pd.unique(features[finite_mask]):
+        row_idx = np.flatnonzero((features == feat) & finite_mask)
+        if len(row_idx) == 0:
+            continue
+        u = np.round(val_nums[row_idx], 6)
+        uniq, inv = np.unique(u, return_inverse=True)
+        n_uniq = len(uniq)
+
+        # Smooth fallback when all values in this window slice are identical (e.g., FUP=0 only)
+        if n_uniq <= 1:
+            continue
+
+        if n_uniq <= 7:
+            # Map each distinct ordered value in the slice directly to evenly spaced ordinal labels
+            label_indices = np.round(np.linspace(0, len(CORE_ORDINAL_7) - 1, n_uniq)).astype(int)
+            mapped = np.asarray([CORE_ORDINAL_7[label_indices[k]] for k in inv], dtype=object)
+            new_values[row_idx] = mapped
+        else:
+            try:
+                cats = pd.qcut(u, q=len(CORE_ORDINAL_7), labels=False, duplicates="drop")
+                cats_np = np.asarray(cats, dtype=int)
+                n_bins_actual = int(cats_np.max()) + 1
+                if n_bins_actual <= 1:
+                    continue
+                label_indices = np.round(np.linspace(0, len(CORE_ORDINAL_7) - 1, n_bins_actual)).astype(int)
+                mapped = np.asarray([CORE_ORDINAL_7[label_indices[c]] for c in cats_np], dtype=object)
+                new_values[row_idx] = mapped
+            except ValueError:
+                continue
+
+    df["Value_Slice"] = new_values
+    df["Value"] = df["Value_Slice"]
+    return df
 
 
 def extract_attributions(
     model, dataset, collator, indices, vocab, device, target_idx=0,
     entity_filter=None, max_delta=None,
-    csv_path=None, plot_only=False,
+    csv_path=None, plot_only=False, binning_mode: str = BINNING_MODE,
+    ckpt_sig: str = "",
 ) -> pd.DataFrame:
-    
-    if plot_only and csv_path.exists():
-        return pd.read_csv(csv_path)
+    meta_sidecar = csv_path.with_suffix(".meta.json") if csv_path is not None else None
+    if csv_path is not None and csv_path.exists():
+        if plot_only:
+            print(f" -> Found existing attribution CSV ({csv_path.name}); reusing cached attributions...")
+            return apply_slice_relative_binning(pd.read_csv(csv_path), mode=binning_mode)
+        if os.environ.get("RESUME_ATTRIBUTIONS", "1") == "1" and meta_sidecar is not None and meta_sidecar.exists():
+            try:
+                cached_meta = json.loads(meta_sidecar.read_text())
+                if cached_meta.get("ckpt_sig") == ckpt_sig and cached_meta.get("target_idx") == target_idx:
+                    print(f" -> Verified matching checkpoint cache ({csv_path.name}); reusing attributions...")
+                    return apply_slice_relative_binning(pd.read_csv(csv_path), mode=binning_mode)
+            except Exception:
+                pass
 
     subset = Subset(dataset, indices)
     loader = DataLoader(subset, batch_size=32, collate_fn=collator.torch_call)
@@ -530,6 +661,8 @@ def extract_attributions(
     lig = LayerIntegratedGradients(wrapper, target_layer)
     
     collected_data = []
+    n_skipped_delta = 0
+    n_total_patients = 0
 
     for batch in tqdm(loader, desc="Calculating attributions"):
         inp = batch["input_dict"]
@@ -537,7 +670,7 @@ def extract_attributions(
         attr = inp["attribute_id"].to(device)
         val = inp["value_id"].to(device)
         days = inp["days_since_tpx"].to(device)
-        args = (ent, attr, val, days)
+        val_num = inp["value_num"].to(device) if "value_num" in inp else None
 
         bos_token_id = vocab.get("[BOS]", 2)
         pad_token_id = vocab.get("[PAD]", 0)
@@ -552,7 +685,13 @@ def extract_attributions(
             values_only=ATTRIBUTIONS_TO_VALUES_ONLY,
         )
         wrapper.fixed_attention_mask = ((ent != pad_token_id) | (attr != pad_token_id) | (val != pad_token_id)).long()
-        baseline_args = (baseline_ent, baseline_attr, baseline_val, baseline_days)
+        if val_num is not None:
+            args = (ent, attr, val, days, val_num)
+            baseline_val_num = torch.full_like(val_num, float("nan"))
+            baseline_args = (baseline_ent, baseline_attr, baseline_val, baseline_days, baseline_val_num)
+        else:
+            args = (ent, attr, val, days)
+            baseline_args = (baseline_ent, baseline_attr, baseline_val, baseline_days)
 
         try:
             with torch.inference_mode(False): 
@@ -573,13 +712,16 @@ def extract_attributions(
         attr_np = args[1].cpu().numpy()
         val_np = args[2].cpu().numpy()
         days_np = args[3].cpu().numpy()
+        val_num_np = args[4].detach().float().cpu().numpy() if len(args) > 4 else None
         mask_np = ((ent_np != 0) | (attr_np != 0) | (val_np != 0)).astype(int)
         delta_np = delta.detach().cpu().numpy()
 
         for i in range(ent_np.shape[0]):
+            n_total_patients += 1
             patient_delta = float(abs(delta_np[i]))
             
             if max_delta is not None and patient_delta > max_delta:
+                n_skipped_delta += 1
                 continue  
             
             length = int(mask_np[i].sum())
@@ -588,23 +730,17 @@ def extract_attributions(
             seq_val = val_np[i, :length]
             seq_score = attrs_sum[i, :length]
             seq_days = days_np[i, :length]
+            seq_val_num = val_num_np[i, :length] if val_num_np is not None else [np.nan] * length
             
-            for k, (e_id, a_id, v_id, score, day) in enumerate(
-                zip(seq_ent, seq_attr, seq_val, seq_score, seq_days)
+            for k, (e_id, a_id, v_id, score, day, v_num) in enumerate(
+                zip(seq_ent, seq_attr, seq_val, seq_score, seq_days, seq_val_num)
             ):
                 if max(e_id, a_id, v_id) < 5: continue
                 ent_name = id2word.get(e_id, f"Ent_{e_id}")
-                if entity_filter is not None:
-                    if not ent_name.startswith(entity_filter): continue
-                
-                if "infection" in ent_name.lower():
-                    if ent_name.strip().lower() == "infection":
-                        ent_name = "Previous infection"
-                    elif not ent_name.lower().startswith("previous"):
-                        ent_name = f"Previous {ent_name.lower()}"
-                
+                if entity_filter is not None and not ent_name.startswith(entity_filter):
+                    continue
                 attr_name = id2word.get(a_id, f"Attr_{a_id}")
-                full_feature_name = f"{ent_name} - {attr_name}" if e_id >= 5 else attr_name
+                full_feature_name = format_eav_feature_name(ent_name, attr_name, entity_id=int(e_id))
                 val_name = id2word.get(v_id, f"Val_{v_id}")
 
                 val_name_str = str(val_name).strip()
@@ -614,14 +750,20 @@ def extract_attributions(
                 collected_data.append({
                     "Feature": full_feature_name,
                     "Value": val_name,
+                    "Value_Num": float(v_num) if np.isfinite(v_num) else np.nan,
                     "Score": float(score),
                     "Delta": patient_delta,
                     "Days": float(day)
                 })
 
+    if n_skipped_delta > 0:
+        print(f"   [Info] Skipped {n_skipped_delta}/{n_total_patients} patients exceeding max_delta={max_delta}")
     df = pd.DataFrame(collected_data)
+    df = apply_slice_relative_binning(df, mode=binning_mode)
     if csv_path:
         df.to_csv(csv_path, index=False)
+        if meta_sidecar is not None:
+            meta_sidecar.write_text(json.dumps({"ckpt_sig": ckpt_sig, "target_idx": int(target_idx)}, indent=2))
     
     return df
 
@@ -781,34 +923,6 @@ def get_deterministic_color_with_context(feature_name: str, string_value: str, p
     return palette_list[palette_index]
 
 
-def abbreviate_feature_name(text: str) -> str:
-    """Replaces full clinical terms with concise abbreviations while preserving original casing."""
-    replacements = {
-        "patient": "pt.",
-        "transplant": "tpx.",
-        "immunology": "immu.",
-        "medication": "med.",
-        "hemoglobin": "hgb.",
-        "previous": "prev.",
-        "infection": "inf.",
-    }
-    
-    def replace_match(match):
-        word = match.group(0)
-        lower_word = word.lower()
-        replacement = replacements.get(lower_word, word)
-        
-        # Preserve Titlecase / UPPERCASE formatting
-        if word.istitle():
-            return replacement.capitalize()
-        elif word.isupper():
-            return replacement.upper()
-        return replacement
-
-    pattern = re.compile(r'\b(' + '|'.join(replacements.keys()) + r')\b', re.IGNORECASE)
-    return pattern.sub(replace_match, text)
-
-
 def plot_feature_value_impact(
     df, OUTPUT_DIR, label_name, fup_max, max_delta=None, top_k=20, min_freq=50,
 ):
@@ -883,7 +997,7 @@ def plot_feature_value_impact(
     ]
     
     num_manual_map = {
-        'No / Male': "#D11D14", 'Yes / Female / Occured': "#203ed1",
+        'No / Male': "#D11D14", 'Yes / Female / Occurred': "#203ed1",
         'Value 2': "#4082b7", 'Value 3': "#54a4a1", 'Value 4': "#88f3cf",
     }
     
@@ -1089,52 +1203,10 @@ def plot_feature_value_impact(
     plt.close()
     
     
-def compute_feature_enrichment(target_indices, background_indices, dataset, top_k=20):
-    print(f"   -> Analyzing features for {len(target_indices)} vs {len(background_indices)} samples...")
-    
-    def get_features(indices):
-        features = []
-        for idx in indices:
-            sample = dataset[int(idx)]
-            f_set = set([f"{a}_{v}" for a, v in zip(sample["attribute"], sample["value_binned"])])
-            features.extend(list(f_set))
-        return features
-
-    target_counts = pd.Series(get_features(target_indices)).value_counts()
-    bg_counts = pd.Series(get_features(background_indices)).value_counts()
-    
-    n_target = len(target_indices)
-    n_bg = len(background_indices)
-    results = []
-    
-    candidates = target_counts[target_counts > (n_target * 0.05)].index 
-    
-    for feat_key in candidates:
-        a = target_counts.get(feat_key, 0)
-        c = bg_counts.get(feat_key, 0)
-        odds, p_val = fisher_exact([[a, n_target - a], [c, n_bg - c]], alternative='greater')
-        
-        try:
-            a_id, v_id = map(int, feat_key.split("_"))
-            feat_name = f"Attr({a_id}) - Val({v_id})" 
-        except:
-            feat_name = feat_key
-
-        results.append({
-            "Feature": feat_name,
-            "Target_%": (a / n_target) * 100,
-            "Background_%": (c / n_bg) * 100,
-            "Odds_Ratio": odds,
-            "P_Value": p_val
-        })
-        
-    return pd.DataFrame(results).sort_values("Odds_Ratio", ascending=False).head(top_k)
-
-
 def run_captum_analysis(
     model, dataset, collator, vocab, device, OUTPUT_DIR, label_name,
     fup_max, indices, target_idx=0, entity_filter=None, max_delta=None,
-    top_k=20, min_freq=20, plot_only=None, agg_method="mean",
+    top_k=20, min_freq=20, plot_only=None, agg_method="mean", ckpt_sig: str = "",
 ):
     print(f" -> Extracting attributions for {len(indices)} samples...")
     csv_path = OUTPUT_DIR / f"attributions_analysis_{label_name}.csv"
@@ -1142,7 +1214,7 @@ def run_captum_analysis(
     df = extract_attributions(
         model, dataset, collator, indices, vocab, device,
         target_idx=target_idx, entity_filter=entity_filter,
-        max_delta=max_delta, csv_path=csv_path, plot_only=plot_only,
+        max_delta=max_delta, csv_path=csv_path, plot_only=plot_only, ckpt_sig=ckpt_sig,
     )
     
     if df.empty:

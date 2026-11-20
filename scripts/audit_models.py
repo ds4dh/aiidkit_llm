@@ -1,43 +1,46 @@
-import argparse
+import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import argparse
 import re
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, precision_recall_curve
 from scipy.stats import norm
 
-from scripts.script_utils import calibrate_dataframe_pair
+from src.tasks import UNIFIED_HORIZONS, UNIFIED_TASKS, normalize_task_key
+from scripts.script_utils import calibrate_dataframe_pair, resolve_predictions_csv
 
 
 # ==========================================
 # Paths & Settings Defaults
 # ==========================================
-BASE_DATA_PATH = Path("/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.6_old/teav")
 RESULTS_DIR = Path("results")
 OUTPUT_IMAGE = Path("./tmp/conf_mats.png")
+
+_LEGACY_MODEL_MAP = {
+    "Transformer": "tf_raw_mt",
+    "logistic_regression": "lr_raw",
+    "random_forest": "rf_raw",
+    "xgboost": "xgb_raw",
+}
 
 
 # ==========================================
 # Data Loading Functions (Single Step)
 # ==========================================
-def _load_step_from_csv(root: Path, dataset_split: str, horizon: int, time_step: int) -> pd.DataFrame:
-    """
-    Reads one (horizon, fup) slice from a run's tidy '{dataset_split}_predictions.csv'
-    (written by the training scripts) into the audit schema:
-        patient_id, time_step, horizon, y_true, y_prob
-    """
-    if not root.exists():
+def _extract_step_from_csv_file(csv_path: Path | None, task: str, horizon: int, time_step: int) -> pd.DataFrame:
+    """Reads one (task, horizon, fup) slice from a tidy '{split}_predictions.csv'."""
+    if csv_path is None or not csv_path.exists():
         return pd.DataFrame()
-    fname = f"{dataset_split}_predictions.csv"
-    run_dir = next(
-        (x for x in sorted(root.iterdir())
-         if x.is_dir() and f"hrz({horizon:04d})" in x.name and (x / fname).exists()),
-        None,
-    )
-    if run_dir is None:
-        return pd.DataFrame()
-    df = pd.read_csv(run_dir / fname)
+    df = pd.read_csv(csv_path)
+    if "task" in df.columns:
+        norm_t = normalize_task_key(task)
+        df = df[df["task"].isin([task, norm_t])]
     df = df[(df["horizon"] == horizon) & (df["fup"] == time_step)]
     if df.empty:
         return pd.DataFrame()
@@ -50,39 +53,66 @@ def _load_step_from_csv(root: Path, dataset_split: str, horizon: int, time_step:
     }).reset_index(drop=True)
 
 
-def load_transformer_step(task, split, dataset_split, horizon, time_step):
-    """Load Transformer predictions for a single follow-up time step (tidy CSV)."""
-    root = RESULTS_DIR / "transformer" / split / "e00-a15-v60" / "finetuning" / task
-    return _load_step_from_csv(root, dataset_split, horizon, time_step)
+def _find_csv_in_dir(root: Path, dataset_split: str, horizon: int) -> Path | None:
+    if not root.exists():
+        return None
+    fname = f"{dataset_split}_predictions.csv"
+    tag = f"{horizon:04d}"
+    for x in sorted(root.iterdir(), key=lambda p: p.stat().st_mtime_ns if p.exists() else 0, reverse=True):
+        if not x.is_dir() or not (x / fname).exists():
+            continue
+        m = re.match(r"hrz\(([0-9\-]+)\)", x.name)
+        if m and tag in m.group(1).split("-"):
+            return x / fname
+    return None
 
 
-def load_classic_step(model, task, split, dataset_split, horizon, time_step):
-    """Load classic ML predictions for a single follow-up time step (tidy CSV)."""
-    root = RESULTS_DIR / "classic_ml" / split / model / task
-    return _load_step_from_csv(root, dataset_split, horizon, time_step)
+def load_model_data(model_name: str, task: str, split: str, dataset_split: str, horizon: int, time_step: int, results_dir: Path = RESULTS_DIR) -> pd.DataFrame:
+    """Loads single-(task, horizon, fup) predictions for any Transformer or Classic ML model."""
+    norm_task = normalize_task_key(task)
+    registry_candidates = [_LEGACY_MODEL_MAP[model_name], "tf_raw_mt", "tf_raw_pan", "tf_raw"] if model_name == "Transformer" else [
+        _LEGACY_MODEL_MAP.get(model_name, model_name)
+    ]
+    for reg_key in registry_candidates:
+        try:
+            csv_path = resolve_predictions_csv(
+                results_dir=results_dir,
+                model_key=reg_key,
+                split_type=split,
+                task=norm_task,
+                horizon=horizon,
+                split_subset=dataset_split,
+            )
+            df = _extract_step_from_csv_file(csv_path, norm_task, horizon, time_step)
+            if not df.empty:
+                return df
+        except KeyError:
+            pass
 
-
-def load_model_data(model_name, task, split, dataset_split, horizon, time_step):
-    if model_name == "Transformer":
-        return load_transformer_step(task, split, dataset_split, horizon, time_step)
-    return load_classic_step(model_name, task, split, dataset_split, horizon, time_step)
+    # Fallback for un-tagged classic_ml folders (e.g. classic_ml/<split>/xgboost/<task>)
+    for t_cand in (norm_task, task):
+        csv_path = _find_csv_in_dir(results_dir / "classic_ml" / split / model_name / t_cand, dataset_split, horizon)
+        df = _extract_step_from_csv_file(csv_path, norm_task, horizon, time_step)
+        if not df.empty:
+            return df
+    return pd.DataFrame()
 
 
 # ==========================================
 # Helpers & Calculations
 # ==========================================
-def compute_threshold_for_recall(df_val, target_recall=0.80):
+def compute_threshold_for_recall(df_val: pd.DataFrame, target_recall: float = 0.80) -> float:
     """Find the threshold that achieves target recall on validation set."""
     if df_val.empty or df_val["y_true"].nunique() < 2:
         return 0.5
     _, recall, thresholds = precision_recall_curve(df_val["y_true"], df_val["y_prob"])
     idx = np.where(recall[:-1] >= target_recall)[0]
     if len(idx) == 0:
-        return 0.5
+        return float(thresholds[0]) if len(thresholds) else 0.5
     return float(thresholds[idx[-1]])
 
 
-def calculate_mcnemar_sample_size(p10, p01, alpha=0.05, power=0.80, two_sided=True):
+def calculate_mcnemar_sample_size(p10: float, p01: float, alpha: float = 0.05, power: float = 0.80, two_sided: bool = True):
     """Calculate sample size for McNemar's test given discordant proportions (Connor 1987 / Machin)."""
     p_diff = abs(p10 - p01)
     p_disc = p10 + p01
@@ -91,8 +121,6 @@ def calculate_mcnemar_sample_size(p10, p01, alpha=0.05, power=0.80, two_sided=Tr
 
     z_alpha = norm.ppf(1.0 - alpha / 2.0) if two_sided else norm.ppf(1.0 - alpha)
     z_beta = norm.ppf(power)
-
-    # Standard formula for paired binary proportions
     n_required = ((z_alpha * np.sqrt(p_disc) + z_beta * np.sqrt(p_disc - p_diff**2)) / p_diff) ** 2
     return int(np.ceil(n_required))
 
@@ -102,28 +130,35 @@ def calculate_mcnemar_sample_size(p10, p01, alpha=0.05, power=0.80, two_sided=Tr
 # ==========================================
 def main():
     parser = argparse.ArgumentParser(description="Two-Model Evaluation & McNemar Sample Size Calculator")
-    parser.add_argument("--model_a", type=str, default="Transformer", choices=["Transformer", "logistic_regression", "random_forest", "xgboost"])
-    parser.add_argument("--model_b", type=str, default="xgboost", choices=["Transformer", "logistic_regression", "random_forest", "xgboost"])
-    parser.add_argument("--task", type=str, default="infection_bacteria", choices=["infection_bacteria", "infection_virus"])
+    parser.add_argument("--model_a", type=str, default="tf_raw_mt",
+                        help="First model (e.g. tf_raw_mt, tf_raw_unified, Transformer, xgboost, random_forest, logistic_regression)")
+    parser.add_argument("--model_b", type=str, default="xgboost",
+                        help="Second model to compare against model_a")
+    parser.add_argument("--task", type=str, default="infection_bacteria",
+                        help=f"Outcome task key (e.g. {', '.join(UNIFIED_TASKS[:4])}, death, graft_loss)")
     parser.add_argument("--split", type=str, default="random_split", choices=["random_split", "temporal_split", "center_split"])
     parser.add_argument("--time_step", "-T", type=int, default=180, help="Post-tpx follow-up day (e.g. 180)")
-    parser.add_argument("--horizon", "-H", type=int, default=30, choices=[30, 60, 90], help="Prediction horizon in days")
+    parser.add_argument("--horizon", "-H", type=int, default=30, choices=UNIFIED_HORIZONS, help="Prediction horizon in days")
     parser.add_argument("--target_recall", type=float, default=0.80, help="Recall target for thresholding (0.0 - 1.0)")
-    parser.add_argument("--calibrate", action="store_true", default=True, help="Apply isotonic calibration")
+    parser.add_argument("--calibrate", action=argparse.BooleanOptionalAction, default=True,
+                        help="Apply validation-fitted L2 Platt scaling calibration (default: True; disable with --no-calibrate)")
+    parser.add_argument("--results-dir", type=Path, default=RESULTS_DIR, help="Root results directory")
+    parser.add_argument("--output-image", type=Path, default=OUTPUT_IMAGE, help="Output PNG path for confusion matrices")
     args = parser.parse_args()
 
     print(f"Loading data: Task={args.task} | Split={args.split} | FUP={args.time_step}d | Horizon={args.horizon}d")
 
-    # Load validation and test sets
-    val_a = load_model_data(args.model_a, args.task, args.split, "validation", args.horizon, args.time_step)
-    test_a = load_model_data(args.model_a, args.task, args.split, "test", args.horizon, args.time_step)
-    val_b = load_model_data(args.model_b, args.task, args.split, "validation", args.horizon, args.time_step)
-    test_b = load_model_data(args.model_b, args.task, args.split, "test", args.horizon, args.time_step)
+    val_a = load_model_data(args.model_a, args.task, args.split, "validation", args.horizon, args.time_step, args.results_dir)
+    test_a = load_model_data(args.model_a, args.task, args.split, "test", args.horizon, args.time_step, args.results_dir)
+    val_b = load_model_data(args.model_b, args.task, args.split, "validation", args.horizon, args.time_step, args.results_dir)
+    test_b = load_model_data(args.model_b, args.task, args.split, "test", args.horizon, args.time_step, args.results_dir)
 
     if any(df.empty for df in [val_a, test_a, val_b, test_b]):
-        raise RuntimeError("Could not find matching prediction files for the specified parameters.")
+        raise RuntimeError(
+            f"Could not find matching prediction files for ({args.model_a} vs {args.model_b}, "
+            f"task={args.task}, split={args.split}, fup={args.time_step}, horizon={args.horizon})."
+        )
 
-    # Align common patients
     keys = ["patient_id", "time_step", "horizon", "y_true"]
     common_val = val_a[keys].merge(val_b[keys], on=keys, how="inner").drop_duplicates()
     val_a = val_a.merge(common_val, on=keys).sort_values(keys).reset_index(drop=True)
@@ -137,7 +172,6 @@ def main():
         val_a, test_a = calibrate_dataframe_pair(df_val=val_a, df_test=test_a, prob_col="y_prob")
         val_b, test_b = calibrate_dataframe_pair(df_val=val_b, df_test=test_b, prob_col="y_prob")
 
-    # Compute classification thresholds
     thresh_a = compute_threshold_for_recall(val_a, target_recall=args.target_recall)
     thresh_b = compute_threshold_for_recall(val_b, target_recall=args.target_recall)
 
@@ -145,13 +179,10 @@ def main():
     pred_a = (test_a["y_prob"].values >= thresh_a).astype(int)
     pred_b = (test_b["y_prob"].values >= thresh_b).astype(int)
 
-    # ------------------------------------------
-    # Plot Confusion Matrices
-    # ------------------------------------------
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.8), dpi=150)
 
-    cm_a = confusion_matrix(y_test, pred_a)
-    cm_b = confusion_matrix(y_test, pred_b)
+    cm_a = confusion_matrix(y_test, pred_a, labels=[0, 1])
+    cm_b = confusion_matrix(y_test, pred_b, labels=[0, 1])
 
     disp_a = ConfusionMatrixDisplay(confusion_matrix=cm_a, display_labels=["Neg", "Pos"])
     disp_b = ConfusionMatrixDisplay(confusion_matrix=cm_b, display_labels=["Neg", "Pos"])
@@ -169,13 +200,11 @@ def main():
         y=1.05,
     )
     plt.tight_layout()
-    plt.savefig(OUTPUT_IMAGE, bbox_inches="tight")
+    args.output_image.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(args.output_image, bbox_inches="tight")
     plt.close()
-    print(f"\n[Saved] Confusion matrices plot written to {OUTPUT_IMAGE.resolve()}")
+    print(f"\n[Saved] Confusion matrices plot written to {args.output_image.resolve()}")
 
-    # ------------------------------------------
-    # McNemar Contingency Table & Sample Size
-    # ------------------------------------------
     correct_a = (pred_a == y_test)
     correct_b = (pred_b == y_test)
 
@@ -183,30 +212,27 @@ def main():
     n_pos_gt = int(np.sum(y_test == 1))
     n_neg_gt = int(np.sum(y_test == 0))
 
-    # Overall Discordance
-    n11 = int(np.sum(correct_a & correct_b))    # Both correct
-    n10 = int(np.sum(correct_a & ~correct_b))   # Model A correct, Model B incorrect
-    n01 = int(np.sum(~correct_a & correct_b))   # Model A incorrect, Model B correct
-    n00 = int(np.sum(~correct_a & ~correct_b))  # Both incorrect
+    n11 = int(np.sum(correct_a & correct_b))
+    n10 = int(np.sum(correct_a & ~correct_b))
+    n01 = int(np.sum(~correct_a & correct_b))
+    n00 = int(np.sum(~correct_a & ~correct_b))
 
     p10 = n10 / n_total
     p01 = n01 / n_total
     p_disc = p10 + p01
     delta_acc = p10 - p01
 
-    # Confusion matrix components
     tn_a, fp_a, fn_a, tp_a = cm_a.ravel()
     tn_b, fp_b, fn_b, tp_b = cm_b.ravel()
 
-    # Stratified Discordance for Sensitivity & Specificity
     mask_neg = (y_test == 0)
     mask_pos = (y_test == 1)
-    
-    n10_neg = int(np.sum(correct_a[mask_neg] & ~correct_b[mask_neg]))  # A correctly identified TN, B called FP
-    n01_neg = int(np.sum(~correct_a[mask_neg] & correct_b[mask_neg]))  # B correctly identified TN, A called FP
 
-    n10_pos = int(np.sum(correct_a[mask_pos] & ~correct_b[mask_pos]))  # A correctly identified TP, B called FN
-    n01_pos = int(np.sum(~correct_a[mask_pos] & correct_b[mask_pos]))  # B correctly identified TP, A called FN
+    n10_neg = int(np.sum(correct_a[mask_neg] & ~correct_b[mask_neg]))
+    n01_neg = int(np.sum(~correct_a[mask_neg] & correct_b[mask_neg]))
+
+    n10_pos = int(np.sum(correct_a[mask_pos] & ~correct_b[mask_pos]))
+    n01_pos = int(np.sum(~correct_a[mask_pos] & correct_b[mask_pos]))
 
     print("\n" + "=" * 65)
     print("             DATASET AND MODEL PREDICTION COUNTS")
@@ -223,7 +249,7 @@ def main():
     print(f"  >>>    TP: {tp_a:<5} FP: {fp_a:<5} TN: {tn_a:<5} FN: {fn_a:<5}")
     print(f"{args.model_b} Predictions: {int(np.sum(pred_b == 1))} pos / {int(np.sum(pred_b == 0))} neg")
     print(f"  >>>    TP: {tp_b:<5} FP: {fp_b:<5} TN: {tn_b:<5} FN: {fn_b:<5}")
-    
+
     print("\n" + "=" * 65)
     print("        PILOT PERFORMANCE AND DISCORDANCE BREAKDOWN")
     print("=" * 65)

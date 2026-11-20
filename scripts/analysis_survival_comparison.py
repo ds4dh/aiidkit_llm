@@ -48,6 +48,7 @@ from src.data.survival_labels import (
 from src.evaluation.survival_metrics import (
     concordance_index, ipcw_brier_scores, integrated_brier_score,
 )
+from src.tasks import normalize_task_key
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +134,7 @@ def _load_predictions(
     fup: int,
     dataset_split: str,
     risk_col: str = "prob",
+    task_filter: str | None = None,
 ) -> pd.DataFrame:
     """
     Extracts one (horizon, fup) slice of a run's tidy predictions table as
@@ -147,6 +149,8 @@ def _load_predictions(
     if df.empty:
         return pd.DataFrame()
     sub = df[(df["horizon"] == horizon) & (df["fup"] == fup)]
+    if task_filter is not None and "task" in sub.columns:
+        sub = sub[sub["task"].isin([task_filter, normalize_task_key(task_filter)])]
     if sub.empty:
         return pd.DataFrame()
     return pd.DataFrame({
@@ -164,10 +168,30 @@ def load_binary_transformer_predictions(
     fup: int,
     dataset_split: str,
 ) -> pd.DataFrame:
-    """Loads P(event by horizon) from the binary transformer run (tidy CSV)."""
-    return _load_predictions(
-        results_root / split_type / run_id / "finetuning" / task_key, horizon, fup, dataset_split,
-    )
+    """Loads P(event by horizon) from single-task or multi-task binary transformer runs."""
+    norm_task = normalize_task_key(task_key)
+    clean_run_id = run_id if run_id.endswith(("_raw", "_bin")) else f"{run_id}_raw"
+    ft_base = results_root / split_type / clean_run_id / "finetuning"
+    folder_candidates = [
+        norm_task,
+        task_key,
+        "multitask_unified",
+        "multitask_all",
+        "multitask_bacteria",
+        "multitask_viruses",
+        "multitask_fungi",
+    ]
+    for folder in folder_candidates:
+        cand_dir = ft_base / folder
+        if not cand_dir.exists():
+            continue
+        try:
+            df = _load_predictions(cand_dir, horizon, fup, dataset_split, task_filter=norm_task)
+            if not df.empty:
+                return df
+        except FileNotFoundError:
+            continue
+    raise FileNotFoundError(f"No binary transformer predictions for ({task_key}, h={horizon}) under {ft_base}")
 
 
 def load_classic_ml_predictions(
@@ -179,10 +203,13 @@ def load_classic_ml_predictions(
     fup: int,
     dataset_split: str,
 ) -> pd.DataFrame:
-    """Loads P(event by horizon) from a classic ML run (tidy CSV)."""
-    return _load_predictions(
-        results_root / split_type / model_type / task_key, horizon, fup, dataset_split,
-    )
+    """Loads P(event by horizon) from a classic ML run (supports both grp_* and infection_grp_*)."""
+    norm_task = normalize_task_key(task_key)
+    for t_cand in (norm_task, task_key):
+        cand_dir = results_root / split_type / model_type / t_cand
+        if cand_dir.exists():
+            return _load_predictions(cand_dir, horizon, fup, dataset_split)
+    raise FileNotFoundError(f"Missing classic_ml directory for ({model_type}, {task_key})")
 
 
 def load_survival_transformer_predictions(
@@ -195,9 +222,14 @@ def load_survival_transformer_predictions(
     dataset_split: str,
 ) -> pd.DataFrame:
     """Loads P(event by horizon) = 1 - S(horizon|x) from the Cox survival run (tidy CSV)."""
-    return _load_predictions(
-        results_root / split_type / run_id / "finetuning" / task_key, horizon, fup, dataset_split,
-    )
+    clean_run_id = run_id if run_id.endswith(("_raw", "_bin")) else f"{run_id}_raw"
+    norm_task = normalize_task_key(task_key)
+    for subdir in ("finetuning_survival", "finetuning"):
+        for t_cand in (task_key, norm_task):
+            cand_dir = results_root / split_type / clean_run_id / subdir / t_cand
+            if cand_dir.exists():
+                return _load_predictions(cand_dir, horizon, fup, dataset_split)
+    raise FileNotFoundError(f"Missing survival predictions for {task_key} under {results_root}")
 
 
 # ---------------------------------------------------------------------------
@@ -280,46 +312,47 @@ def stratified_paired_bootstrap(
     seed: int = 42,
 ) -> dict:
     """
-    Stratified (per fup) paired bootstrap testing H1: model A > model B on
-    AUROC and AP, over identical resampled patients within each fup stratum.
+    Patient-cluster paired bootstrap testing two-sided differences between model A and model B
+    on AUROC and AP across correlated longitudinal snapshots per `patient_id`.
     """
-    rng = np.random.default_rng(seed)
-    strata_idx = [grp.index.to_numpy() for _, grp in df.groupby("fup") if len(grp) >= 5]
-    if not strata_idx:
+    from scripts.script_utils import build_patient_cluster_bootstrap_counts, vectorized_bootstrap_ap_and_roc
+
+    y = df[y_col].to_numpy(dtype=np.float64)
+    valid = (y == 0) | (y == 1)
+    if np.sum(valid) < 5 or len(np.unique(y[valid])) < 2:
         return {"auroc_delta": np.nan, "auroc_p": np.nan, "ap_delta": np.nan, "ap_p": np.nan}
 
-    def _metrics(idx):
-        sub = df.loc[idx]
-        y = sub[y_col].to_numpy()
-        if len(np.unique(y)) < 2:
-            return None, None
-        a_auc = roc_auc_score(y, sub[col_a].to_numpy()); b_auc = roc_auc_score(y, sub[col_b].to_numpy())
-        a_ap = average_precision_score(y, sub[col_a].to_numpy()); b_ap = average_precision_score(y, sub[col_b].to_numpy())
-        return a_auc - b_auc, a_ap - b_ap
+    y_v = y[valid]
+    pa = df[col_a].to_numpy(dtype=np.float64)[valid]
+    pb = df[col_b].to_numpy(dtype=np.float64)[valid]
+    pids = df["patient_id"].to_numpy()[valid] if "patient_id" in df.columns else None
 
-    idx_full = np.concatenate(strata_idx)
-    d_auc, d_ap = _metrics(idx_full)
-    auc_diffs, ap_diffs = [], []
-    for _ in range(n_bootstraps):
-        boot_idx = np.concatenate([
-            rng.choice(idx, size=len(idx), replace=True) for idx in strata_idx
-        ])
-        da, dp = _metrics(boot_idx)
-        if da is None:
-            continue
-        auc_diffs.append(da); ap_diffs.append(dp)
+    d_auc = float(roc_auc_score(y_v, pa) - roc_auc_score(y_v, pb))
+    d_ap = float(average_precision_score(y_v, pa) - average_precision_score(y_v, pb))
 
-    def _p(diffs, observed):
-        if not diffs or observed is None or np.isnan(observed):
+    counts = build_patient_cluster_bootstrap_counts(pids, len(y_v), n_bootstraps, seed=seed)
+    pos_counts = counts @ y_v
+    tot_counts = np.sum(counts, axis=1)
+    valid_boot = (pos_counts > 0) & (pos_counts < tot_counts)
+    if not np.any(valid_boot):
+        return {"auroc_delta": d_auc, "auroc_p": np.nan, "ap_delta": d_ap, "ap_p": np.nan}
+
+    ap_a, roc_a = vectorized_bootstrap_ap_and_roc(y_v, pa, counts, valid_boot_mask=valid_boot, compute_roc=True)
+    ap_b, roc_b = vectorized_bootstrap_ap_and_roc(y_v, pb, counts, valid_boot_mask=valid_boot, compute_roc=True)
+
+    def _two_sided_p(diffs: np.ndarray) -> float:
+        if len(diffs) == 0:
             return np.nan
-        diffs = np.asarray(diffs)
-        return float(np.mean(diffs <= 0.0))  # one-sided p-value (A better)
+        n_b = len(diffs)
+        p_le = (np.sum(diffs <= 0.0) + 1.0) / (n_b + 1.0)
+        p_ge = (np.sum(diffs >= 0.0) + 1.0) / (n_b + 1.0)
+        return float(min(1.0, 2.0 * min(p_le, p_ge)))
 
     return {
-        "auroc_delta": float(d_auc) if d_auc is not None and not np.isnan(d_auc) else np.nan,
-        "auroc_p": _p(auc_diffs, d_auc),
-        "ap_delta": float(d_ap) if d_ap is not None and not np.isnan(d_ap) else np.nan,
-        "ap_p": _p(ap_diffs, d_ap),
+        "auroc_delta": d_auc,
+        "auroc_p": _two_sided_p(roc_a - roc_b),
+        "ap_delta": d_ap,
+        "ap_p": _two_sided_p(ap_a - ap_b),
     }
 
 
@@ -352,7 +385,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     reference = comp.get("reference_model", "transformer_survival")
-    n_boot = int(comp.get("n_bootstrap", 1000))
+    n_boot = int(cfg.get("n_bootstrap", comp.get("n_bootstrap", 1000)))
     run_id = comp.get("run_id", "e00-a15-v60")
 
     # Registry of model loaders: name -> callable(task, horizon, fup) -> df(patient_id, risk)
