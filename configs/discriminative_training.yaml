@@ -13,7 +13,7 @@
 
 # Run configuration and task (data collator) definition
 data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v3.9/teav
-data_split_type: temporal_split  # random_split, center_split, temporal_split
+data_split_type: random_split    # random_split, center_split, temporal_split
 result_dir: results/transformer  # base directory name for all results
 data_collator:
   eav_mappings:
@@ -32,70 +32,181 @@ data_collator:
     value_id: 0.60      # probability of masking a value sub-token
 
 # Configuration for finetuning tasks to run
-train_data_augment: all           # default: "all" (pool every fup folder; 'fups' then only affect run names). "none" = one model per fup, "valid" = pool listed fups
-target_undersampling_ratio: 15.0  # maximum ("worst") ratio of positive to negative samples during finetuning (null for not using under-sampling)
+train_data_augment: all           # default: "all" (pool all 121 FUP folders). "valid" = pool listed 18 FUPs, "none" = one model per FUP
+target_undersampling_ratio: 15.0  # per-FUP negative-to-positive cap (undersample majority class if ratio exceeds 15:1)
 drop_unlabeled: true              # drop rows whose horizon labels are all -100 (unknown outcome; the loss masks them anyway)
 early_stopping_metric: roc_auc    # metric to use for early stopping (per label, then averaged)
 early_stopping_subset: null       # tasks whose heads VOTE on early stopping / checkpoint selection (null = every valid head in the group votes)
-early_stopping_mean: geometric    # aggregation over voting heads: harmonic | mean | geometric
-prediction_tasks:                 # Domain-grouped multi-task default (Option 1: bacteria + viruses)
+early_stopping_mean: random_effects # hierarchical random-effects inverse-variance pooling (resilient to rare-head noise without one head dominating)
+n_bootstrap_eval: 100             # paired stratified bootstrap replicates on early_stopping_metric during mid-training eval (0 disables)
+prediction_tasks:                 # Individual bacterial tasks + domain-grouped & unified multi-task
+  # Validation FUPs (18 FUPs, 1.5x denser) span all 5 clinical windows up to 3600d with increasing step size:
+  #   Perioperative (0-30d):       0, 30                        (step +30d)
+  #   Opportunistic (31-180d):     60, 90, 120, 150, 180        (step +30d)
+  #   Maintenance (181-360d):      240, 300, 360                (step +60d)
+  #   Long-term (361-1080d):       540, 720, 900, 1080          (step +180d)
+  #   Very long-term (1081-3600d): 1440, 1800, 2700, 3600       (step +360d, +900d)
+  # --- Individual well-powered pathogen & clinical tasks (>=115 train patients, no 'other_*' buckets) ---
+  infection_bacteria:             {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[30, 60, 90]]}
+  infection_virus:                {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[30, 60, 90]]}
+  infection_grp_enterobacterales: {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[30, 60, 90]]}
+  infection_grp_gram_positive:    {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[30, 60, 90]]}
+  infection_grp_gn_nonfermenters: {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[30, 60, 90]]}
+  infection_grp_clostridium:      {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[30, 60, 90]]}
+  infection_grp_herpes_viruses:   {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[30, 60, 90]]}
+  infection_grp_cmv:              {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[30, 60, 90]]}
+  infection_grp_bkpyv:            {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[30, 60, 90]]}
+  infection_fungi:                {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[30, 60, 90]]}
+  infection_grp_candida:          {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[30, 60, 90]]}
+
+  # --- Long-term patient & allograft outcomes (1y=360d, 2y=720d, 5y=1800d = 3 heads each) ---
+  death:                          {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[360, 720, 1800]]}
+  graft_loss:                     {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[360, 720, 1800]]}
+
+  # --- Domain-grouped multi-task bacteria (5 tasks x 3 horizons = 15 heads) ---
   multitask_bacteria:
     tasks: [
-      infection_bacteria,                  # 888 train / 185 val pos patients
-      infection_grp_enterobacterales,      # 636 / 135
-      infection_grp_gram_positive,         # 328 /  51
-      infection_grp_gn_nonfermenters,      #  79 /  17  (borderline, clinically actionable)
-      infection_grp_clostridium,           #  64 /  12  (borderline)
+      infection_bacteria,
+      infection_grp_enterobacterales,
+      infection_grp_gram_positive,
+      infection_grp_gn_nonfermenters,
+      infection_grp_clostridium,
     ]
-    fups: [0, 30, 60, 90, 180, 360]
+    fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600]
     horizons: [[30, 60, 90]]
 
   multitask_viruses:
     tasks: [
-      infection_virus,                     # 723 / 163
-      infection_grp_herpes_viruses,        # 235 /  57
-      infection_grp_cmv,                   # 170 /  43
-      infection_grp_bkpyv,                 # 146 /  29
+      infection_virus,
+      infection_grp_herpes_viruses,
+      infection_grp_cmv,
+      infection_grp_bkpyv,
     ]
-    fups: [0, 30, 60, 90, 180, 360]
+    fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600]
     horizons: [[30, 60, 90]]
 
-  # --- Optional single-task examples (uncomment or pass via --tasks to run individually):
-  # infection_bacteria: {fups: [0, 30, 60, 90, 180, 360], horizons: [[30, 60, 90]]}
-  # infection_grp_cmv:  {fups: [0, 30, 60, 90, 180, 360], horizons: [[30, 60, 90]]}
+  # --- Domain-grouped multi-task fungi (baseline comparison) ---
+  multitask_fungi:
+    tasks: [
+      infection_fungi,
+      infection_grp_candida,
+    ]
+    fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600]
+    horizons: [[30, 60, 90]]
+
+  # --- Time-scale & prevalence-aligned acute Bacteria + Viruses (9 tasks x 3 horizons = 27 heads) ---
+  multitask_bv:
+    tasks: [
+      infection_bacteria,
+      infection_grp_enterobacterales,
+      infection_grp_gram_positive,
+      infection_grp_gn_nonfermenters,
+      infection_grp_clostridium,
+      infection_virus,
+      infection_grp_herpes_viruses,
+      infection_grp_cmv,
+      infection_grp_bkpyv,
+    ]
+    fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600]
+    horizons: [[30, 60, 90]]
+
+  # --- Pure time-scale separated acute Pan-Infection: Bacteria + Viruses + Fungi (11 tasks x 3 horizons = 33 heads) ---
+  multitask_infections:
+    tasks: [
+      infection_bacteria,
+      infection_grp_enterobacterales,
+      infection_grp_gram_positive,
+      infection_grp_gn_nonfermenters,
+      infection_grp_clostridium,
+      infection_virus,
+      infection_grp_herpes_viruses,
+      infection_grp_cmv,
+      infection_grp_bkpyv,
+      infection_fungi,
+      infection_grp_candida,
+    ]
+    fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600]
+    horizons: [[30, 60, 90]]
+
+  # --- Matched-horizon unified Pan-Clinical: 11 acute @ [30,60,90] + 2 long-term @ [360,720,1800] (39 heads) ---
+  multitask_pan_13:
+    tasks: [
+      infection_bacteria,
+      infection_grp_enterobacterales,
+      infection_grp_gram_positive,
+      infection_grp_gn_nonfermenters,
+      infection_grp_clostridium,
+      infection_virus,
+      infection_grp_herpes_viruses,
+      infection_grp_cmv,
+      infection_grp_bkpyv,
+      infection_fungi,
+      infection_grp_candida,
+      death,
+      graft_loss,
+    ]
+    fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600]
+    horizons: [[30, 60, 90]]
+    task_horizons:
+      death: [360, 720, 1800]
+      graft_loss: [360, 720, 1800]
+
+  # --- Unified 7-horizon multi-task (optional all-in-one baseline / single-checkpoint web tool export) ---
+  multitask_unified:
+    tasks: [
+      infection_bacteria,
+      infection_grp_enterobacterales,
+      infection_grp_gram_positive,
+      infection_grp_gn_nonfermenters,
+      infection_grp_clostridium,
+      infection_virus,
+      infection_grp_herpes_viruses,
+      infection_grp_cmv,
+      infection_grp_bkpyv,
+      infection_fungi,
+      infection_grp_candida,
+      death,
+      graft_loss,
+    ]
+    fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600]
+    horizons: [[30, 60, 90, 180, 360, 720, 1800]]
 
 # Arguments for optuna run (perform both pretraining and finetuning for different hyper-parameters)
 optuna:
-  metric_to_optimize: val_all_roc_auc  # if possible, will add prediction tasks common denominator
   num_trials: 50
   num_trials_debug: 2
-  db_name: optuna_study.db
   study_name: pretraining_finetuning_hp_optimization
 
 # Arguments for HF's trainer for the pre-training phase
+do_clustering: false  # skip mid-training UMAP/HDBSCAN clustering; only run final clustering in downstream analysis
 pretrainer:
   seed: 1234
   logging_steps: 10
   warmup_steps: 100
-  num_train_epochs: 100  # maximum number of epochs (loses to max_steps)
-  max_steps: 100000  # maximum number of steps (training + validation)
+  num_train_epochs: 250  # maximum number of epochs (loses to max_steps)
+  max_steps: 5000  # realistic ceiling (~235 epochs at ga=4) so cosine LR schedule anneals smoothly
+  lr_scheduler_type: cosine
   eval_strategy: steps
   save_strategy: steps
   eval_steps: 100
   save_steps: 100
   save_total_limit: 1
   gradient_accumulation_steps: 4
-  per_device_train_batch_size: 48
-  per_device_eval_batch_size: 48
+  per_device_train_batch_size: 24
+  per_device_eval_batch_size: 24
   learning_rate: 1.0e-4  # careful! "1e-4" will be read as a string, use 1.0e-4
-  weight_decay: 0.1
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  adam_beta1: 0.9
+  adam_beta2: 0.98
+  adam_epsilon: 1.0e-6  # bf16-safe (1e-8 default underflows on small gradients)
   bf16: true
   report_to: none
   remove_unused_columns: false  # crucial for custom collators
   load_best_model_at_end: true  # required for early stopping
   metric_for_best_model: eval_mlm_accuracy  # format: "eval_" + metric name
   greater_is_better: true
-  early_stopping_patience: 5  # evaluations without improvement before stopping
+  early_stopping_patience: 7  # 7 evaluations (~33 epochs at ga=4) without improvement before stopping
 
 # Arguments for HF's trainer for the fine-tuning phase
 finetuner:
@@ -112,15 +223,16 @@ finetuner:
   save_total_limit: 1
   eval_accumulation_steps: 500
   gradient_accumulation_steps: 4
-  per_device_train_batch_size: 48
+  per_device_train_batch_size: 24
   per_device_eval_batch_size: 48
+  dataloader_num_workers: 4
   learning_rate: 4.0e-5
   weight_decay: 0.01
   max_grad_norm: 1.0  # global-norm cap, applied after gradient accumulation (0 disables)
   adam_beta1: 0.9
   adam_beta2: 0.99  # a bit more spike-tolerant than the 0.999 default
   adam_epsilon: 1.0e-6  # bf16-safe (the 1e-8 default underflows on small grads)
-  loss_name: dampened_ce  # ce, dampened_ce, weighted_ce, focal, poly1 (dampened_ce = sqrt(N_neg/N_pos) capped at 10.0)
+  loss_name: ce  # unweighted binary cross-entropy (well-calibrated probabilities; ce, dampened_ce, weighted_ce, focal, poly1)
   # loss_args: {gamma: 2.0, epsilon: 1.0, alpha: [3.0]}  # extra kwargs for the loss
   # class, merged over the data-derived class weights (popped, not TrainerArguments)
   enforce_monotonicity: true  # probabilities increase with horizon (in multi-task
@@ -132,7 +244,7 @@ finetuner:
   load_best_model_at_end: true
   metric_for_best_model: eval_all_early_stopping_metric  # see evaluator arguments
   greater_is_better: true
-  early_stopping_patience: 10  # evaluations without improvement before stopping
+  early_stopping_patience: 7  # 7 evaluations (350 steps at eval_steps=50) without improvement before stopping
 
 # LoRA configuration for fine-tuning (experimentally, it did not improve results)
 use_lora: false  # false for full fine-tuning
@@ -151,6 +263,7 @@ model:
   config_args:
     # vocab_size: 1024  # set when dataset is build (depends on the data vocabulary)
     max_position_embeddings: 1024  # original value in ModernBERT-base: 8192 // max t-EAV length: 1010
+    tie_word_embeddings: false  # inputs come from PatientEmbeddingLayer, so keep MLM decoder head untied & trainable
     output_hidden_states: true  # required for plotting embeddings
     classifier_pooling: mean  # to classify sequences during the fine-tuning phase
     pad_token_id: 0
@@ -173,4 +286,4 @@ model:
     dtype: bfloat16
     attn_implementation: sdpa  # flash_attention_2 will create a shape mismatch in ModernBERT, with input_embeds as input
   embedding_layer_config:
-    sentence_embedding_model: NeuML/pubmedbert-base-embeddings
+    use_numerical_embedding: true  # true: continuous value embedding + dual-head MLM; false: 7-bin discrete token embedding + standard CE MLM

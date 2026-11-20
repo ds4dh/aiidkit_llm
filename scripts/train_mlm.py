@@ -3,12 +3,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import argparse
-import yaml
 import gc
+import json
+import random
+import shutil
+import numpy as np
 import torch
 import wandb
+import yaml
 from transformers import Trainer, TrainingArguments, EarlyStoppingCallback
-from src.utils import apply_config_overrides
+from src.utils import apply_config_overrides, load_optuna_json_overrides
 from src.data.patient_dataset import load_hf_data_and_metadata
 from src.model.model_utils import GradientClippingGuard
 from src.model.patient_embedder import PatientEmbeddingModelFactory
@@ -17,6 +21,7 @@ from src.evaluation.evaluate_models import (
     DiscriminativeEmbeddingEvaluatorForMaskedLanguageModelling as CustomEvaluator,
     preprocess_logits_for_mlm_metrics,
 )
+from scripts.script_utils import format_pretrain_run_id
 
 class GuardedMLMTrainer(GradientClippingGuard, Trainer):
     """Trainer with gradient clipping diagnostics + non-finite gradient guard."""
@@ -26,6 +31,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Pre-train patient sequence model via Masked Language Modeling.")
     parser.add_argument("--config", "-c", type=str, default="configs/discriminative_training.yaml")
     parser.add_argument("--silent", "-s", action="store_true", help="Disable wandb logging.")
+    parser.add_argument("--optuna-json", "-J", action="append", default=[],
+                        help="Path(s) to best_pretrain_config.json written by train_optuna.py (applies portable_overrides before --overrides).")
     parser.add_argument("--overrides", "-o", action="append", default=[], help="Overrides config (JSON string or key=value).")
     return parser.parse_args()
 
@@ -37,6 +44,7 @@ def main():
     cli_args = parse_args()
     with open(cli_args.config, 'r') as f:
         cfg = yaml.safe_load(f)
+    cfg = load_optuna_json_overrides(cfg, cli_args.optuna_json)
     cfg = apply_config_overrides(cfg, cli_args.overrides)
 
     # Load whole patient dataset (all sequences) for masked language modelling
@@ -62,8 +70,13 @@ def main():
     model = PatientEmbeddingModelFactory.create_from_backbone(**cfg["model"])
 
     # Use custom data collator for t-EAV formatted patient loading
+    collator_cfg = dict(cfg["data_collator"])
+    collator_cfg.setdefault(
+        "use_numerical_embedding",
+        cfg["model"]["embedding_layer_config"].get("use_numerical_embedding", True),
+    )
     data_collator = PatientDataCollatorForMaskedLanguageModelling(
-        **cfg["data_collator"],
+        **collator_cfg,
         max_position_embeddings=model.config.max_position_embeddings,
     )
 
@@ -73,8 +86,7 @@ def main():
     evaluator = CustomEvaluator(do_clustering=cfg.get("do_clustering", True))
 
     # Training arguments, with the correct output directory
-    mlm_masking_rules = cfg["data_collator"]["mlm_masking_rules"]
-    run_id = "-".join([f"{k[0]}{int(v * 100):02d}" for k, v in mlm_masking_rules.items()])
+    run_id = format_pretrain_run_id(cfg)
     pt_cfg = cfg["pretrainer"].copy()
     result_dir = Path(cfg["result_dir"]) / cfg["data_split_type"]
     pt_cfg["output_dir"] = str(result_dir / run_id / "pretraining")
@@ -105,7 +117,28 @@ def main():
     )
 
     # Pre-train the model and reset wandb for the next run
-    trainer.train()  # best model saved automatically
+    for old_ckpt in Path(pt_cfg["output_dir"]).glob("checkpoint-*"):
+        shutil.rmtree(old_ckpt, ignore_errors=True)
+    train_out = trainer.train()  # best model saved automatically
+
+    # Standardized post-training validation evaluation on reference masking rules (e00-a15-v60, fixed seed)
+    # so Optuna trials with different training masking probabilities are evaluated on the exact same mask.
+    ref_collator_cfg = dict(collator_cfg)
+    ref_collator_cfg["mlm_masking_rules"] = {"entity_id": 0.00, "attribute_id": 0.15, "value_id": 0.60}
+    ref_collator_cfg["mlm_label_keys"] = ["entity_id", "attribute_id", "value_id"]
+    ref_collator = PatientDataCollatorForMaskedLanguageModelling(
+        **ref_collator_cfg,
+        max_position_embeddings=model.config.max_position_embeddings,
+    )
+    trainer.remove_callback(EarlyStoppingCallback)
+    trainer.data_collator = ref_collator
+    random.seed(1234)
+    torch.manual_seed(1234)
+    np.random.seed(1234)
+    ref_metrics = trainer.evaluate(eval_dataset=dataset["validation"], metric_key_prefix="ref_eval")
+    ref_metrics["train_runtime"] = float(getattr(train_out, "metrics", {}).get("train_runtime", 0.0))
+    with open(Path(pt_cfg["output_dir"]) / "pretraining_results.json", "w") as f:
+        json.dump({k: float(v) if isinstance(v, (int, float, np.floating)) else v for k, v in ref_metrics.items()}, f, indent=2)
 
     # Reset wandb and clean up memory for the next run
     if use_wandb:

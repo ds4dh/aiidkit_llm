@@ -2,13 +2,14 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import os
 import argparse
 import yaml
 import json
 import numpy as np
 import pandas as pd
 import optuna
-from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from tqdm.auto import tqdm
 from scipy.special import logit
 from xgboost import XGBClassifier
@@ -23,17 +24,24 @@ from sklearn.metrics import roc_auc_score
 from transformers.trainer_utils import EvalPrediction
 from imblearn.pipeline import Pipeline as ImbPipeline
 from imblearn.under_sampling import RandomUnderSampler
+from src.utils import apply_config_overrides
 from src.evaluation.plot_results import plot_task_results
 from src.evaluation.evaluate_models import (
     DiscriminativeEmbeddingEvaluatorForClassification as CustomEvaluator
 )
-from scripts.script_utils import save_predictions_table, extract_horizons_from_path
+from scripts.script_utils import save_predictions_table, extract_horizons_from_path, scan_all_fups
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 # Minimum training positives required to attempt a classic-ML run for a given
 # (task, horizon); below this the fitted model would be degenerate (see
 # train_model_run) and rare groups are skipped with a warning instead.
 MIN_TRAIN_POSITIVES = 5
+
+# Per-process cache keyed on (str(data_root), tuple(fups), filename) so 121 FUP
+# parquet tables and feature-type inference are computed ONCE per split rather
+# than repeated across all (model, task, horizon) combinations.
+_SPLIT_FRAME_CACHE: dict[tuple[str, tuple[int, ...], str], tuple[pd.DataFrame, list[str]]] = {}
+_FEATURE_TYPES_CACHE: dict[tuple[str, tuple[str, ...]], tuple[list[int], list[int], list[int]]] = {}
 
 
 # =================
@@ -46,22 +54,8 @@ def parse_args():
     parser.add_argument("--fixed_hp", "-f", action="store_true", help="Skip Optuna hyperparameter search.")
     parser.add_argument("--overrides", "-o", action="append", default=[], help="Overrides config (JSON string or key=value).")
     parser.add_argument("--tasks", "-t", nargs="+", default=[], help="Comma- or space-separated prediction_tasks keys to run.")
+    parser.add_argument("--models", "-m", nargs="+", default=[], help="Comma- or space-separated model_types to run.")
     return parser.parse_args()
-
-
-def scan_all_fups(data_root: Path) -> list[int]:
-    """Find all available follow-up folders (fup_XXXXd) in the data directory."""
-    fups = []
-    if not data_root.exists(): return []
-    for path in data_root.iterdir():
-        if path.is_dir() and path.name.startswith("fup_"):
-            try:
-                # Extract integer from "fup_0090d" -> 90
-                val = int(path.name.split("_")[-1].replace("d", ""))
-                fups.append(val)
-            except ValueError:
-                continue
-    return sorted(fups)
 
 
 def format_fup_string(fups: list[int] | str) -> str:
@@ -76,11 +70,13 @@ def main():
     args = parse_args()
     with open(args.config, 'r') as f:
         cfg = yaml.safe_load(f)
-    from src.utils import apply_config_overrides
     cfg = apply_config_overrides(cfg, args.overrides)
     if args.tasks:
         wanted = [t.strip() for arg in (args.tasks if isinstance(args.tasks, list) else [args.tasks]) for t in arg.split(",") if t.strip()]
         cfg["prediction_tasks"] = {t: cfg["prediction_tasks"][t] for t in wanted if t in cfg["prediction_tasks"]}
+    if args.models:
+        wanted_m = [m.strip() for arg in (args.models if isinstance(args.models, list) else [args.models]) for m in arg.split(",") if m.strip()]
+        cfg["model_types"] = [m for m in wanted_m if m in cfg["models"]]
 
     # Run all models
     model_types = cfg['model_types']
@@ -149,52 +145,66 @@ def main():
             )
 
 
-def load_combined_data(
-    data_root, fups, filename, label_key, ignore_cols, enforced_features=None,
-):
-    """
-    Loads and concatenates data from multiple FUP directories.
-    
-    Args:
-        enforced_features (list):
-        - If provided, the output X will be reindexed to match features exactly
-        - If None (training time), features are detected dynamically
-    """
-    dfs = []    
-    for fup in fups:
+def _load_cached_split_frame(data_root: Path, fups: list[int], filename: str, base_ignore_cols: set[str]) -> tuple[pd.DataFrame | None, list[str]]:
+    """Loads all FUP parquets once per (data_root, fups, filename) without split-dependent encoding."""
+    cache_key = (str(data_root.resolve()), tuple(int(f) for f in fups), filename)
+    if cache_key in _SPLIT_FRAME_CACHE:
+        return _SPLIT_FRAME_CACHE[cache_key]
+
+    def _read_one(fup):
         fup_dir = data_root / f"fup_{fup:04d}d"
         if not fup_dir.exists():
             fup_dir = data_root / f"fup_{fup:04d}"
         file_path = fup_dir / filename
-        if file_path.exists():
-            df_chunk = pd.read_parquet(file_path)
-            if label_key in df_chunk.columns:
-                df_chunk = df_chunk[df_chunk[label_key] != -100]
-            dfs.append(df_chunk)
+        if not file_path.exists():
+            return None
+        df_chunk = pd.read_parquet(file_path)
+        if len(df_chunk) > 0:
+            df_chunk = df_chunk.copy()
+            df_chunk["__fup__"] = int(fup)
+        return df_chunk
 
-    if not dfs: return None, None, None, None
+    workers = min(8, max(1, len(fups)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        dfs = [d for d in ex.map(_read_one, fups) if d is not None]
+
+    if not dfs:
+        return None, []
     full_df = pd.concat(dfs, ignore_index=True)
+    feats = [c for c in full_df.columns if c not in base_ignore_cols and c != "__fup__" and not c.startswith("label_")]
+    _SPLIT_FRAME_CACHE[cache_key] = (full_df, feats)
+    return full_df, feats
 
-    # Feature selection logic
-    if enforced_features is None:
-        # Dynamic detection (training phase)
-        feats = [c for c in full_df.columns if c not in ignore_cols and not c.startswith("label_")]
-        X_df = full_df[feats].copy()
+
+def load_combined_data(
+    data_root, fups, filename, label_key, ignore_cols, enforced_features=None, return_fups=False,
+):
+    """
+    Loads and concatenates data from multiple FUP directories (served from in-memory split cache).
+    """
+    base_ignore = {c for c in ignore_cols if not c.startswith("label_")}
+    full_df, detected_feats = _load_cached_split_frame(Path(data_root), list(fups), filename, base_ignore)
+    if full_df is None or full_df.empty:
+        return (None, None, None, None, None) if return_fups else (None, None, None, None)
+
+    if label_key in full_df.columns:
+        valid_mask = full_df[label_key].to_numpy() != -100
+        sub_df = full_df.loc[valid_mask]
     else:
-        # Strict enforcement (validation/test phase)
-        feats = enforced_features
-        # reindex ensures X has exactly 'feats' columns in the right order.
-        # Missing columns in 'full_df' become NaNs (which SimpleImputer will handle).
-        X_df = full_df.reindex(columns=feats)
+        sub_df = full_df
 
-    for obj_col in X_df.select_dtypes(include=["object", "category"]).columns:
-        X_df[obj_col] = X_df[obj_col].astype("category").cat.codes
-    X = X_df.values
-    y = full_df[label_key].values if label_key in full_df.columns else None
-    patient_ids = (
-        full_df["patientid"].values if "patientid" in full_df.columns else None
-    )
-    
+    if sub_df.empty:
+        return (None, None, None, None, None) if return_fups else (None, None, None, None)
+
+    feats = detected_feats if enforced_features is None else enforced_features
+    X_df = sub_df[feats] if enforced_features is None else sub_df.reindex(columns=feats)
+    X = X_df.to_numpy()
+    y = sub_df[label_key].to_numpy() if label_key in sub_df.columns else None
+    patient_ids = sub_df["patientid"].to_numpy() if "patientid" in sub_df.columns else None
+    if return_fups:
+        fup_arr = sub_df["__fup__"].to_numpy() if "__fup__" in sub_df.columns else None
+        return X, y, feats, patient_ids, fup_arr
+
     return X, y, feats, patient_ids
 
 
@@ -313,6 +323,21 @@ def train_model_run(
 # TRAINING CLASSES
 # ================
 
+def _evaluate_pipeline_predictions(pipeline, X, y, evaluator, prefix="eval"):
+    """Shared probability-to-logit adapter for BaselineTrainer and OptunaTrainer."""
+    if pipeline is None:
+        raise RuntimeError("Trainer must be trained before evaluation!")
+    probs = pipeline.predict_proba(X)[:, 1]
+    logits = logit(np.clip(probs, 1e-6, 1.0 - 1e-6))
+    if logits.ndim == 1:
+        logits = logits[:, None]
+    if y.ndim == 1:
+        y = y[:, None]
+    evaluator.current_prefix = prefix
+    metrics = evaluator(EvalPrediction(predictions=logits, label_ids=y))
+    return {f"{prefix}_{k}": v for k, v in metrics.items()}
+
+
 class BaselineTrainer:
     def __init__(self, model_type, model_params, output_dir, target_ratio):
         self.output_dir = Path(output_dir)
@@ -323,38 +348,13 @@ class BaselineTrainer:
 
     def train(self, X_train, y_train):
         print(f"Training {self.model_type}...")
-        
-        # Build a data transform + model pipeline based on X_train statistics
         self.pipeline = build_model_pipeline(
             X_train, y_train, self.model_type, self.model_params, self.target_ratio,
         )
-        
-        # Fit model with nicer data
         self.pipeline.fit(X_train, y_train)
 
     def evaluate(self, X, y, evaluator, prefix="eval"):
-        if self.pipeline is None:
-            raise RuntimeError("Trainer must be trained before evaluation!")
-
-        if hasattr(self.pipeline._final_estimator, "predict_proba"):
-            probs = self.pipeline.predict_proba(X)[:, 1]
-        else:
-            raise AttributeError("Model must support predict_proba")
-
-        # Invert Sigmoid: Logit(p) = log(p/(1-p))
-        probs_clipped = np.clip(probs, 1e-6, 1 - 1e-6)
-        logits = logit(probs_clipped)
-
-        if logits.ndim == 1: logits = logits[:, None]
-        if y.ndim == 1: y = y[:, None]
-        
-        eval_preds = EvalPrediction(predictions=logits, label_ids=y)
-        evaluator.current_prefix = prefix
-        
-        metrics = evaluator(eval_preds)
-        prefixed_metrics = {f"{prefix}_{k}": v for k, v in metrics.items()}
-        
-        return prefixed_metrics
+        return _evaluate_pipeline_predictions(self.pipeline, X, y, evaluator, prefix=prefix)
 
 
 class OptunaTrainer:
@@ -369,31 +369,35 @@ class OptunaTrainer:
 
     def optimize_and_train(self, X_train, y_train, X_val, y_val):
         """
-        Runs Optuna optimization to find best params, then retrains on full data.
+        Runs seeded Optuna optimization to find best params (precomputing preprocessing
+        and ANOVA feature ranking once), then retrains on full training data.
         """
-        # Define objective function
         base_pipe = build_model_pipeline(X_train, y_train, self.model_type, self._merge_fixed_params({}), self.target_ratio)
         prep_only = Pipeline([base_pipe.steps[0], base_pipe.steps[1]])
         X_train_prep = prep_only.fit_transform(X_train, y_train)
         X_val_prep = prep_only.transform(X_val)
+
+        f_scores, _ = f_classif(X_train_prep, y_train)
+        f_scores = np.nan_to_num(f_scores, nan=-np.inf)
+        feat_rank_desc = np.argsort(f_scores)[::-1]
+        n_prep_feats = X_train_prep.shape[1]
+
         def objective(trial):
-            # Sample parameters
-            params = self._suggest_params(trial)
-            
-            # Build temporary pipeline
+            params = dict(self._suggest_params(trial))
+            pct = int(params.pop("feature_fraction", 100))
+            k_keep = max(1, int(np.ceil(n_prep_feats * (pct / 100.0))))
+            keep_cols = feat_rank_desc[:k_keep]
+            X_tr_sel = X_train_prep[:, keep_cols]
+            X_va_sel = X_val_prep[:, keep_cols]
+
             pipeline = build_model_pipeline(
-                X_train_prep, y_train, self.model_type, params, self.target_ratio, include_preprocessor=False,
+                X_tr_sel, y_train, self.model_type, params, self.target_ratio,
+                include_preprocessor=False, include_selector=False,
             )
-            
-            # Fit on train, score on validation (simple hold-out optimization)
-            # For more robustness, replace this with cross_val_score on X_train
-            # NOTE: any degenerate fit (nan predictions, nan/failed AUC) must
-            # return a valid fallback score, otherwise the whole study has no
-            # completed trials and study.best_trial raises.
             try:
-                pipeline.fit(X_train_prep, y_train)
+                pipeline.fit(X_tr_sel, y_train)
                 if hasattr(pipeline, "predict_proba"):
-                    probs = pipeline.predict_proba(X_val_prep)[:, 1]
+                    probs = pipeline.predict_proba(X_va_sel)[:, 1]
                     if np.isnan(probs).any():
                         return 0.5
                     score = roc_auc_score(y_val, probs)
@@ -402,9 +406,8 @@ class OptunaTrainer:
             except Exception:
                 return 0.5
 
-        # Run hyper-parameter optimization
         print(f"Starting Optuna optimization ({self.n_trials} trials)...")
-        study = optuna.create_study(direction="maximize")
+        study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=1234))
         with tqdm(total=self.n_trials, colour='green', desc="Tuning") as pbar:
             study.optimize(
                 objective, 
@@ -435,20 +438,7 @@ class OptunaTrainer:
             json.dump(serializable_params, f, indent=4)
 
     def evaluate(self, X, y, evaluator, prefix="eval"):
-        if self.pipeline is None: raise RuntimeError("Not trained")
-        
-        probs = self.pipeline.predict_proba(X)[:, 1]
-        probs_clipped = np.clip(probs, 1e-6, 1 - 1e-6)
-        logits = logit(probs_clipped)
-        
-        if logits.ndim == 1: logits = logits[:, None]
-        if y.ndim == 1: y = y[:, None]
-        
-        eval_preds = EvalPrediction(predictions=logits, label_ids=y)
-        evaluator.current_prefix = prefix
-        
-        metrics = evaluator(eval_preds)
-        return {f"{prefix}_{k}": v for k, v in metrics.items()}
+        return _evaluate_pipeline_predictions(self.pipeline, X, y, evaluator, prefix=prefix)
 
     def _suggest_params(self, trial):
         """Parses the YAML config to suggest params via Optuna."""
@@ -527,13 +517,20 @@ def infer_feature_types(X, cat_threshold=20):
     return binary_cols, categorical_cols, numerical_cols
 
 
-def build_model_pipeline(X_train, y_train, model_type, model_params, target_ratio=None, include_preprocessor=True):
+def build_model_pipeline(
+    X_train, y_train, model_type, model_params, target_ratio=None,
+    include_preprocessor=True, include_selector=True,
+):
     """
-    Constructs a ColumnTransformer pipeline that treats features differently.
+    Constructs a ColumnTransformer pipeline fitted strictly on training data.
     """
-    # Infer types
-    bin_idx, cat_idx, num_idx = infer_feature_types(X_train) if include_preprocessor else ([], [], [])
-    # print(f"   [Auto-Preprocessing] Detected: {len(bin_idx)} Binary, {len(cat_idx)} Categorical, {len(num_idx)} Numerical features.")
+    if include_preprocessor:
+        cache_sig = (id(X_train), X_train.shape)
+        if cache_sig not in _FEATURE_TYPES_CACHE:
+            _FEATURE_TYPES_CACHE[cache_sig] = infer_feature_types(X_train)
+        bin_idx, cat_idx, num_idx = _FEATURE_TYPES_CACHE[cache_sig]
+    else:
+        bin_idx, cat_idx, num_idx = [], [], []
 
     # Numerical: median impute -> standard scale (robust to outliers/skew)
     num_transformer = Pipeline([
@@ -567,6 +564,12 @@ def build_model_pipeline(X_train, y_train, model_type, model_params, target_rati
 
     # Feature selector (keeps top N-% of features based on ANOVA F-value
     model_params = dict(model_params)
+    if model_params.get("n_jobs") == -1:
+        model_params["n_jobs"] = (
+            len(os.sched_getaffinity(0))
+            if hasattr(os, "sched_getaffinity")
+            else int(os.environ.get("SLURM_CPUS_PER_TASK", 16))
+        )
     percentile = model_params.pop('feature_fraction', 100)
     selector = SelectPercentile(score_func=f_classif, percentile=percentile)
 
@@ -589,11 +592,14 @@ def build_model_pipeline(X_train, y_train, model_type, model_params, target_rati
     # ])
     
     # Initialize pipeline step list
-    steps = [('selector', selector)] if not include_preprocessor else [
-        ('preprocessor', preprocessor),
-        ('dropper', dropper),
-        ('selector', selector),
-    ]
+    steps = []
+    if include_preprocessor:
+        steps.extend([
+            ('preprocessor', preprocessor),
+            ('dropper', dropper),
+        ])
+    if include_selector:
+        steps.append(('selector', selector))
     
     # Add under-sampler if ratio was provided and data needs to be under-sampled
     if target_ratio is not None:
@@ -651,30 +657,35 @@ def test_classic_ml_model(
         final_metrics = {}
         all_predictions = {}
         
-        # Compute the global aggregated matrix cut across ALL discovered FUP folders
-        X_all, y_all, _, pid_all = load_combined_data(
-            data_root, all_possible_fups, config["filename"], label_key, ignore_cols, enforced_features=features
+        # Compute the global aggregated matrix cut across ALL discovered FUP folders in ONE pass
+        X_all, y_all, _, pid_all, fup_all = load_combined_data(
+            data_root, all_possible_fups, config["filename"], label_key, ignore_cols,
+            enforced_features=features, return_fups=True,
         )
         
         if X_all is not None and len(X_all) > 0:
             prefix = f"{config['split_label']}_all"
             metrics_all = trainer.evaluate(X_all, y_all, evaluator, prefix=prefix)
             final_metrics.update(metrics_all)
+            mega_logits = np.asarray(evaluator.last_logits)
+            mega_labels = np.asarray(evaluator.saved_labels_and_probs["labels"])
             evaluator.saved_labels_and_probs = None
                 
-        # Iterate through individual stratified FUP time-steps sequentially
-        for fup in all_possible_fups:
-            X_fup, y_fup, _, pid_fup = load_combined_data(
-                data_root, [fup], config["filename"], label_key, ignore_cols, enforced_features=features
-            )
-            if X_fup is not None and len(X_fup) > 0:
+            # Slice per-FUP predictions in memory without re-reading or re-transforming 121 parquets
+            for fup in all_possible_fups:
+                idx = np.where(fup_all == fup)[0]
+                if len(idx) == 0:
+                    continue
                 prefix = f"{config['split_label']}_fup_{fup:04d}"
-                metrics_fup = trainer.evaluate(X_fup, y_fup, evaluator, prefix=prefix)
-                final_metrics.update(metrics_fup)
+                evaluator.current_prefix = prefix
+                raw_fup_metrics = evaluator(
+                    EvalPrediction(predictions=mega_logits[idx], label_ids=mega_labels[idx])
+                )
+                final_metrics.update({f"{prefix}_{k}": v for k, v in raw_fup_metrics.items()})
                 for key, array in evaluator.saved_labels_and_probs.items():
                     all_predictions[f"{prefix}_{key}"] = array
-                if pid_fup is not None and len(pid_fup) == len(y_fup):
-                    all_predictions[f"{prefix}_patientid"] = np.asarray(pid_fup)
+                if pid_all is not None:
+                    all_predictions[f"{prefix}_patientid"] = np.asarray(pid_all[idx])
                     
         # Explicitly flush out evaluator memory storage arrays between passes
         evaluator.saved_labels_and_probs = None

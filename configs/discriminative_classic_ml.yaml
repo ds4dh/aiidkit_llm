@@ -1,60 +1,23 @@
 # Run parameters
 data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v3.9/classic_ml
-data_split_type: center_split  # random_split, center_split, temporal_split
+data_split_type: random_split  # random_split, center_split, temporal_split
 result_dir: results/classic_ml
 model_types: [logistic_regression, random_forest, xgboost]
 prediction_tasks:
-  # Keep this list in sync with 'multitask_bacteria' and 'multitask_viruses' in
-  # configs/discriminative_training.yaml so the comparison can match
-  # the transformer heads one-to-one.
-  infection_bacteria:   {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  infection_virus:      {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  infection_grp_enterobacterales:   {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  infection_grp_gram_positive:      {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  infection_grp_gn_nonfermenters:   {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  infection_grp_clostridium:        {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  infection_grp_herpes_viruses:     {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  infection_grp_cmv:                {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  infection_grp_bkpyv:              {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  # dropped (prevalence check, pos patients train/val — see multitask config):
-  # infection_fungi:      {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}  # 123/21 — fungi skipped for now
-  # infection_grp_anaerobic_bacteria: {…}  #  11/2
-  # infection_grp_enteric_viruses:    {…}  #  40/8
-  # infection_grp_hepatitis_viruses:  {…}  #   4/3
-  # infection_grp_candida / aspergillus / pneumocystis: {…}  # fungi
-  # infection_grp_influenza / sars_cov_2 / other*: {…}       # seasonal / catch-alls
-
-  # --- Optional: pathogen-group baseline tasks ---------------------------------
-  # Same task keys and per-horizon label columns as the transformer multi-task
-  # run (label_infection_grp_<group>_<H>d), so their predictions plug straight
-  # into the comparison analysis as contenders for the group heads.
-  # Cost warning: runs = tasks x horizons x model_types x n_optuna_trials.
-  # For broad group sweeps consider the --fixed_hp flag (uses each model's
-  # fixed_params, skips Optuna) or fewer trials: rare groups have few positives
-  # and Optuna mostly tunes noise there.
-  # infection_grp_gram_positive:      {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  # infection_grp_enterobacterales:   {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  # infection_grp_gn_nonfermenters:   {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  # infection_grp_other_gn_bacteria:  {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  # infection_grp_clostridium:        {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  # infection_grp_anaerobic_bacteria: {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  # infection_grp_other_bacteria:     {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  # infection_grp_herpes_viruses:     {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  # infection_grp_cmv:                {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  # infection_grp_bkpyv:              {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  # infection_grp_enteric_viruses:    {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  # infection_grp_hepatitis_viruses:  {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  # infection_grp_influenza:          {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  # infection_grp_other_resp_viruses: {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  # infection_grp_sars_cov_2:         {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  # infection_grp_other_viruses:      {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  # infection_grp_candida:            {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  # infection_grp_aspergillus:        {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  # infection_grp_pneumocystis:       {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  # infection_grp_other_fungi:        {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  # infection_grp_other_opportunistic: {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
-  # general class not shown above:
-  # infection_fungi:                  {fups: [0, 30, 60, 90, 180, 360], horizons: [30, 60, 90]}
+  # Synchronized 1-to-1 with the 13 canonical tasks and clinical horizons ([30, 60, 90] acute infections; [360, 720, 1800] long-term outcomes)
+  infection_bacteria:             {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90]}
+  infection_grp_enterobacterales: {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90]}
+  infection_grp_gram_positive:    {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90]}
+  infection_grp_gn_nonfermenters: {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90]}
+  infection_grp_clostridium:      {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90]}
+  infection_virus:                {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90]}
+  infection_grp_herpes_viruses:   {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90]}
+  infection_grp_cmv:              {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90]}
+  infection_grp_bkpyv:            {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90]}
+  infection_fungi:                {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90]}
+  infection_grp_candida:          {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90]}
+  death:                          {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [360, 720, 1800]}
+  graft_loss:                     {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [360, 720, 1800]}
 
 # Columns to exclude from input features
 ignore_columns:
@@ -79,7 +42,7 @@ models:
       feature_fraction: ["int", 25, 100]
       solver: "liblinear"
       max_iter: 1000
-      n_jobs: -1
+      random_state: 1234
     fixed_params:
       C: 1.0
       penalty: "l2"
@@ -96,6 +59,7 @@ models:
       max_features: ["categorical", "sqrt", "log2"]
       feature_fraction: ["int", 25, 100]
       n_jobs: -1
+      random_state: 1234
     fixed_params:
       n_estimators: 200
       max_depth: 15
@@ -118,6 +82,7 @@ models:
       feature_fraction: ["int", 25, 100]
       n_jobs: -1
       eval_metric: "logloss"
+      random_state: 1234
     fixed_params:
       learning_rate: 0.05
       n_estimators: 200

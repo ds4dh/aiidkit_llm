@@ -1,0 +1,228 @@
+# =============================================================================
+# Generative / Causal Decoder-Only t-EAV Transformer Configuration (`tfg`)
+#
+# Pre-Training Objective (Conditional Next-Event Prediction):
+#   Given the patient's causal history up to event t-1 (Event_0, ..., Event_{t-1})
+#   summarized by the causal decoder's hidden state h_{t-1} on clean (unmasked)
+#   events, plus the partial context of the next event Event_t at time tau_t
+#   (e.g., given (tau_t, e_t, a_t) predict v_t, or given (tau_t, e_t, v_t)
+#   predict a_t), predict the masked field of Event_t (discrete token ID via
+#   lm_head or continuous quantile-normalized value via numerical_mlm_head).
+#
+# Fine-Tuning Mode:
+#   Causal sequence classification with last-token pooling (`classifier_pooling: last`)
+#   and the same 2-stage projection head (`head -> drop -> classifier`) and
+#   domain-grouped multi-task heads as the discriminative ModernBERT pipeline.
+# =============================================================================
+
+# Run configuration and task (data collator) definition
+data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v3.9/teav
+data_split_type: random_split               # random_split, center_split, temporal_split
+result_dir: results/generative_transformer  # base directory name for all generative (`tfg_*`) results
+data_collator:
+  eav_mappings:
+    entity_id: entity
+    attribute_id: attribute
+    value_id: value_binned
+  time_mapping:
+    days_since_tpx: time
+  mlm_label_keys:
+    - entity_id         # conditional next-event task can predict 'entity_id' labels
+    - attribute_id      # conditional next-event task predicts 'attribute_id' labels (given time, entity, value)
+    - value_id          # conditional next-event task predicts 'value_id' / 'value_num' labels (given time, entity, attribute)
+  mlm_masking_rules:    # these numbers set the result subdirectory name (e00-a15-v60_{raw|bin})
+    entity_id: 0.00     # probability of masking an entity sub-token
+    attribute_id: 0.15  # probability of masking an attribute sub-token
+    value_id: 0.60      # probability of masking a value sub-token
+
+# Configuration for finetuning tasks to run
+train_data_augment: all           # default: "all" (pool every fup folder; 'fups' then only affect run names). "none" = one model per fup, "valid" = pool listed fups
+target_undersampling_ratio: 15.0  # maximum ("worst") ratio of positive to negative samples during finetuning (null for not using under-sampling)
+drop_unlabeled: true              # drop rows whose horizon labels are all -100 (unknown outcome; the loss masks them anyway)
+early_stopping_metric: roc_auc    # metric to use for early stopping (per label, then averaged)
+early_stopping_subset: null       # tasks whose heads VOTE on early stopping / checkpoint selection (null = every valid head in the group votes)
+early_stopping_mean: random_effects # hierarchical random-effects inverse-variance pooling (resilient to rare-head noise without one head dominating)
+n_bootstrap_eval: 100             # paired stratified bootstrap replicates on early_stopping_metric during mid-training eval (0 disables)
+prediction_tasks:                 # Individual bacterial tasks + domain-grouped & unified multi-task
+  # Validation FUPs (18 FUPs, 1.5x denser) span all 5 clinical windows up to 3600d with increasing step size:
+  #   Perioperative (0-30d):       0, 30                        (step +30d)
+  #   Opportunistic (31-180d):     60, 90, 120, 150, 180        (step +30d)
+  #   Maintenance (181-360d):      240, 300, 360                (step +60d)
+  #   Long-term (361-1080d):       540, 720, 900, 1080          (step +180d)
+  #   Very long-term (1081-3600d): 1440, 1800, 2700, 3600       (step +360d, +900d)
+  # --- Individual well-powered pathogen & clinical tasks (>=115 train patients, no 'other_*' buckets) ---
+  infection_bacteria:             {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[30, 60, 90]]}
+  infection_virus:                {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[30, 60, 90]]}
+  infection_grp_enterobacterales: {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[30, 60, 90]]}
+  infection_grp_gram_positive:    {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[30, 60, 90]]}
+  infection_grp_gn_nonfermenters: {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[30, 60, 90]]}
+  infection_grp_clostridium:      {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[30, 60, 90]]}
+  infection_grp_herpes_viruses:   {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[30, 60, 90]]}
+  infection_grp_cmv:              {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[30, 60, 90]]}
+  infection_grp_bkpyv:            {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[30, 60, 90]]}
+  infection_fungi:                {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[30, 60, 90]]}
+  infection_grp_candida:          {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[30, 60, 90]]}
+  death:                          {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[360, 720, 1800]]}
+  graft_loss:                     {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[360, 720, 1800]]}
+
+  # --- Domain-grouped multi-task bacteria (5 tasks x 3 horizons = 15 heads) ---
+  multitask_bacteria:
+    tasks: [
+      infection_bacteria,
+      infection_grp_enterobacterales,
+      infection_grp_gram_positive,
+      infection_grp_gn_nonfermenters,
+      infection_grp_clostridium,
+    ]
+    fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600]
+    horizons: [[30, 60, 90]]
+
+  multitask_viruses:
+    tasks: [
+      infection_virus,
+      infection_grp_herpes_viruses,
+      infection_grp_cmv,
+      infection_grp_bkpyv,
+    ]
+    fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600]
+    horizons: [[30, 60, 90]]
+
+  multitask_fungi:
+    tasks: [
+      infection_fungi,
+      infection_grp_candida,
+    ]
+    fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600]
+    horizons: [[30, 60, 90]]
+
+  # --- Unified 7-horizon multi-task (13 well-powered tasks x 7 horizons [30d..5y] = 91 monotonic heads) ---
+  multitask_unified:
+    tasks: [
+      infection_bacteria,
+      infection_grp_enterobacterales,
+      infection_grp_gram_positive,
+      infection_grp_gn_nonfermenters,
+      infection_grp_clostridium,
+      infection_virus,
+      infection_grp_herpes_viruses,
+      infection_grp_cmv,
+      infection_grp_bkpyv,
+      infection_fungi,
+      infection_grp_candida,
+      death,
+      graft_loss,
+    ]
+    fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600]
+    horizons: [[30, 60, 90, 180, 360, 720, 1800]]
+
+# Arguments for optuna run (perform both pretraining and finetuning for different hyper-parameters)
+optuna:
+  num_trials: 50
+  num_trials_debug: 2
+  study_name: generative_pretraining_finetuning_hp_optimization
+
+# Arguments for HF's trainer for the pre-training phase
+do_clustering: false  # skip mid-training UMAP/HDBSCAN clustering; only run final clustering in downstream analysis
+pretrainer:
+  seed: 1234
+  logging_steps: 10
+  warmup_steps: 100
+  num_train_epochs: 250  # maximum number of epochs (loses to max_steps)
+  max_steps: 5000  # realistic ceiling (~235 epochs at ga=4) so cosine LR schedule anneals smoothly
+  lr_scheduler_type: cosine
+  eval_strategy: steps
+  save_strategy: steps
+  eval_steps: 100
+  save_steps: 100
+  save_total_limit: 1
+  gradient_accumulation_steps: 4
+  per_device_train_batch_size: 24
+  per_device_eval_batch_size: 24
+  learning_rate: 1.0e-4  # careful! "1e-4" will be read as a string, use 1.0e-4
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  adam_beta1: 0.9
+  adam_beta2: 0.98
+  adam_epsilon: 1.0e-6
+  bf16: true
+  report_to: none
+  remove_unused_columns: false  # crucial for custom collators
+  load_best_model_at_end: true  # required for early stopping
+  metric_for_best_model: eval_mlm_accuracy  # format: "eval_" + metric name
+  greater_is_better: true
+  early_stopping_patience: 7  # 7 evaluations without improvement before stopping
+
+# Arguments for HF's trainer for the fine-tuning phase
+finetuner:
+  seed: 1234
+  ft_subdir: "finetuning"
+  logging_steps: 10
+  warmup_steps: 50
+  num_train_epochs: 10  # maximum number of epochs (loses to max_steps)
+  max_steps: 10000  # maximum number of steps (training + validation)
+  eval_strategy: steps
+  save_strategy: steps
+  eval_steps: 50
+  save_steps: 50
+  save_total_limit: 1
+  eval_accumulation_steps: 500
+  gradient_accumulation_steps: 4
+  per_device_train_batch_size: 24
+  per_device_eval_batch_size: 48
+  dataloader_num_workers: 4
+  learning_rate: 4.0e-5
+  weight_decay: 0.01
+  max_grad_norm: 1.0  # global-norm cap, applied after gradient accumulation (0 disables)
+  adam_beta1: 0.9
+  adam_beta2: 0.99  # a bit more spike-tolerant than the 0.999 default
+  adam_epsilon: 1.0e-6  # bf16-safe (the 1e-8 default underflows on small grads)
+  loss_name: ce  # unweighted binary cross-entropy (well-calibrated probabilities)
+  enforce_monotonicity: true  # probabilities increase with horizon
+  bf16: true
+  report_to: none
+  remove_unused_columns: false  # crucial for custom collators
+  load_best_model_at_end: true
+  metric_for_best_model: eval_all_early_stopping_metric  # see evaluator arguments
+  greater_is_better: true
+  early_stopping_patience: 7  # 7 evaluations (350 steps at eval_steps=50) without improvement before stopping
+
+# LoRA configuration for fine-tuning
+use_lora: false  # false for full fine-tuning
+lora_config:
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.1
+  bias: "none"
+  task_type: SEQ_CLS
+  target_modules: all-linear
+
+# Modern Causal Decoder Backbone (Qwen3 architecture: RoPE, GQA, QK-RMSNorm, SwiGLU, RMSNorm)
+# Dimensions matched to ModernBERT-base (~110M backbone params) for fair comparison
+model:
+  model_id: Qwen/Qwen3-0.6B
+  architecture_type: causal
+  load_backbone_weights: false
+  config_args:
+    max_position_embeddings: 1024  # max t-EAV length: 1010
+    hidden_size: 768
+    intermediate_size: 1152
+    num_hidden_layers: 22
+    num_attention_heads: 12
+    num_key_value_heads: 4         # Grouped-Query Attention (GQA, 3:1 ratio)
+    output_hidden_states: true     # required for plotting embeddings
+    classifier_pooling: last       # last-token (EOS / follow-up cutoff) causal pooling
+    pad_token_id: 0
+    bos_token_id: 2                # 1 being mask_token_id
+    cls_token_id: 2
+    eos_token_id: 3
+    sep_token_id: 3
+    dropout_embedding: 0.0
+    dropout_attention: 0.1
+    dropout_mlp: 0.1
+    dropout_classifier: 0.1
+  model_args:
+    dtype: bfloat16
+    attn_implementation: sdpa
+  embedding_layer_config:
+    use_numerical_embedding: true  # true: continuous value embedding + dual-head next-event prediction; false: 7-bin discrete token embedding
+
