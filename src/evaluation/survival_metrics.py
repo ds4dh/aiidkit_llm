@@ -108,12 +108,9 @@ def breslow_baseline(
     # sum equals rev_csum at the FIRST index where t == u
     risk_at_unique = rev_csum[first_idx]
 
-    # Breslow increments at unique event times with d_j > 0
-    event_counts = np.zeros_like(unique_t, dtype=np.float64)
-    for u in np.unique(t[e == 1]):
-        d = int(np.sum((t == u) & (e == 1)))
-        idx = int(np.searchsorted(unique_t, u))
-        event_counts[idx] += d / max(risk_at_unique[idx], 1e-12)
+    # Breslow increments at unique times using O(N) np.add.reduceat over sorted tied blocks
+    d_per_unique = np.add.reduceat(e.astype(np.float64), first_idx) if len(unique_t) > 0 else np.empty(0, dtype=np.float64)
+    event_counts = np.where(d_per_unique > 0, d_per_unique / np.maximum(risk_at_unique, 1e-12), 0.0)
 
     keep = event_counts > 0
     return unique_t[keep], np.cumsum(event_counts[keep])
@@ -176,7 +173,7 @@ def kaplan_meier(
 
     unique_t, first_idx = np.unique(t, return_index=True)
     at_risk = n - first_idx  # number at risk just before unique_t
-    d = np.array([np.sum((t == u) & (e == 1)) for u in unique_t], dtype=np.float64)
+    d = np.add.reduceat(e.astype(np.float64), first_idx) if len(unique_t) > 0 else np.empty(0, dtype=np.float64)
     with np.errstate(divide="ignore", invalid="ignore"):
         surv_steps = np.cumprod(1.0 - np.where(at_risk > 0, d / np.maximum(at_risk, 1), 0.0))
 

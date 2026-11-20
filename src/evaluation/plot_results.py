@@ -5,7 +5,9 @@ import numpy as np
 from pathlib import Path
 from itertools import chain
 
-COLORS = [f"tab:{c}" for c in ["blue", "green", "orange", "red", "purple", "brown"]]
+from src.tasks import DEFAULT_VALIDATION_FUPS, UNIFIED_HORIZONS, format_horizon_label
+
+COLORS = [f"tab:{c}" for c in ["blue", "green", "orange", "red", "purple", "brown", "pink", "olive", "cyan"]]
 METRICS_TO_PLOT = ["roc_auc", "pr_auc", "brier"]
 Y_AXIS_CONFIG = {
     "roc_auc": {"label": "ROC AUC", "lim": (0.5, 1.0)},
@@ -22,35 +24,28 @@ Y_AXIS_CONFIG = {
 
 def main():
     """Main execution loop over MLM configs and Tasks."""
-    results_dir = "results"
+    results_dir = "results/transformer/random_split"
     finetuning_subdir = "finetuning"
-    train_data_filtered = False
+    train_data_augment = "all"
     mlm_configs = [
-        {"entity_id": 0.05, "attribute_id": 0.15, "value_id": 0.25},
-        # ...
+        {"entity_id": 0.00, "attribute_id": 0.15, "value_id": 0.60},
     ]
     tasks_dict = {
-        "infection_bacteria": {"fups": [0, 30, 60, 90, 180, 365], "horizons": [[30, 60, 90]]},
-        "graft_loss": {"fups": [0, 180, 365, 730, 1095], "horizons": [[180, 365, 730, 1095]]},
-        "death": {"fups": [0, 180, 365, 730, 1095], "horizons": [[180, 365, 730, 1095]]},
-        # ...
+        "infection_bacteria": {"fups": DEFAULT_VALIDATION_FUPS, "horizons": [UNIFIED_HORIZONS]},
+        "graft_loss": {"fups": DEFAULT_VALIDATION_FUPS, "horizons": [UNIFIED_HORIZONS]},
+        "death": {"fups": DEFAULT_VALIDATION_FUPS, "horizons": [UNIFIED_HORIZONS]},
     }
 
-    # Generate plots for all ways in which pretraining was performed
     for rule in mlm_configs:
-        
-        # Construct run ID (e.g. "e05-a15-v25")
-        run_id = "-".join([f"{k[0]}{int(v * 100):02d}" for k, v in rule.items()])
+        run_id = "-".join([f"{k[0]}{int(v * 100):02d}" for k, v in rule.items()]) + "_raw"
         finetuning_dir = Path(results_dir) / run_id / finetuning_subdir
-        
-        print(f"\n> Processing Config: {run_id} | Filtered={train_data_filtered}")
+        print(f"\n> Processing Config: {run_id} | Augment={train_data_augment}")
         if not finetuning_dir.exists():
             print(f"  [Skip] Path not found: {finetuning_dir}")
             continue
-
         for task_key, task_specs in tasks_dict.items():
             print(f"  -- Plotting Task: {task_key}")
-            plot_task_results(task_key, task_specs, finetuning_dir, train_data_filtered)
+            plot_task_results(task_key, task_specs, finetuning_dir, train_data_augment)
 
 
 def plot_task_results(
@@ -94,11 +89,10 @@ def plot_task_results(
             # Extract metrics for each horizon in this group
             for h in current_horizons:
                 for metric in METRICS_TO_PLOT:
-                    # Construct strict key: e.g. test_fup_0030_roc_auc_label_infection_bacteria_0060d
                     label_task = sub_task if sub_task is not None else task_key
                     key = f"test_fup_{fup:04d}_{metric}_label_{label_task}_{h:04d}d"
-                    val = results.get(key, 0.0)
-                    plot_data[metric][h].append(val)
+                    val = results.get(key, np.nan)
+                    plot_data[metric][h].append(np.nan if (val is None or (isinstance(val, float) and val < 0 and not metric.startswith("nb_"))) else float(val))
 
     # Plotting
     n_h = len(flat_horizons)
@@ -115,28 +109,28 @@ def plot_task_results(
         cfg = Y_AXIS_CONFIG.get(metric, {"label": metric, "lim": (0, 1)})
         
         for j, h in enumerate(flat_horizons):
-            # Calculate offset to center bars
             offset = (j - (n_h - 1) / 2) * bar_w
-            values = plot_data[metric][h]
-            
-            # Draw bars
+            raw_values = plot_data[metric][h]
+            values = [0.0 if np.isnan(v) else v for v in raw_values]
+
             rects = ax.bar(
                 x_pos + offset, values, bar_w, 
-                label=f"{h} days", color=COLORS[j % len(COLORS)], 
+                label=format_horizon_label(h, "short"), color=COLORS[j % len(COLORS)], 
                 edgecolor='black', linewidth=0.6, alpha=0.85
             )
-            
-            # Label bars (only valid values)
-            labels = [f"{v:.2f}" if v > 0.01 else "" for v in values]
-            ax.bar_label(rects, labels=labels, padding=2, fontsize=8)
+
+            labels = [f"{v:.2f}" if (not np.isnan(v) and abs(v) > 0.005) else "" for v in raw_values]
+            lbl_size = 6 if n_h > 4 else (7 if n_h == 4 else 8)
+            lbl_rot = 90 if n_h > 4 else 0
+            ax.bar_label(rects, labels=labels, padding=2, fontsize=lbl_size, rotation=lbl_rot)
 
         # Styling
         ax.set_ylabel(cfg["label"], fontsize=11, fontweight='bold')
-        all_vals = [v for h in flat_horizons for v in plot_data[metric][h] if v > 0.0]
+        all_vals = [v for h in flat_horizons for v in plot_data[metric][h] if not np.isnan(v)]
         y_low, y_high = cfg["lim"]
         if all_vals:
             if min(all_vals) < y_low:
-                y_low = max(0.0, round(min(all_vals) - 0.05, 2))
+                y_low = round(min(all_vals) - 0.05, 2) if metric.startswith("nb_") else max(0.0, round(min(all_vals) - 0.05, 2))
             if max(all_vals) > y_high - 0.03:
                 y_high = min(1.06, round(max(all_vals) + 0.06, 2))
         ax.set_ylim((y_low, y_high))
@@ -182,13 +176,18 @@ def find_run_folder(
         suffix_pattern = f"fut({train_data_augment})_fuv(*)" 
 
     # Construct glob pattern
-    # Look for: hrz(0030-0060)_fut(all)_fuv(...)
+    # Look for exact hrz(0030-0060)_fut(all)_fuv(...) first, then superset hrz(...) folders
     pattern = f"hrz({hrz_str})_{suffix_pattern}"
-    
-    # Search
     candidates = list(base_dir.glob(pattern))
+    if not candidates:
+        import re
+        needed = {int(h) for h in horizons}
+        for p in base_dir.glob(f"hrz(*)_{suffix_pattern}"):
+            m = re.search(r"hrz\(([\d-]+)\)", p.name)
+            if m and needed.issubset({int(x) for x in m.group(1).split("-")}):
+                candidates.append(p)
     if candidates:
-        return candidates[0]  # return first match
+        return max(candidates, key=lambda p: p.stat().st_mtime_ns)  # return most recent match
     
     return None
 

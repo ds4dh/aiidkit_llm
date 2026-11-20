@@ -9,12 +9,10 @@ warnings.filterwarnings("ignore", category=SyntaxWarning, module="hdbscan")
 
 from sklearn.calibration import calibration_curve
 from sklearn.linear_model import LogisticRegression
-from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import (
-    silhouette_score, adjusted_mutual_info_score, roc_curve,
+    accuracy_score, silhouette_score, roc_curve,
     roc_auc_score, average_precision_score, precision_recall_curve,
-    brier_score_loss, accuracy_score, balanced_accuracy_score,
-    precision_score, recall_score, f1_score,
+    brier_score_loss,
 )
 from transformers.trainer_utils import EvalPrediction
 from scipy.stats import hmean, gmean
@@ -172,16 +170,6 @@ class UMAP_HDBSCAN_Clusterer:
 
         return best_params
 
-    def fit_predict(
-        self,
-        embeddings: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Fit UMAP and HDBSCAN and return 2D embeddings and cluster labels
-        """
-        best_params = self.fit(embeddings)
-        return self.predict(embeddings, compute_clusters=True, **best_params)
-
     def predict(
         self,
         embeddings: np.ndarray,
@@ -282,6 +270,7 @@ class UMAP_HDBSCAN_Clusterer:
 
         # Compute dimensionality-reduced embeddings on CPU
         effective_umap_args = dict(umap_args)
+        effective_umap_args.setdefault("random_state", 42)
         n_samples = len(embeddings)
         if n_samples <= effective_umap_args.get("n_neighbors", 15):
             effective_umap_args["n_neighbors"] = max(2, n_samples - 1)
@@ -392,10 +381,16 @@ class DiscriminativeEmbeddingEvaluatorForMaskedLanguageModelling:
         (pred_ids, embeddings), labels = eval_preds.predictions, eval_preds.label_ids
         metrics = {}
 
-        # Compute MLM accuracy
+        # Compute MLM accuracy (overall + split by discrete tokens vs continuous quantile-bins)
         preds_flat, labels_flat = pred_ids.flatten(), labels.flatten()
         mask = labels_flat != -100  # filtering out ignored tokens
-        metrics["mlm_accuracy"] = accuracy_score(labels_flat[mask], preds_flat[mask])
+        metrics["mlm_accuracy"] = float(accuracy_score(labels_flat[mask], preds_flat[mask])) if mask.any() else 0.0
+        disc_mask = labels_flat >= 0
+        if disc_mask.any():
+            metrics["mlm_discrete_accuracy"] = float(accuracy_score(labels_flat[disc_mask], preds_flat[disc_mask]))
+        cont_mask = (labels_flat < 0) & (labels_flat != -100)
+        if cont_mask.any():
+            metrics["mlm_continuous_accuracy"] = float(accuracy_score(labels_flat[cont_mask], preds_flat[cont_mask]))
         
         # Compute clustering metrics using custom clustering module
         if self.do_clustering and embeddings is not None:
@@ -441,6 +436,7 @@ class BaseEmbeddingEvaluatorForClassification:
         monotonic_groups: list[int] | None = None,
         early_stopping_subset: list[str] | None = None,
         early_stopping_mean: str = "harmonic",
+        n_bootstrap_eval: int = 100,
     ):
         self.do_clustering = do_clustering
         self.max_clustered_samples = max_clustered_samples
@@ -458,6 +454,7 @@ class BaseEmbeddingEvaluatorForClassification:
         # Aggregation across the voting heads: 'harmonic' (default, punishes the
         # weakest head), 'mean' (arithmetic) or 'geometric'.
         self.early_stopping_mean = early_stopping_mean
+        self.n_bootstrap_eval = int(n_bootstrap_eval or 0)
         self.current_prefix = "eval"
         self.calibrators = None
         self.saved_labels_and_probs = None
@@ -487,6 +484,58 @@ class BaseEmbeddingEvaluatorForClassification:
                 return True
         return False
 
+    def _bootstrap_early_stopping_score(
+        self,
+        y_true: np.ndarray,
+        y_prob: np.ndarray,
+        y_cal: np.ndarray,
+        seed: int = 1234,
+    ) -> tuple[float, float, float]:
+        """
+        Compute `self.n_bootstrap_eval` paired stratified bootstrap replicates of
+        `self.early_stopping_metric` using a fixed RNG seed across evaluation steps.
+        Returns (conservative_score = mean - 0.5 * std, boot_mean, boot_std) so
+        checkpoint selection favors high performance with low bootstrap variance.
+        """
+        pos_idx = np.where(y_true == 1)[0]
+        neg_idx = np.where(y_true == 0)[0]
+        n_pos, n_neg = len(pos_idx), len(neg_idx)
+        if n_pos == 0 or n_neg == 0:
+            return 0.0, 0.0, 0.0
+
+        rng = np.random.default_rng(seed)
+        metric_name = self.early_stopping_metric
+        boot_vals = np.empty(self.n_bootstrap_eval, dtype=np.float64)
+
+        if metric_name not in ("pr_auc", "brier"):
+            # Fast exact Mann-Whitney U (with tie-averaging) stratified bootstrap for ROC-AUC (~15x faster on 90+ heads)
+            pos_scores = np.asarray(y_prob[pos_idx], dtype=np.float64)
+            neg_scores = np.asarray(y_prob[neg_idx], dtype=np.float64)
+            inv_n_neg = 1.0 / float(n_neg)
+            for b in range(self.n_bootstrap_eval):
+                p_b = pos_scores[rng.integers(0, n_pos, size=n_pos)]
+                n_b = np.sort(neg_scores[rng.integers(0, n_neg, size=n_neg)])
+                left = np.searchsorted(n_b, p_b, side="left")
+                right = np.searchsorted(n_b, p_b, side="right")
+                boot_vals[b] = float(np.mean(0.5 * (left + right))) * inv_n_neg
+        else:
+            y_boot = np.concatenate([np.ones(n_pos, dtype=y_true.dtype), np.zeros(n_neg, dtype=y_true.dtype)])
+            for b in range(self.n_bootstrap_eval):
+                b_pos = pos_idx[rng.integers(0, n_pos, size=n_pos)]
+                b_neg = neg_idx[rng.integers(0, n_neg, size=n_neg)]
+                b_idx = np.concatenate([b_pos, b_neg])
+                if metric_name == "pr_auc":
+                    boot_vals[b] = average_precision_score(y_boot, y_prob[b_idx])
+                else:
+                    # Invert Brier into (1 - Brier) so higher-is-better holds across all aggregators
+                    boot_vals[b] = 1.0 - brier_score_loss(y_boot, y_cal[b_idx])
+
+        boot_mean = float(np.mean(boot_vals))
+        boot_std = float(np.std(boot_vals))
+        # Variance-penalized bootstrap score (rewards stability across resampled cohorts)
+        boot_score = float(max(0.0, boot_mean - 0.5 * boot_std))
+        return boot_score, boot_mean, boot_std
+
     def __call__(self, eval_preds: EvalPrediction) -> dict[str, float]:
         """
         This is called by Huggingface's Trainer at evaluation time.
@@ -503,6 +552,7 @@ class BaseEmbeddingEvaluatorForClassification:
             probs_cal = _grouped_cummax(probs_cal, self.monotonic_groups)
             
         # Expose arrays for saving (useful for the final test)
+        self.last_logits = logits
         self.saved_labels_and_probs = {
             "labels": labels,
             "probs": probs,
@@ -513,6 +563,10 @@ class BaseEmbeddingEvaluatorForClassification:
         # Prepare metrics for logging by Huggingface's Trainer
         metrics = {}
         valid_early_stopping_metric = []
+        valid_early_stopping_raw_means = []
+        valid_early_stopping_stds = []
+        valid_early_stopping_names = []
+        valid_early_stopping_pos_counts = []
         names = self.label_names if self.label_names else [f"lbl{i}" for i in range(num_labels)]
         for i, name in enumerate(names[:num_labels]):
             
@@ -532,20 +586,67 @@ class BaseEmbeddingEvaluatorForClassification:
             if len(np.unique(y_true)) < 2: continue   # skip constant labels
             sub_metrics = self._compute_single_label_metrics(y_true, y_prob, y_cal)
             metrics.update({f"{k}_{name}": v for k, v in sub_metrics.items()})
+            n_pos_i = int(np.sum(y_true == 1))
+            metrics[f"n_pos_{name}"] = n_pos_i
             
             # Record valid early stopping metrics (optionally restricted to the
             # heads of the early_stopping_subset tasks; every head is still
             # reported as a metric regardless of the vote)
             if sub_metrics[self.early_stopping_metric] != -1.0 \
                     and self._in_early_stopping_subset(name):
-                valid_early_stopping_metric.append(sub_metrics[self.early_stopping_metric])
+                if self.n_bootstrap_eval > 0 and self.current_prefix.startswith("eval"):
+                    boot_score, boot_mean, boot_std = self._bootstrap_early_stopping_score(
+                        y_true, y_prob, y_cal, seed=1234 + i
+                    )
+                    metrics[f"{self.early_stopping_metric}_boot_mean_{name}"] = boot_mean
+                    metrics[f"{self.early_stopping_metric}_boot_std_{name}"] = boot_std
+                    valid_early_stopping_metric.append(boot_score)
+                    valid_early_stopping_raw_means.append(boot_mean)
+                    valid_early_stopping_stds.append(boot_std)
+                else:
+                    pt_val = float(sub_metrics[self.early_stopping_metric])
+                    approx_se = 0.5 / np.sqrt(max(1.0, float(n_pos_i)))
+                    valid_early_stopping_metric.append(pt_val)
+                    valid_early_stopping_raw_means.append(pt_val)
+                    valid_early_stopping_stds.append(float(approx_se))
+                valid_early_stopping_names.append(name)
+                valid_early_stopping_pos_counts.append(n_pos_i)
 
         # Aggregate the early-stopping score across the voting heads
         if valid_early_stopping_metric:
             vals = np.array(valid_early_stopping_metric) + 1e-6
             kind = (self.early_stopping_mean or "harmonic").lower()
-            if kind in ("mean", "arithmetic"):
+            if kind in ("random_effects", "precision_capped"):
+                # Hierarchical DerSimonian-Laird random-effects pooling:
+                # 1) Within each task, weight horizons by w_h = 1 / (tau^2 + se_h^2) so noisy
+                #    low-count horizons self-dampen without letting huge horizons monopolize.
+                # 2) Across tasks, combine task scores with w_t = 1 / (tau^2 + se_t^2) so every
+                #    well-powered outcome shares nearly equal influence while high-variance tasks shrink.
+                tau2 = 0.03 ** 2
+                task_buckets: dict[str, list[tuple[float, float]]] = {}
+                for nm, m_val, se_val in zip(valid_early_stopping_names, valid_early_stopping_raw_means, valid_early_stopping_stds):
+                    # Strip trailing `_XXXXd` horizon tag to group heads by clinical outcome task
+                    t_base = nm[:-6] if (len(nm) > 6 and nm[-1] == "d" and nm[-5:-1].isdigit() and nm[-6] == "_") else nm
+                    task_buckets.setdefault(t_base, []).append((float(m_val), float(se_val)))
+                task_scores = []
+                task_weights = []
+                for items in task_buckets.values():
+                    ms = np.array([x[0] for x in items], dtype=np.float64)
+                    ses = np.array([x[1] for x in items], dtype=np.float64)
+                    ws = 1.0 / (tau2 + ses ** 2)
+                    w_sum = float(np.sum(ws))
+                    t_mean = float(np.sum(ws * ms) / w_sum)
+                    t_var = float(np.sum((ws ** 2) * (ses ** 2)) / (w_sum ** 2))
+                    task_scores.append(t_mean)
+                    task_weights.append(1.0 / (tau2 + t_var))
+                metrics["early_stopping_metric"] = float(
+                    np.average(np.array(task_scores, dtype=np.float64), weights=np.array(task_weights, dtype=np.float64))
+                )
+            elif kind in ("mean", "arithmetic"):
                 metrics["early_stopping_metric"] = float(np.mean(vals))
+            elif kind in ("log_support", "support_weighted"):
+                weights = np.log1p(np.maximum(1, np.array(valid_early_stopping_pos_counts, dtype=np.float64)))
+                metrics["early_stopping_metric"] = float(np.average(vals, weights=weights))
             elif kind == "geometric":
                 metrics["early_stopping_metric"] = float(gmean(vals))
             else:  # 'harmonic' (default): most conservative, punishes the worst head
@@ -568,58 +669,63 @@ class BaseEmbeddingEvaluatorForClassification:
     
     def _apply_calibration_strategy(self, labels, probs):
         """
-        Calibrate model output probabilities using regularized Platt scaling (logistic regression).
+        Calibrate model output probabilities using monotone Platt scaling:
+        - Fits on validation (`eval*`, `validation`, `validation_all`) only; resets calibrators
+          freshly on each fit pass so stale checkpoint calibrators are never reused.
+        - Guards against finite-sample slope inversion (`coef <= 0.05` or `n_pos < 20`) by
+          falling back to intercept-only prior calibration (`1.0 * logit(p) + b`), strictly
+          preserving within-head rank order (AUROC & PR-AUC invariant).
         """
         is_train = self.current_prefix.startswith("eval") or self.current_prefix in ("validation", "validation_all")
         num_labels = labels.shape[1]
 
-        # Initialize with L2 Regularization (C=1.0) instead of penalty=None
-        if is_train and self.calibrators is None:
-            self.calibrators = [
-                LogisticRegression(C=1.0, penalty='l2', solver='lbfgs') 
-                for _ in range(num_labels)
-            ]
-        
-        if self.calibrators is None:
+        if is_train:
+            self.calibrators = [None] * num_labels
+        elif self.calibrators is None:
+            print(f"[WARN] No fitted calibrators found for prefix '{self.current_prefix}'; returning raw probabilities.")
             return probs
 
         probs_cal = np.zeros_like(probs)
         for i in range(num_labels):
-            # Isolate only the valid labels (ignore -100)
-            valid_mask = labels[:, i] != -100
+            valid_mask = (labels[:, i] == 0) | (labels[:, i] == 1)
             if valid_mask.sum() == 0:
                 probs_cal[:, i] = probs[:, i]
                 continue
-                
-            # Extract valid subsets
-            valid_labels = labels[valid_mask, i]
-            safe_probs = np.clip(probs[valid_mask, i], 1e-7, 1 - 1e-7)
-            logits_i = logit(safe_probs).reshape(-1, 1)
+
+            valid_labels = labels[valid_mask, i].astype(np.int64)
+            safe_probs = np.clip(probs[valid_mask, i], 1e-7, 1.0 - 1.0e-7)
+            logits_i = logit(safe_probs)
 
             try:
-                # Only fit when explicitly in training mode
                 if is_train and len(np.unique(valid_labels)) > 1:
-                    self.calibrators[i].fit(logits_i, valid_labels)
-                
-                # Predict safely 
-                if hasattr(self.calibrators[i], 'classes_'):
-                    pos_idx = np.where(self.calibrators[i].classes_ == 1)[0]
-                    if len(pos_idx) > 0:
-                        probs_cal[valid_mask, i] = self.calibrators[i].predict_proba(logits_i)[:, pos_idx[0]]
-                    else:
-                        probs_cal[valid_mask, i] = 0.0
-                
-                # Model not fitted yet (e.g., first evaluation step had no valid positive labels)
+                    n_pos = int(np.sum(valid_labels == 1))
+                    slope, intercept = 1.0, 0.0
+                    fitted = False
+                    if n_pos >= 20:
+                        lr = LogisticRegression(C=1.0, solver="lbfgs", random_state=42)
+                        lr.fit(logits_i.reshape(-1, 1), valid_labels)
+                        if hasattr(lr, "coef_") and float(lr.coef_[0, 0]) > 0.05:
+                            slope = float(lr.coef_[0, 0])
+                            intercept = float(lr.intercept_[0])
+                            fitted = True
+                    if not fitted:
+                        # Calibration-in-the-large (intercept-only offset; strictly order-preserving)
+                        p_bar = float(np.clip(np.mean(valid_labels), 1e-6, 1.0 - 1e-6))
+                        slope = 1.0
+                        intercept = float(logit(p_bar) - np.mean(logits_i))
+                    self.calibrators[i] = (slope, intercept)
+
+                cal_params = self.calibrators[i] if i < len(self.calibrators) else None
+                if cal_params is not None:
+                    slope, intercept = cal_params
+                    probs_cal[valid_mask, i] = expit(slope * logits_i + intercept)
                 else:
                     probs_cal[valid_mask, i] = probs[valid_mask, i]
-                    
-            # Fallback to raw probabilities if anything fails
-            except Exception as e:
+            except Exception:
                 probs_cal[valid_mask, i] = probs[valid_mask, i]
-                
-            # Keep raw probabilities for the -100 tokens (they get ignored in metrics anyway)
+
             probs_cal[~valid_mask, i] = probs[~valid_mask, i]
-        
+
         return np.clip(probs_cal, 0.0, 1.0)
 
     def _compute_single_label_metrics(self, y_true, y_prob, y_cal):
@@ -638,21 +744,42 @@ class BaseEmbeddingEvaluatorForClassification:
             metrics["roc_auc"] = -1.0
             metrics["pr_auc"] = -1.0
 
-        # Threshold-based metrics at multiple thresholds
-        thresholds = [i / 10 for i in range(1, 10)] + ["best_f1"]
-        for t in thresholds:
-            
-            # Determine threshold (if best_f1) and associated predictions
-            t, preds = self._get_preds_from_threshold(y_true, y_prob, t)
-            t_str = (f"t{int(t * 100)}" if isinstance(t, float) else t)
-            
-            # Log metrics
-            metrics[f"acc_{t_str}"] = accuracy_score(y_true, preds)
-            metrics[f"bal_acc_{t_str}"] = balanced_accuracy_score(y_true, preds)
-            metrics[f"precision_{t_str}"] = precision_score(y_true, preds, zero_division=0)
-            metrics[f"recall_{t_str}"] = recall_score(y_true, preds, zero_division=0)
-            metrics[f"f1_{t_str}"] = f1_score(y_true, preds, zero_division=0)
-            metrics[f"nb_{t_str}"] = self._calculate_net_benefit(y_true, y_prob, t)
+        # Vectorized threshold-based metrics across fixed grid [0.1..0.9] + F1-optimal threshold ("best_f1")
+        y_t = np.asarray(y_true, dtype=np.int64)
+        y_p = np.asarray(y_prob, dtype=np.float64)
+        n_total = len(y_t)
+        pos_mask = (y_t == 1)
+        n_pos = float(np.sum(pos_mask))
+        n_neg = float(n_total - n_pos)
+
+        fixed_ts = np.arange(1, 10, dtype=np.float64) * 0.1
+        best_f1_t, _ = self._get_preds_from_threshold(y_t, y_p, "best_f1")
+        all_ts = np.append(fixed_ts, float(best_f1_t))
+        t_names = [f"t{int(round(t * 100))}" for t in fixed_ts] + ["best_f1"]
+
+        pred_mat = y_p[:, None] >= all_ts[None, :]  # [N, 10]
+        tp = np.sum(pred_mat & pos_mask[:, None], axis=0).astype(np.float64)
+        fp = np.sum(pred_mat & (~pos_mask)[:, None], axis=0).astype(np.float64)
+        tn = n_neg - fp
+
+        acc_arr = (tp + tn) / max(float(n_total), 1.0)
+        rec_arr = np.where(n_pos > 0, tp / np.maximum(n_pos, 1.0), 0.0)
+        spec_arr = np.where(n_neg > 0, tn / np.maximum(n_neg, 1.0), 0.0)
+        bal_acc_arr = 0.5 * (rec_arr + spec_arr)
+        pred_pos = tp + fp
+        prec_arr = np.where(pred_pos > 0, tp / np.maximum(pred_pos, 1.0), 0.0)
+        denom_f1 = prec_arr + rec_arr
+        f1_arr = np.where(denom_f1 > 0, 2.0 * prec_arr * rec_arr / np.maximum(denom_f1, 1e-12), 0.0)
+        safe_ts = np.clip(all_ts, 1e-6, 1.0 - 1e-6)
+        nb_arr = (tp / max(float(n_total), 1.0)) - (fp / max(float(n_total), 1.0)) * (safe_ts / (1.0 - safe_ts))
+
+        for j, t_str in enumerate(t_names):
+            metrics[f"acc_{t_str}"] = float(acc_arr[j])
+            metrics[f"bal_acc_{t_str}"] = float(bal_acc_arr[j])
+            metrics[f"precision_{t_str}"] = float(prec_arr[j])
+            metrics[f"recall_{t_str}"] = float(rec_arr[j])
+            metrics[f"f1_{t_str}"] = float(f1_arr[j])
+            metrics[f"nb_{t_str}"] = float(nb_arr[j])
 
         return metrics
 
@@ -1006,6 +1133,8 @@ class DiscriminativeEmbeddingEvaluatorForSurvival(DiscriminativeEmbeddingEvaluat
 
         # Unpack model outputs: risk = log hazard ratio
         logits, labels, embeddings = self.prepare_predictions(eval_preds)
+        self.last_logits = logits
+        self.last_raw_labels = labels
         risk = logits.reshape(logits.shape[0], -1)[:, 0].astype(np.float64)
         if labels.ndim == 1 or labels.shape[1] < 2:
             raise ValueError("Survival labels must contain (time, status) columns")
@@ -1123,36 +1252,6 @@ class DiscriminativeEmbeddingEvaluatorForSurvival(DiscriminativeEmbeddingEvaluat
         return fig
 
 
-class GenerativeEmbeddingEvaluatorForClassification(BaseEmbeddingEvaluatorForClassification):
-    """
-    Evaluator for Generative LLMs (CausalLM) performing classification.
-    Expects predictions to be formatted by `preprocess_logits_for_metrics_generative`.
-    """
-    def __init__(self, tokenizer, positive_token="1", negative_token="0", **kwargs):
-        # Enforce clustering to False (at least for now)
-        kwargs["do_clustering"] = False
-        super().__init__(**kwargs)
-        self.tokenizer = tokenizer
-        self.pos_token_id = tokenizer.encode(positive_token, add_special_tokens=False)[-1]
-        self.neg_token_id = tokenizer.encode(negative_token, add_special_tokens=False)[-1]
-
-    def prepare_predictions(self, eval_preds: EvalPrediction):
-        # Unpack predictions (from preprocess function output)
-        logits, embeddings = eval_preds.predictions, None  # no clustering (for now)
-
-        # Reconstruct labels (first valid token in the sequence, using argmax)
-        label_ids = eval_preds.label_ids
-        answer_indices = (label_ids != -100).argmax(axis=1)
-
-        # Extract the actual token IDs at those positions
-        actual_token_ids = label_ids[np.arange(len(label_ids)), answer_indices]
-
-        # Convert to binary 0/1 (1 if it matches pos_token_id, else 0)
-        labels = (actual_token_ids == self.pos_token_id).astype(int)
-
-        return logits, labels, embeddings
-
-
 class ModelInterpreter:
     """Extracts embeddings and logits from the model for a given dataloader."""
     def __init__(self, model, device=None):
@@ -1163,27 +1262,52 @@ class ModelInterpreter:
         self.model.to(device)
         self.device = device
 
-    def get_embeddings_and_predictions(self, dataloader, extract_logits=True):
+    def get_embeddings_and_predictions(self, dataloader, extract_logits=True, use_classifier_head=False):
         """
-        extract_logits: Set to False for pre-trained models (MLM) where sequence lengths 
-                        vary by batch, causing np.vstack to crash.
+        Extract sequence representations from the common Transformer trunk (`outputs.hidden_states[-1]`)
+        so pre-trained and fine-tuned embeddings live in the exact same architectural layer across tasks.
+
+        Args:
+            extract_logits: Set to False for pre-trained models (MLM) where sequence lengths
+                            vary by batch, causing np.vstack to crash.
+            use_classifier_head: Keep False (default) to extract the shared Transformer trunk
+                                 representation prior to any task-specific projection head.
         """
         embeddings_list, logits_list, labels_list = [], [], []
         device_type = "cuda" if ("cuda" in str(self.device) and torch.cuda.is_available()) else "cpu"
-        target_dtype = torch.bfloat16 if device_type == "cuda" else torch.float32
+        try:
+            param_dtype = next(self.model.parameters()).dtype
+        except StopIteration:
+            param_dtype = torch.float32
+        target_dtype = param_dtype if (device_type == "cuda" and param_dtype in (torch.float16, torch.bfloat16)) else (
+            torch.bfloat16 if device_type == "cuda" else torch.float32
+        )
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="Extracting embeddings"):
                 input_dict = {k: v.to(self.device) for k, v in batch["input_dict"].items()}
-    
+                attn_mask = batch["attention_mask"].to(self.device)
+
                 with torch.autocast(device_type=device_type, dtype=target_dtype):
-                    outputs = self.model(input_dict=input_dict, output_hidden_states=True) 
-                
-                last_hidden = outputs.hidden_states[-1]
-                mask = batch["attention_mask"].to(self.device).unsqueeze(-1)
-                
-                sum_embeddings = (last_hidden * mask).sum(dim=1)
-                sum_mask = mask.sum(dim=1).clamp(min=1e-9)
-                pooled = sum_embeddings / sum_mask
+                    outputs = self.model(
+                        input_dict=input_dict,
+                        attention_mask=attn_mask,
+                        output_hidden_states=True,
+                    )
+                    last_hidden = outputs.hidden_states[-1]
+                    pooling_mode = getattr(self.model.config, "classifier_pooling", "mean")
+                    if pooling_mode == "last":
+                        seq_lens = attn_mask.sum(dim=1).clamp(min=1) - 1
+                        batch_idx = torch.arange(last_hidden.size(0), device=last_hidden.device)
+                        pooled = last_hidden[batch_idx, seq_lens]
+                    else:
+                        mask = attn_mask.unsqueeze(-1)
+                        sum_embeddings = (last_hidden * mask).sum(dim=1)
+                        sum_mask = mask.sum(dim=1).clamp(min=1e-9)
+                        pooled = sum_embeddings / sum_mask
+
+                    if use_classifier_head and hasattr(self.model, "classifier") and hasattr(self.model, "head"):
+                        head_dtype = next(self.model.head.parameters()).dtype
+                        pooled = self.model.head(pooled.to(dtype=head_dtype))
                 
                 embeddings_list.append(pooled.float().cpu().numpy())
                 labels_list.append(batch["labels"].cpu().numpy())
@@ -1206,19 +1330,29 @@ def preprocess_logits_for_mlm_metrics(logits, labels):
     """
     Compute model predictions and pool last hidden states as sequence embeddings
     """
-    # The model returns (logits, hidden_states)
+    # The model returns (logits, hidden_states) where hidden_states may be (pred_num, last_hidden) or (last_hidden,)
+    pred_num = None
     if isinstance(logits, tuple):
         real_logits = logits[0]  # [batch, seq, vocab]
-        hidden_states = logits[1] # layer tuple (usually includes only the last one)
+        hidden_states = logits[1] # layer tuple
         last_hidden = hidden_states[-1] # [batch, seq, hidden]
+        if len(hidden_states) >= 2 and hidden_states[0].ndim == 2:
+            pred_num = hidden_states[0]  # [batch, seq] continuous predictions in [-1, 1]
     else:
         real_logits = logits
         last_hidden = None
 
-    # Compute masked token prediction from the model logits
+    # Compute masked token prediction from the discrete vocabulary logits
     pred_ids = torch.argmax(real_logits, dim=-1)
+
+    # For continuous masked positions (encoded as labels in {-1..-7}), convert continuous prediction to -1 - bin_idx
+    if pred_num is not None and labels is not None:
+        cont_mask = (labels < 0) & (labels != -100)
+        if cont_mask.any():
+            pred_bins = -1 - torch.clamp(torch.floor((pred_num.float() + 1.0) * 0.5 * 7.0).long(), 0, 6)
+            pred_ids = torch.where(cont_mask, pred_bins, pred_ids)
     
-    # Pool embeddings by averaging all non-pad token embeddings
+    # Pool embeddings by averaging all masked token embeddings
     pooled_embeddings = None
     if last_hidden is not None:
         mask = (labels != -100).unsqueeze(-1).to(last_hidden.dtype)
@@ -1227,37 +1361,3 @@ def preprocess_logits_for_mlm_metrics(logits, labels):
         pooled_embeddings = sum_embeddings / sum_mask
 
     return pred_ids, pooled_embeddings
-
-
-def make_preprocess_logits_for_metrics_generative(
-    tokenizer,
-    pos_token: str="1",
-    neg_token: str="0",
-):
-    """
-    Creates a pre-processing function to extract only the logits
-    for the '0' and '1' tokens and the last hidden state for embeddings.
-    """
-    pos_id = tokenizer.encode(pos_token, add_special_tokens=False)[-1]
-    neg_id = tokenizer.encode(neg_token, add_special_tokens=False)[-1]
-
-    def preprocess_logits_for_metrics_generative(logits, labels):
-        if isinstance(logits, tuple):
-            logits = logits[0]
-
-        # Find index of the first valid label (the answer token)
-        # labels format: [-100 (prompt), ..., answer, eos, -100 (padding)]
-        # argmax on a boolean tensor returns the index of the first True
-        answer_indices = (labels != -100).long().argmax(dim=-1)
-
-        # The logit used to predict token at answer_indices is located at answer_indices - 1
-        # Clamped to 0 to avoid -1 indexing errors, though -1 should not happen in valid data
-        logit_indices = (answer_indices - 1).clamp(min=0)
-        
-        # Extract logits at the answer position
-        batch_range = torch.arange(logits.shape[0], device=logits.device)
-        final_logits = logits[batch_range, logit_indices][:, [neg_id, pos_id]]
-
-        return final_logits
-
-    return preprocess_logits_for_metrics_generative
