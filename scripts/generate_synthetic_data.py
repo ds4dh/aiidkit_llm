@@ -1051,8 +1051,8 @@ def main():
         "--horizons",
         type=int,
         nargs="+",
-        default=[30, 60, 90, 180, 360],
-        help="Prediction horizons in days for binary labels.",
+        default=[30, 60, 90, 180, 360, 720, 1800],
+        help="Prediction horizons in days for binary labels (default: 30, 60, 90, 180, 360, 720, 1800).",
     )
     parser.add_argument(
         "--seed",

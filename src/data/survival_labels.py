@@ -210,24 +210,3 @@ def binarize_survival_labels(
     # Propagate unknown labels (invalid/negative times or statuses)
     labels[(times < 0) | (statuses < 0)] = MASK
     return labels
-
-
-def build_survival_truth_frame(
-    raw_dataset: Dataset,
-    task_key: str,
-) -> "list[dict]":
-    """
-    Convenience helper used by the comparison analysis:
-    extracts a list of records with patientid + (time, status) for a task,
-    deriving category endpoints on the fly when needed.
-    """
-    raw_dataset = derive_category_survival_labels(raw_dataset, task_key)
-    time_key, status_key, _ = resolve_survival_label_keys(task_key)
-    times = np.asarray(raw_dataset[time_key])
-    statuses = np.asarray(raw_dataset[status_key])
-    patient_ids = np.asarray(raw_dataset["patientid"])
-    keep = survival_keep_mask(times, statuses)
-    return [
-        {"patientid": pid, "time": float(t), "status": int(s)}
-        for pid, t, s in zip(patient_ids[keep], times[keep], statuses[keep])
-    ]
