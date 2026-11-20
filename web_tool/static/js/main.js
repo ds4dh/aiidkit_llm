@@ -1,12 +1,32 @@
 /**
  * AIIDKIT — main.js
  * Application orchestrator: state management, API calls,
- * risk gauge animation, UI updates, and event listeners.
+ * dynamic multi-horizon cards, UI updates, and event listeners.
  * Exposes window.AIIDKIT  (call init() on DOMContentLoaded)
  */
 'use strict';
 
 window.AIIDKIT = (() => {
+
+  function _escHtml(val) {
+    return String(val ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function _formatHorizonLabel(h, config) {
+    const fromCfg = config?.horizon_labels?.[String(h)];
+    if (fromCfg) return fromCfg;
+    if (h >= 360 && h % 360 === 0) {
+      const y = h / 360;
+      return y === 1 ? '1 year' : `${y} years`;
+    }
+    if (h === 180) return '6 months';
+    return `${h} days`;
+  }
 
   // ================================================================
   // STATE
@@ -14,12 +34,106 @@ window.AIIDKIT = (() => {
   const state = {
     config:           null,
     cohort:           null,
+    cohortsByFup:     {},
     prediction:       null,
+    predictionsByFup: {},
+    trajectory:       [],
+    fupSteps:         [],
+    maxFup:           0,
+    patientMaxDay:    0,
+    showTrajectory:   true,
+    bgFetchToken:     0,
+    selectedTask:     'infection_bacteria',
     selectedHorizon:  90,
-    selectedFup:      90,
+    selectedFup:      30,
     chartsInitialized: false,
     currentPatientRawEvents: null,
   };
+
+  function _getAvailableHorizons() {
+    return state.config?.available_horizons?.length
+      ? state.config.available_horizons
+      : [30, 60, 90];
+  }
+
+  function getActiveTaskCohort() {
+    const activeCohortObj = state.cohortsByFup[state.selectedFup] || state.cohort;
+    if (!activeCohortObj) return null;
+    const taskCohort = activeCohortObj.tasks?.[state.selectedTask] || activeCohortObj;
+    if (activeCohortObj.global_umap_bounds && !taskCohort.global_umap_bounds) {
+      taskCohort.global_umap_bounds = activeCohortObj.global_umap_bounds;
+    }
+    return taskCohort;
+  }
+
+  function _buildLightweightStagePred(fup) {
+    const basePred = state.predictionsByFup[state.maxFup] || state.prediction;
+    if (!basePred) return null;
+    const baseTask = basePred.tasks?.[state.selectedTask] || basePred;
+    const baseHoriz = baseTask.by_horizon?.[String(state.selectedHorizon)] || baseTask;
+    const trajPt = (state.trajectory || []).find(pt => pt.fup === fup);
+    if (!trajPt) return baseHoriz;
+
+    const stTask = trajPt.tasks?.[state.selectedTask];
+    const hKey = `${state.selectedHorizon}d`;
+    const riskScores = stTask?.risk_scores || baseHoriz.risk_scores;
+    const calibRisks = stTask?.calibrated_risks || baseHoriz.calibrated_risks;
+    const selRisk = riskScores?.[hKey] ?? baseHoriz.risk_score;
+    const selCalib = calibRisks?.[hKey] ?? baseHoriz.calibrated_risk;
+    const evsUpToFup = (baseHoriz.events_with_scores || []).filter(e => parseFloat(e.days_since_tpx ?? 0) <= fup);
+
+    const taskCohort = getActiveTaskCohort();
+    const cohortPts = taskCohort?.horizons?.[state.selectedHorizon]?.patients || [];
+    let clusterId = baseHoriz.cluster;
+    let clusterName = baseHoriz.cluster_name;
+    let clusterColor = baseHoriz.cluster_color;
+    let percentile = baseHoriz.percentile;
+    if (cohortPts.length > 0) {
+      let bestDist = Infinity;
+      for (const p of cohortPts) {
+        const d2 = (p.umap_x - trajPt.umap_x) ** 2 + (p.umap_y - trajPt.umap_y) ** 2;
+        if (d2 < bestDist) {
+          bestDist = d2;
+          clusterId = p.cluster;
+          clusterName = p.cluster_name;
+          clusterColor = p.cluster_color;
+        }
+      }
+      const lowerCount = cohortPts.filter(p => p.risk_score < selRisk).length;
+      percentile = Math.round((lowerCount / cohortPts.length) * 100);
+    }
+
+    return {
+      ...baseHoriz,
+      fup,
+      umap_x: trajPt.umap_x,
+      umap_y: trajPt.umap_y,
+      risk_scores: riskScores,
+      calibrated_risks: calibRisks,
+      risk_score: selRisk,
+      calibrated_risk: selCalib,
+      risk_category: clusterName,
+      risk_color: clusterColor,
+      cluster: clusterId,
+      cluster_name: clusterName,
+      cluster_color: clusterColor,
+      percentile,
+      events_with_scores: evsUpToFup,
+    };
+  }
+
+  function getActiveTaskPrediction() {
+    const fupPred = state.predictionsByFup[state.selectedFup];
+    if (fupPred) {
+      const taskPred = fupPred.tasks?.[state.selectedTask] || fupPred;
+      return taskPred.by_horizon?.[String(state.selectedHorizon)] || taskPred;
+    }
+    if (state.prediction && state.selectedFup === state.maxFup) {
+      const taskPred = state.prediction.tasks?.[state.selectedTask] || state.prediction;
+      return taskPred.by_horizon?.[String(state.selectedHorizon)] || taskPred;
+    }
+    return _buildLightweightStagePred(state.selectedFup);
+  }
 
   // ================================================================
   // API
@@ -36,18 +150,33 @@ window.AIIDKIT = (() => {
   }
 
   const fetchConfig = () => _fetch('/api/config');
-  const fetchCohort = (fup) => _fetch(`/api/cohort?fup=${fup || 90}`);
+  const fetchCohort = async (fup) => {
+    const targetFup = fup != null ? fup : 30;
+    if (state.cohortsByFup[targetFup]) {
+      return state.cohortsByFup[targetFup];
+    }
+    const c = await _fetch(`/api/cohort?fup=${targetFup}`);
+    state.cohortsByFup[targetFup] = c;
+    return c;
+  };
 
-  function submitPrediction(events, horizon, fup) {
+  function submitPrediction(events, horizon, fup, task, maxFup, background = false) {
     return _fetch('/api/predict', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ events, horizon, fup }),
+      body: JSON.stringify({
+        events,
+        horizon,
+        fup,
+        max_fup: maxFup != null ? maxFup : fup,
+        task: task || state.selectedTask,
+        background,
+      }),
     });
   }
 
   // ================================================================
-  // LOADING OVERLAY
+  // LOADING OVERLAY & TOASTS
   // ================================================================
 
   const showLoading = (msg = 'Analysing patient data…') => {
@@ -57,10 +186,6 @@ window.AIIDKIT = (() => {
   };
   const hideLoading = () => document.getElementById('loading-overlay')?.classList.add('hidden');
 
-  // ================================================================
-  // TOAST NOTIFICATIONS
-  // ================================================================
-
   function showToast(message, type = 'info', duration = 4200) {
     const container = document.getElementById('toast-container');
     if (!container) return null;
@@ -68,13 +193,13 @@ window.AIIDKIT = (() => {
       success: '\u2713',
       error: '\u2717',
       info: '\u2139',
-      loading: '<span class="toast-spinner"></span>'
+      loading: '<span class="toast-spinner"></span>',
     };
     const toast = document.createElement('div');
     toast.className = `toast toast-${type}`;
-    toast.innerHTML = `<span>${icons[type] || '\u2139'}</span>${message}`;
+    toast.innerHTML = `<span>${icons[type] || '\u2139'}</span>${_escHtml(message)}`;
     container.appendChild(toast);
-    
+
     if (duration > 0) {
       setTimeout(() => {
         toast.style.cssText += 'opacity:0;transform:translateY(-15px);transition:opacity 0.3s,transform 0.3s;';
@@ -85,160 +210,169 @@ window.AIIDKIT = (() => {
   }
 
   // ================================================================
-  // RESULTS AREA
+  // RESULTS AREA & COLLAPSIBLE LATERAL SIDEBAR
   // ================================================================
+
+  function _refreshChartsAfterLayoutChange() {
+    if (!state.chartsInitialized) return;
+    const C = window.AIIDKIT_CHARTS;
+    const taskCohort = getActiveTaskCohort();
+    const activeCohort = taskCohort?.horizons?.[state.selectedHorizon];
+    const activePred = getActiveTaskPrediction();
+    if (!C || !activeCohort) return;
+
+    C.initUMAP(activeCohort, taskCohort.global_umap_bounds);
+    if (activePred) {
+      C.updateUMAPWithPatient(
+        activePred.umap_x,
+        activePred.umap_y,
+        activePred,
+        state.trajectory,
+        state.selectedFup,
+        state.showTrajectory,
+        (clickedFup) => setSelectedFup(clickedFup)
+      );
+      if (activePred.events_with_scores) {
+        C.drawRiskTimelineGraph?.(activePred.events_with_scores, activePred.risk_score, state.selectedTask);
+      }
+    }
+    C.resizeCharts?.();
+  }
+
+  function setSidebarCollapsed(collapsed, refitCharts = true) {
+    const sidebar = document.getElementById('app-sidebar');
+    if (!sidebar) return;
+    sidebar.classList.toggle('collapsed', Boolean(collapsed));
+    if (refitCharts && state.chartsInitialized) {
+      setTimeout(_refreshChartsAfterLayoutChange, 280);
+    }
+  }
 
   function showResults() {
     document.getElementById('results-area')?.classList.remove('hidden');
     document.getElementById('empty-state')?.classList.add('hidden');
+    document.getElementById('sidebar-collapse-btn')?.classList.remove('hidden');
+    document.getElementById('header-new-patient-btn')?.classList.remove('hidden');
 
-    // Initialize charts once when first shown to ensure correct dimensions
+    setSidebarCollapsed(true, false);
+
     if (!state.chartsInitialized) {
       const C = window.AIIDKIT_CHARTS;
-      if (C && state.cohort) {
+      const taskCohort = getActiveTaskCohort();
+      if (C && taskCohort) {
         requestAnimationFrame(() => {
           setTimeout(() => {
-            const activeCohort = state.cohort.horizons[state.selectedHorizon];
-            C.initUMAP(activeCohort);
-            C.initHistogram(activeCohort.risk_distribution);
+            const activeCohort = taskCohort.horizons[state.selectedHorizon];
+            const activePred = getActiveTaskPrediction();
+            C.initUMAP(activeCohort, taskCohort.global_umap_bounds);
+            C.initHistogram(activeCohort.risk_distribution, state.selectedTask);
             C.initClusterProfiles(activeCohort.cluster_profiles);
-            
-            C.initAttributionChart(state.cohort.global_attributions || []);
 
-            // Draw current prediction values if already set
-            if (state.prediction) {
-              C.updateUMAPWithPatient(state.prediction.umap_x, state.prediction.umap_y);
-              C.updateHistogramWithPatient(state.prediction.risk_score);
-              C.highlightCluster(state.prediction.cluster);
+            if (activePred) {
+              C.updateUMAPWithPatient(
+                activePred.umap_x,
+                activePred.umap_y,
+                activePred,
+                state.trajectory,
+                state.selectedFup,
+                state.showTrajectory,
+                (clickedFup) => setSelectedFup(clickedFup)
+              );
+              C.updateHistogramWithPatient(activePred.risk_score);
+              C.highlightCluster(activePred.cluster);
+              if (activePred.events_with_scores) {
+                C.drawRiskTimelineGraph?.(activePred.events_with_scores, activePred.risk_score, state.selectedTask);
+              }
             }
             state.chartsInitialized = true;
-          }, 50);
+          }, 280);
         });
       }
     } else {
-      // Trigger a resize on already initialized charts
       requestAnimationFrame(() => {
-        setTimeout(() => {
-          window.AIIDKIT_CHARTS?.resizeCharts?.();
-        }, 50);
+        setTimeout(_refreshChartsAfterLayoutChange, 280);
       });
     }
   }
 
   // ================================================================
-  // SVG GAUGE
-  // Half-circumference of r=80 circle: pi*80 ~ 251 px.
-  // rotate(180 100 110) makes arc sweep left->top->right.
+  // DYNAMIC HORIZON CARDS & RISK BADGE
   // ================================================================
-
-  const GAUGE_HALF = 251;
-
-  function updateRiskGauge(riskScore, category, color) {
-    const arc   = document.getElementById('gauge-arc');
-    const track = document.getElementById('gauge-track');
-    const pctEl = document.getElementById('gauge-pct');
-    const badge = document.getElementById('risk-badge');
-
-    if (track) {
-      track.setAttribute('transform',        'rotate(180 100 110)');
-      track.setAttribute('stroke-dasharray', `${GAUGE_HALF} 502`);
-      track.setAttribute('stroke-dashoffset','0');
-    }
-    if (arc) {
-      arc.setAttribute('transform',        'rotate(180 100 110)');
-      arc.setAttribute('stroke-dashoffset','0');
-      arc.setAttribute('stroke',            color);
-      requestAnimationFrame(() => {
-        arc.setAttribute('stroke-dasharray', `${Math.round(riskScore * GAUGE_HALF)} 502`);
-      });
-    }
-
-    if (pctEl) {
-      const startVal = parseInt(pctEl.textContent) || 0;
-      const endVal   = Math.round(riskScore * 100);
-      const t0       = performance.now();
-      const DUR      = 1400;
-      function tick(now) {
-        const p    = Math.min((now - t0) / DUR, 1);
-        const ease = 1 - Math.pow(1 - p, 3);
-        pctEl.textContent = `${Math.round(startVal + (endVal - startVal) * ease)}/100`;
-        pctEl.setAttribute('fill', color);
-        if (p < 1) requestAnimationFrame(tick);
-      }
-      requestAnimationFrame(tick);
-    }
-
-    if (badge) {
-      badge.textContent = category;
-      badge.className   = `risk-badge ${_badgeClass(category)}`;
-    }
-  }
 
   function _badgeClass(cat) {
-    return { 'Low risk': 'badge-low', 'Medium risk': 'badge-mod', 'Moderate risk': 'badge-mod', 'High risk': 'badge-high', 'Very high risk': 'badge-vhigh' }[cat] || 'badge-low';
+    return {
+      'Low risk': 'badge-low',
+      'Medium risk': 'badge-mod',
+      'Moderate risk': 'badge-mod',
+      'High risk': 'badge-high',
+      'Very high risk': 'badge-vhigh',
+    }[cat] || 'badge-low';
   }
 
-  // ================================================================
-  // RISK SCORE CARDS
-  // ================================================================
+  function updateRiskBadge(category) {
+    const badge = document.getElementById('risk-badge');
+    if (badge) {
+      badge.textContent = category || 'Low risk';
+      badge.className = `risk-badge ${_badgeClass(category)}`;
+    }
+  }
+
+  function renderHorizonCards() {
+    const container = document.getElementById('risk-horizons-container');
+    const metricsRow = document.getElementById('unified-metrics-row');
+    if (!container) return;
+
+    const horizons = _getAvailableHorizons();
+    const isMultiGrid = horizons.length > 3;
+    container.classList.toggle('multi-horizon-grid', isMultiGrid);
+    metricsRow?.classList.toggle('has-multi-horizons', isMultiGrid);
+
+    container.innerHTML = '';
+    horizons.forEach((h, idx) => {
+      const item = document.createElement('div');
+      item.className = `risk-horizon-item${h === state.selectedHorizon ? ' active-horizon' : ''}`;
+      if (isMultiGrid && horizons.length % 2 === 1 && idx === horizons.length - 1) {
+        item.classList.add('span-full-col');
+      }
+      item.id = `horizon-card-${h}`;
+      item.dataset.horizon = String(h);
+      item.innerHTML = `
+        <span class="horizon-label">${_escHtml(_formatHorizonLabel(h, state.config))}</span>
+        <span id="risk-${h}d" class="horizon-value">\u2014</span>
+      `;
+      item.addEventListener('click', () => {
+        if (state.selectedHorizon === h) return;
+        state.selectedHorizon = h;
+        applyActiveTaskAndHorizon(true);
+      });
+      container.appendChild(item);
+    });
+  }
 
   function updateRiskScoreCards(riskScores, calibratedRisks, horizon) {
-    [30, 60, 90].forEach(h => {
+    const horizons = _getAvailableHorizons();
+    horizons.forEach(h => {
       const card = document.getElementById(`horizon-card-${h}`);
       const el = document.getElementById(`risk-${h}d`);
       if (!el) return;
       const score = riskScores?.[`${h}d`];
       const risk = calibratedRisks?.[`${h}d`];
-      
+
       if (score != null) {
         let htmlVal = `<span class="horizon-score-val">${Math.round(score * 100)}/100</span>`;
         if (risk != null) {
-          htmlVal += `<span class="horizon-risk-pct">Risk: ${Math.round(risk * 100)}%</span>`;
+          const pctStr = risk < 0.01 ? '<1%' : `${Math.round(risk * 100)}%`;
+          htmlVal += `<span class="horizon-risk-pct">Prob: ${pctStr}</span>`;
         }
         el.innerHTML = htmlVal;
       } else {
         el.textContent = '\u2014';
       }
-      
+
       if (card) {
-        if (h === horizon) {
-          card.classList.add('active-horizon');
-        } else {
-          card.classList.remove('active-horizon');
-        }
+        card.classList.toggle('active-horizon', h === horizon);
       }
     });
-  }
-
-  // ================================================================
-  // COHORT POSITION
-  // ================================================================
-
-  function updateCohortPosition(result) {
-    const numEl   = document.getElementById('percentile-number');
-    const sufEl   = document.getElementById('percentile-suffix');
-    const badgeEl = document.getElementById('cluster-badge');
-    const rateEl  = document.getElementById('cluster-event-rate');
-
-    if (numEl)   numEl.textContent = result.percentile ?? '\u2014';
-    if (sufEl)   sufEl.textContent = _ordSuffix(result.percentile);
-    if (badgeEl) {
-      badgeEl.textContent      = result.cluster_name ?? '\u2014';
-      badgeEl.style.background = result.cluster_color || '#444';
-    }
-    if (rateEl) {
-      const activeCohort = state.cohort?.horizons?.[state.selectedHorizon];
-      const prof = activeCohort?.cluster_profiles?.[String(result.cluster)];
-      rateEl.textContent = `Event rate: ${prof ? (prof.event_rate * 100).toFixed(0) + '%' : '\u2014'}`;
-    }
-    window.AIIDKIT_CHARTS?.highlightCluster?.(result.cluster);
-  }
-
-  function _ordSuffix(n) {
-    if (!Number.isInteger(n)) return '';
-    const s = ['th','st','nd','rd'];
-    const v = n % 100;
-    return s[(v - 20) % 10] || s[v] || s[0];
   }
 
   // ================================================================
@@ -257,44 +391,28 @@ window.AIIDKIT = (() => {
       const clamped = Math.max(-0.2, Math.min(0.2, score));
       const t = (clamped + 0.2) / 0.4;
       const isLight = document.documentElement.getAttribute('data-theme') === 'light';
-
-      // Pick anchors based on light/dark theme
-      // Dark mode: Blue #4F8EF7 (79, 142, 247) -> Gray #B4BED2 (180, 190, 210) -> Red #FF4757 (255, 71, 87)
-      // Light mode: Blue #1A56DB (26, 86, 219) -> Gray #64748B (100, 116, 139) -> Red #B32431 (179, 36, 49)
       const startB = isLight ? [26, 86, 219] : [79, 142, 247];
       const midG   = isLight ? [100, 116, 139] : [180, 190, 210];
       const endR   = isLight ? [179, 36, 49] : [255, 71, 87];
 
-      let r, g, b;
-      if (t < 0.5) {
-        const u = t * 2;
-        r = Math.round(startB[0] + (midG[0] - startB[0]) * u);
-        g = Math.round(startB[1] + (midG[1] - startB[1]) * u);
-        b = Math.round(startB[2] + (midG[2] - startB[2]) * u);
-      } else {
-        const u = (t - 0.5) * 2;
-        r = Math.round(midG[0] + (endR[0] - midG[0]) * u);
-        g = Math.round(midG[1] + (endR[1] - midG[1]) * u);
-        b = Math.round(midG[2] + (endR[2] - midG[2]) * u);
-      }
-      return `rgb(${r}, ${g}, ${b})`;
+      const u = t < 0.5 ? t * 2 : (t - 0.5) * 2;
+      const c0 = t < 0.5 ? startB : midG;
+      const c1 = t < 0.5 ? midG : endR;
+      return `rgb(${Math.round(c0[0] + (c1[0] - c0[0]) * u)}, ${Math.round(c0[1] + (c1[1] - c0[1]) * u)}, ${Math.round(c0[2] + (c1[2] - c0[2]) * u)})`;
     }
 
     const sorted = [...eventsWithScores].sort((a, b) => a.days_since_tpx - b.days_since_tpx);
     list.innerHTML = '';
 
-    const rawFeatures = state.cohort?.cluster_profiles?.['0']?.top_features || [];
+    const activeCohort = getActiveTaskCohort()?.horizons?.[state.selectedHorizon];
+    const rawFeatures = activeCohort?.cluster_profiles?.['0']?.top_features || [];
     const highRiskFeatures = Array.isArray(rawFeatures)
       ? rawFeatures
-      : [
-          ...(rawFeatures.static || []),
-          ...(rawFeatures.recent || [])
-        ];
+      : [...(rawFeatures.static || []), ...(rawFeatures.recent || [])];
 
     sorted.forEach((ev, i) => {
       const sc = ev.score ?? 0;
-      const absScore = Math.abs(sc);
-      const intensity = Math.min(1.0, absScore / 0.2); // Using 0.2 as a reference max absolute value
+      const intensity = Math.min(1.0, Math.abs(sc) / 0.2);
       const textC = getTimelineTextColor(sc);
 
       let barC, bgStyle, badgeStyle, badgeClass, badgeText;
@@ -311,46 +429,43 @@ window.AIIDKIT = (() => {
         badgeText = `Risk Impact: ${sc.toFixed(3)}`;
         badgeClass = 'score-neg';
       } else {
-        barC = `rgba(61, 79, 114, 0.35)`;
-        bgStyle = `background: transparent`;
+        barC = 'rgba(61, 79, 114, 0.35)';
+        bgStyle = 'background: transparent';
         badgeStyle = `background: rgba(255, 255, 255, 0.05); color: ${textC}; border: 1px solid rgba(255, 255, 255, 0.04);`;
-        badgeText = `Risk Impact: 0.000`;
+        badgeText = 'Risk Impact: 0.000';
         badgeClass = 'score-neu';
       }
-
-      const scBadge = `<span class="timeline-score ${badgeClass}" style="${badgeStyle}">${badgeText}</span>`;
 
       const matchesCohortRisk = highRiskFeatures.some(f => {
         const featName = `${ev.entity} - ${ev.attribute}`;
         return f.feature === featName && String(f.value) === String(ev.value);
       });
 
-      const cohortRiskBadge = matchesCohortRisk 
-        ? `<span class="cohort-risk-badge">⚠️ Cohort Risk Driver</span>` 
+      const cohortRiskBadge = matchesCohortRisk
+        ? '<span class="cohort-risk-badge">Cohort Risk Driver</span>'
         : '';
-
-      const entityLabel = ev.entity === 'Infection' ? 'Previous infection' : ev.entity;
+      const entityLabel = _escHtml(ev.entity === 'Infection' ? 'Previous infection' : ev.entity);
 
       const li = document.createElement('li');
       li.className = 'timeline-item';
-      li.style.animationDelay = `${i * 35}ms`;
-      li.style.cssText += `; ${bgStyle}; padding: 12px 18px; border-radius: var(--radius-sm); margin-bottom: 6px; display: flex; align-items: center; gap: 14px;`;
-      
+      li.style.animationDelay = `${i * 25}ms`;
+      li.style.cssText += `; ${bgStyle}; padding: 10px 14px; border-radius: var(--radius-sm); margin-bottom: 5px; display: flex; align-items: center; gap: 12px;`;
+
       li.innerHTML = `
-        <div class="timeline-day" style="flex-shrink: 0; margin-right: 6px;">
-          <div class="timeline-day-num">${ev.days_since_tpx}</div>
+        <div class="timeline-day" style="flex-shrink: 0; margin-right: 4px;">
+          <div class="timeline-day-num">${_escHtml(ev.days_since_tpx)}</div>
           <div class="timeline-day-unit">day</div>
         </div>
-        <div class="timeline-bar" style="background:${barC}; flex-shrink: 0; width: 4px; border-radius: 2px; align-self: stretch;"></div>
-        <div class="timeline-content-2line" style="flex: 1; display: flex; flex-direction: column; gap: 4px; min-width: 0; padding-right: 12px;">
+        <div class="timeline-bar" style="background:${barC}; flex-shrink: 0; width: 3.5px; border-radius: 2px; align-self: stretch;"></div>
+        <div class="timeline-content-2line" style="flex: 1; display: flex; flex-direction: column; gap: 4px; min-width: 0; padding-right: 8px;">
           <div class="timeline-row-top" style="display: flex; align-items: center; justify-content: space-between; gap: 10px;">
             <span class="timeline-entity-tag" style="margin: 0; flex-shrink: 0;">${entityLabel}</span>
-            <span class="timeline-value-text" style="font-size: 0.76rem; font-weight: 700; color: ${textC}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-left: auto;"><strong>Value:</strong> ${ev.value}</span>
+            <span class="timeline-value-text" style="font-size: 0.74rem; font-weight: 700; font-variant-numeric: tabular-nums; color: ${textC}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-left: auto;"><strong>Value:</strong> ${_escHtml(ev.value)}</span>
           </div>
           <div class="timeline-row-bottom" style="display: flex; align-items: center; justify-content: space-between; gap: 10px;">
-            <span class="timeline-attribute-name" style="font-size: 0.75rem; color: var(--text); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${ev.attribute}</span>
+            <span class="timeline-attribute-name" style="font-size: 0.75rem; color: var(--text); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${_escHtml(ev.attribute)}</span>
             <div class="timeline-badges-wrap" style="display: flex; align-items: center; gap: 6px; flex-shrink: 0; margin-left: auto;">
-              ${scBadge}
+              <span class="timeline-score ${badgeClass}" style="${badgeStyle}">${badgeText}</span>
               ${cohortRiskBadge}
             </div>
           </div>
@@ -358,103 +473,323 @@ window.AIIDKIT = (() => {
       list.appendChild(li);
     });
 
-    // Also draw cumulative Risk Timeline Graph (Mode 2)
-    window.AIIDKIT_CHARTS?.drawRiskTimelineGraph?.(
-      sorted,
-      state.prediction?.risk_score
-    );
+    const activePred = getActiveTaskPrediction();
+    window.AIIDKIT_CHARTS?.drawRiskTimelineGraph?.(sorted, activePred?.risk_score, state.selectedTask);
   }
 
   // ================================================================
-  // RISK CATEGORY HELPER
-  // ================================================================
-
-  function _riskCategory(score) {
-    const threshold = state.config?.risk_threshold ?? 0.25;
-    if (score < threshold) return { category: 'Low risk',  color: '#00C9A7' };
-    return                 { category: 'High risk', color: '#FF4757' };
-  }
-
-  // ================================================================
-  // ANALYSE HANDLER
+  // ANALYSE & FUP STAGE MANAGEMENT
   // ================================================================
 
   function clearPredictionResults() {
+    state.bgFetchToken += 1;
     state.prediction = null;
+    state.predictionsByFup = {};
+    state.trajectory = [];
+    state.fupSteps = [];
     state.chartsInitialized = false;
 
-    // Hide results area, show empty state
     document.getElementById('results-area')?.classList.add('hidden');
     document.getElementById('empty-state')?.classList.remove('hidden');
+    document.getElementById('sidebar-collapse-btn')?.classList.add('hidden');
+    document.getElementById('header-new-patient-btn')?.classList.add('hidden');
+    setSidebarCollapsed(false, false);
   }
 
   function resetAnalysis() {
     state.currentPatientRawEvents = null;
     clearPredictionResults();
-
-    // Reset sidebar inputs
     window.AIIDKIT_FORM?.clearForm();
     window.AIIDKIT_FORM?.clearUpload();
-
-    // Reset attribution chart to global importances
-    if (state.chartsInitialized && window.AIIDKIT_CHARTS && state.cohort) {
-      window.AIIDKIT_CHARTS.updateAttributionChart(state.cohort.global_attributions || []);
-    }
-
     showToast('Ready for new analysis.', 'info');
   }
 
   function calculateAutoFup(events) {
-    if (!events || !events.length) return 30;
+    if (!events || !events.length) return { fup: 0, maxDay: 0, fupSteps: [0] };
     const validDays = events
       .map(ev => parseFloat(ev.days_since_tpx))
-      .filter(d => !isNaN(d) && d > 0);
-    if (!validDays.length) return 30;
-    const maxDay = Math.max(...validDays);
-    return Math.max(30, Math.ceil(maxDay / 30) * 30);
+      .filter(d => !isNaN(d) && d >= 0);
+    const maxDay = validDays.length ? Math.max(...validDays) : 0;
+    const avail = (state.config?.available_fups || [0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 360])
+      .slice()
+      .sort((a, b) => a - b);
+
+    // Choose the smallest FUP landmark >= maxDay so no entered clinical events are truncated away!
+    let bestFup = avail.find(f => f >= maxDay);
+    if (bestFup === undefined) {
+      bestFup = avail[avail.length - 1] ?? 0;
+    }
+    const fupSteps = avail.filter(f => f <= bestFup);
+    if (!fupSteps.length) fupSteps.push(0);
+    return { fup: bestFup, maxDay: Math.round(maxDay), fupSteps };
   }
 
-  async function handleAnalyse(events, silent = false) {
-    if (!events?.length) { showToast('Please add at least one clinical event.', 'error'); return; }
-    
-    const autoFup = calculateAutoFup(events);
-    const fupDisplay = document.getElementById('fup-display');
-    if (fupDisplay) fupDisplay.textContent = `Follow-up: ${autoFup} days`;
+  function _updateFupLabelsAndBadges() {
+    const fup = state.selectedFup;
+    const stageText = fup === 0 ? 'Day 0 (Baseline)' : `Day ${fup}`;
+    const shortStageText = `Day ${fup}`;
 
-    const loadToast = showToast('Analysing patient sequence…', 'loading', 0);
-    
-    try {
-      if (!state.cohort || state.selectedFup !== autoFup) {
-        state.selectedFup = autoFup;
-        state.cohort = await fetchCohort(autoFup);
-        state.chartsInitialized = false;
+    const badge1 = document.getElementById('fup-slider-val-badge');
+    if (badge1) badge1.textContent = stageText;
+
+    const badge2 = document.getElementById('assessment-fup-badge');
+    if (badge2) badge2.textContent = shortStageText;
+
+    const panelTitle = document.getElementById('assessment-panel-title');
+    if (panelTitle) {
+      panelTitle.textContent = state.selectedTask.startsWith('infection_')
+        ? 'Infection risk assessment'
+        : 'Clinical outcome risk assessment';
+    }
+
+    const taskBadge = document.getElementById('assessment-task-badge');
+    if (taskBadge) {
+      const taskObj = (state.config?.available_tasks || []).find(t => t.key === state.selectedTask);
+      taskBadge.textContent = taskObj?.label || state.selectedTask;
+    }
+
+    const umapCaption = document.getElementById('umap-cohort-caption');
+    if (umapCaption) {
+      if (fup === state.maxFup) {
+        umapCaption.textContent = `Reference cohort at Day ${fup} post-transplant (matched to patient timeline: Day ${state.patientMaxDay}) — proximity reflects clinical similarity.`;
+      } else {
+        umapCaption.textContent = `Historical stage view: Reference cohort & patient state at Day ${fup} post-transplant (full patient timeline reaches Day ${state.patientMaxDay}).`;
       }
+    }
 
-      const result     = await submitPrediction(events, state.selectedHorizon, autoFup);
-      state.prediction = result;
+    const slider = document.getElementById('fup-slider');
+    if (slider && state.fupSteps.length > 0) {
+      const idx = state.fupSteps.indexOf(fup);
+      if (idx >= 0 && parseInt(slider.value, 10) !== idx) {
+        slider.value = String(idx);
+      }
+    }
 
-      // Always show results first to ensure containers render
-      showResults();
+    document.querySelectorAll('.fup-tick-btn').forEach(btn => {
+      const btnFup = parseInt(btn.dataset.fup, 10);
+      btn.classList.toggle('active', btnFup === fup);
+      btn.classList.toggle('cached', Boolean(state.predictionsByFup[btnFup]));
+    });
+  }
 
-      updateRiskGauge(result.risk_score, result.risk_category, result.risk_color);
-      updateRiskScoreCards(result.risk_scores, result.calibrated_risks, state.selectedHorizon);
-      updateCohortPosition(result);
-      renderTimeline(result.events_with_scores || []);
+  function _updateFupBackgroundStatus() {
+    const statusEl = document.getElementById('fup-bg-status');
+    if (!statusEl) return;
+    const total = state.fupSteps.length;
+    const readyCount = state.fupSteps.filter(f => Boolean(state.predictionsByFup[f])).length;
 
+    if (total <= 1) {
+      statusEl.className = 'fup-bg-status ready';
+      statusEl.innerHTML = '\u2713 Baseline stage';
+    } else if (readyCount < total) {
+      statusEl.className = 'fup-bg-status computing';
+      statusEl.innerHTML = `<span class="toast-spinner"></span>History ${readyCount}/${total}\u2026`;
+    } else {
+      statusEl.className = 'fup-bg-status ready';
+      statusEl.innerHTML = `\u2713 All ${total} stages ready`;
+    }
+
+    document.querySelectorAll('.fup-tick-btn').forEach(btn => {
+      const btnFup = parseInt(btn.dataset.fup, 10);
+      btn.classList.toggle('cached', Boolean(state.predictionsByFup[btnFup]));
+    });
+  }
+
+  function renderFupSliderBar() {
+    const slider = document.getElementById('fup-slider');
+    const ticksWrap = document.getElementById('fup-slider-ticks');
+    const trajBtn = document.getElementById('fup-trajectory-toggle');
+    const steps = state.fupSteps.length ? state.fupSteps : [state.selectedFup];
+
+    if (slider) {
+      slider.min = '0';
+      slider.max = String(Math.max(0, steps.length - 1));
+      slider.step = '1';
+      slider.value = String(Math.max(0, steps.indexOf(state.selectedFup)));
+      slider.disabled = steps.length <= 1;
+    }
+
+    if (trajBtn) {
+      trajBtn.classList.toggle('active', state.showTrajectory);
+      trajBtn.style.display = steps.length > 1 ? 'inline-flex' : 'none';
+    }
+
+    if (ticksWrap) {
+      ticksWrap.innerHTML = '';
+      steps.forEach((f) => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = `fup-tick-btn${f === state.selectedFup ? ' active' : ''}${state.predictionsByFup[f] ? ' cached' : ''}`;
+        btn.dataset.fup = String(f);
+        btn.textContent = f === 0 ? '0d (Base)' : `${f}d`;
+        btn.title = `Switch to Day ${f} post-transplant stage`;
+        btn.addEventListener('click', () => setSelectedFup(f));
+        ticksWrap.appendChild(btn);
+      });
+    }
+
+    _updateFupLabelsAndBadges();
+    _updateFupBackgroundStatus();
+  }
+
+  async function _ensureTaskIGIfNeeded() {
+    const events = state.currentPatientRawEvents || window.AIIDKIT_FORM?.getFormEvents?.() || [];
+    if (!events.length) return;
+    const fupPred = state.predictionsByFup[state.selectedFup];
+    const tPred = fupPred?.tasks?.[state.selectedTask];
+    if (fupPred && tPred && tPred.ig_computed === false) {
+      try {
+        const updated = await submitPrediction(
+          events, state.selectedHorizon, state.selectedFup, state.selectedTask, state.maxFup, true
+        );
+        state.predictionsByFup[state.selectedFup] = updated;
+        if (state.selectedFup === state.maxFup) {
+          state.prediction = updated;
+        }
+        applyActiveTaskAndHorizon(true);
+      } catch (err) {
+        console.warn('[AIIDKIT] Lazy IG fetch error:', err);
+      }
+    }
+  }
+
+  async function setSelectedFup(newFup) {
+    const targetFup = parseInt(newFup, 10);
+    if (isNaN(targetFup) || !state.fupSteps.includes(targetFup)) return;
+    state.selectedFup = targetFup;
+    _updateFupLabelsAndBadges();
+
+    if (!state.cohortsByFup[targetFup]) {
+      try {
+        state.cohort = await fetchCohort(targetFup);
+      } catch (err) {
+        console.warn('[AIIDKIT] Could not fetch cohort for FUP', targetFup, err);
+      }
+    } else {
+      state.cohort = state.cohortsByFup[targetFup];
+    }
+
+    applyActiveTaskAndHorizon(true);
+    _ensureTaskIGIfNeeded();
+  }
+
+  function applyActiveTaskAndHorizon(smoothUmap = true) {
+    const taskCohort = getActiveTaskCohort();
+    const activeCohort = taskCohort?.horizons?.[state.selectedHorizon];
+    const activePred = getActiveTaskPrediction();
+    const C = window.AIIDKIT_CHARTS;
+
+    _updateFupLabelsAndBadges();
+
+    if (activePred) {
+      updateRiskBadge(activePred.risk_category);
+      updateRiskScoreCards(activePred.risk_scores, activePred.calibrated_risks, state.selectedHorizon);
+      C?.highlightCluster?.(activePred.cluster);
+      renderTimeline(activePred.events_with_scores || []);
       const narr = document.getElementById('narrative-text');
-      if (narr) narr.textContent = result.narrative || '\u2014';
+      if (narr) narr.textContent = activePred.narrative || '\u2014';
+    } else {
+      updateRiskScoreCards(null, null, state.selectedHorizon);
+    }
 
-      // If charts are initialized, update them immediately
-      if (state.chartsInitialized) {
-        const C = window.AIIDKIT_CHARTS;
-        if (C) {
-          C.updateUMAPWithPatient(result.umap_x, result.umap_y, result);
-          C.updateHistogramWithPatient(result.risk_score);
-          if (state.cohort && typeof C.updateAttributionChart === 'function') {
-            C.updateAttributionChart(state.cohort.global_attributions || []);
-          }
+    if (state.chartsInitialized && C && activeCohort) {
+      if (smoothUmap && typeof C.updateUMAPCohort === 'function') {
+        C.updateUMAPCohort(activeCohort, taskCohort.global_umap_bounds);
+      } else {
+        C.initUMAP(activeCohort, taskCohort.global_umap_bounds);
+      }
+      if (activePred) {
+        C.updateUMAPWithPatient(
+          activePred.umap_x,
+          activePred.umap_y,
+          activePred,
+          state.trajectory,
+          state.selectedFup,
+          state.showTrajectory,
+          (clickedFup) => setSelectedFup(clickedFup)
+        );
+      }
+      C.updateHistogramData(activeCohort.risk_distribution, state.selectedTask);
+      if (activePred) {
+        C.updateHistogramWithPatient(activePred.risk_score);
+      }
+      C.updateClusterProfiles(activeCohort.cluster_profiles);
+      if (activePred) {
+        C.highlightCluster(activePred.cluster);
+      }
+    }
+  }
+
+  function setSelectedTask(newTask) {
+    if (!newTask || state.selectedTask === newTask) return;
+    state.selectedTask = newTask;
+    const sel1 = document.getElementById('task-select');
+    if (sel1 && sel1.value !== newTask) sel1.value = newTask;
+    applyActiveTaskAndHorizon(true);
+    _ensureTaskIGIfNeeded();
+  }
+
+  async function _precomputeEarlierFupsInBackground(events, priorFups, maxFup, token) {
+    for (const f of priorFups) {
+      if (state.bgFetchToken !== token) return;
+      if (!state.cohortsByFup[f]) {
+        try {
+          await fetchCohort(f);
+        } catch (err) {
+          console.warn(`[AIIDKIT] Background cohort fetch for FUP ${f} failed:`, err);
         }
       }
+    }
+
+    for (const f of priorFups) {
+      if (state.bgFetchToken !== token) return;
+      try {
+        const predF = await submitPrediction(events, state.selectedHorizon, f, state.selectedTask, maxFup, true);
+        if (state.bgFetchToken !== token) return;
+        state.predictionsByFup[f] = predF;
+        _updateFupBackgroundStatus();
+        if (state.selectedFup === f) {
+          applyActiveTaskAndHorizon(true);
+        }
+      } catch (err) {
+        console.warn(`[AIIDKIT] Background prediction for FUP ${f} failed:`, err);
+      }
+    }
+  }
+
+  async function handleAnalyse(events) {
+    if (!events?.length) {
+      showToast('Please add at least one clinical event.', 'error');
+      return;
+    }
+
+    state.currentPatientRawEvents = events;
+    const { fup: autoFup, maxDay, fupSteps } = calculateAutoFup(events);
+    state.bgFetchToken += 1;
+    const currentToken = state.bgFetchToken;
+
+    state.maxFup = autoFup;
+    state.patientMaxDay = maxDay;
+    state.fupSteps = fupSteps;
+    state.selectedFup = autoFup;
+    state.predictionsByFup = {};
+    state.trajectory = [];
+
+    const loadToast = showToast('Analysing patient sequence…', 'loading', 0);
+
+    try {
+      state.cohort = await fetchCohort(autoFup);
+
+      const result = await submitPrediction(events, state.selectedHorizon, autoFup, state.selectedTask, autoFup, false);
+      if (state.bgFetchToken !== currentToken) return;
+
+      state.prediction = result;
+      state.predictionsByFup[autoFup] = result;
+      state.trajectory = Array.isArray(result.trajectory) ? result.trajectory : [];
+
+      renderFupSliderBar();
+      showResults();
+      applyActiveTaskAndHorizon(false);
 
       if (loadToast) {
         loadToast.style.cssText += 'opacity:0;transform:translateX(40px);transition:opacity 0.3s,transform 0.3s;';
@@ -463,10 +798,13 @@ window.AIIDKIT = (() => {
 
       showToast('Analysis updated!', 'success');
       window.scrollTo({ top: 0, behavior: 'smooth' });
-    } catch (err) {
-      if (loadToast) {
-        loadToast.remove();
+
+      const priorFups = fupSteps.filter(f => f < autoFup).sort((a, b) => b - a);
+      if (priorFups.length > 0) {
+        _precomputeEarlierFupsInBackground(events, priorFups, autoFup, currentToken);
       }
+    } catch (err) {
+      loadToast?.remove();
       showToast(`Analysis failed: ${err.message}`, 'error');
       console.error('[AIIDKIT] Prediction error:', err);
     }
@@ -480,18 +818,13 @@ window.AIIDKIT = (() => {
     const toggleBtn = document.getElementById('theme-toggle');
     if (!toggleBtn) return;
 
-    // Determine initial theme
     const savedTheme = localStorage.getItem('theme');
     const systemPref = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-    const initialTheme = savedTheme || systemPref || 'light';
-
-    // Apply initial theme
-    _setTheme(initialTheme);
+    _setTheme(savedTheme || systemPref || 'light');
 
     toggleBtn.addEventListener('click', () => {
       const currentTheme = document.documentElement.getAttribute('data-theme');
-      const nextTheme = currentTheme === 'light' ? 'dark' : 'light';
-      _setTheme(nextTheme);
+      _setTheme(currentTheme === 'light' ? 'dark' : 'light');
     });
   }
 
@@ -502,14 +835,12 @@ window.AIIDKIT = (() => {
     const toggleBtn = document.getElementById('theme-toggle');
     if (toggleBtn) {
       if (theme === 'light') {
-        // Moon icon + Dark theme text (indicates clicking will switch to dark theme)
         toggleBtn.innerHTML = `
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
           <span>Dark theme</span>
         `;
         toggleBtn.setAttribute('title', 'Switch to dark theme');
       } else {
-        // Sun icon + Light theme text (indicates clicking will switch to light theme)
         toggleBtn.innerHTML = `
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
           <span>Light theme</span>
@@ -518,12 +849,10 @@ window.AIIDKIT = (() => {
       }
     }
 
-    // Update charts tick and grid colors
     window.AIIDKIT_CHARTS?.updateThemeColors?.();
-
-    // Redraw timeline to update text colors
-    if (state.prediction) {
-      renderTimeline(state.prediction.events_with_scores || []);
+    const activePred = getActiveTaskPrediction();
+    if (activePred) {
+      renderTimeline(activePred.events_with_scores || []);
     }
   }
 
@@ -532,45 +861,43 @@ window.AIIDKIT = (() => {
   // ================================================================
 
   function _setupListeners() {
-    [30, 60, 90].forEach(h => {
-      const card = document.getElementById(`horizon-card-${h}`);
-      card?.addEventListener('click', async () => {
-        if (state.selectedHorizon === h) return;
-        state.selectedHorizon = h;
+    document.getElementById('task-select')?.addEventListener('change', (e) => {
+      setSelectedTask(e.target.value);
+    });
 
-        updateRiskScoreCards(
-          state.prediction?.risk_scores,
-          state.prediction?.calibrated_risks,
-          state.selectedHorizon
+    const fupSlider = document.getElementById('fup-slider');
+    fupSlider?.addEventListener('input', (e) => {
+      const idx = parseInt(e.target.value, 10);
+      const targetFup = state.fupSteps[idx];
+      if (targetFup !== undefined && targetFup !== state.selectedFup) {
+        setSelectedFup(targetFup);
+      }
+    });
+
+    const fupTrajToggle = document.getElementById('fup-trajectory-toggle');
+    fupTrajToggle?.addEventListener('click', () => {
+      state.showTrajectory = !state.showTrajectory;
+      fupTrajToggle.classList.toggle('active', state.showTrajectory);
+      const activePred = getActiveTaskPrediction();
+      if (activePred && window.AIIDKIT_CHARTS) {
+        window.AIIDKIT_CHARTS.updateUMAPWithPatient(
+          activePred.umap_x,
+          activePred.umap_y,
+          activePred,
+          state.trajectory,
+          state.selectedFup,
+          state.showTrajectory,
+          (clickedFup) => setSelectedFup(clickedFup)
         );
-
-        const C = window.AIIDKIT_CHARTS;
-        if (state.chartsInitialized && C && state.cohort) {
-          const activeCohort = state.cohort.horizons[state.selectedHorizon];
-          if (activeCohort) {
-            C.initUMAP(activeCohort);
-            if (state.prediction) {
-              C.updateUMAPWithPatient(state.prediction.umap_x, state.prediction.umap_y, state.prediction);
-            }
-            C.updateHistogramData(activeCohort.risk_distribution);
-            C.updateClusterProfiles(activeCohort.cluster_profiles);
-          }
-        }
-
-        const formEvents = window.AIIDKIT_FORM?.getFormEvents?.() || [];
-        if (formEvents.length > 0 && state.prediction) {
-          await handleAnalyse(formEvents, true);
-        }
-      });
+      }
     });
 
-    document.getElementById('header-brand')?.addEventListener('click', () => {
-      resetAnalysis();
-    });
+    document.getElementById('header-brand')?.addEventListener('click', resetAnalysis);
+    document.getElementById('header-new-patient-btn')?.addEventListener('click', resetAnalysis);
+    document.getElementById('reset-analysis-btn')?.addEventListener('click', resetAnalysis);
 
-    document.getElementById('reset-analysis-btn')?.addEventListener('click', () => {
-      resetAnalysis();
-    });
+    document.getElementById('sidebar-collapsed-rail')?.addEventListener('click', () => setSidebarCollapsed(false, true));
+    document.getElementById('sidebar-collapse-btn')?.addEventListener('click', () => setSidebarCollapsed(true, true));
 
     document.getElementById('umap-toggle-cluster')?.addEventListener('click', () =>
       window.AIIDKIT_CHARTS?.toggleUMAPColorMode?.('cluster'));
@@ -579,11 +906,11 @@ window.AIIDKIT = (() => {
     document.getElementById('umap-toggle-imminence')?.addEventListener('click', () =>
       window.AIIDKIT_CHARTS?.toggleUMAPColorMode?.('imminence'));
 
-    // Panel 2 Mode Toggle (List vs Risk Timeline)
+    // Panel 2 Mode Toggle (List vs Risk Timeline — toggle #timeline-graph-outer cleanly!)
     const btnList   = document.getElementById('timeline-toggle-list');
     const btnGraph  = document.getElementById('timeline-toggle-graph');
     const wrapList  = document.getElementById('timeline-list-wrapper');
-    const wrapGraph = document.getElementById('timeline-graph-wrapper');
+    const wrapGraph = document.getElementById('timeline-graph-outer');
 
     btnList?.addEventListener('click', () => {
       btnList.classList.add('active');
@@ -597,10 +924,12 @@ window.AIIDKIT = (() => {
       btnList?.classList.remove('active');
       wrapGraph?.classList.remove('hidden');
       wrapList?.classList.add('hidden');
-      if (state.prediction && state.prediction.events_with_scores) {
+      const activePred = getActiveTaskPrediction();
+      if (activePred && activePred.events_with_scores) {
         window.AIIDKIT_CHARTS?.drawRiskTimelineGraph?.(
-          state.prediction.events_with_scores,
-          state.prediction.risk_score
+          activePred.events_with_scores,
+          activePred.risk_score,
+          state.selectedTask
         );
       }
     });
@@ -613,9 +942,7 @@ window.AIIDKIT = (() => {
         const type = btn.dataset.example;
         clearPredictionResults();
         document.getElementById('tab-btn-form')?.click();
-        if (window.AIIDKIT_FORM?.loadExample) {
-          await window.AIIDKIT_FORM.loadExample(type);
-        }
+        await window.AIIDKIT_FORM?.loadExample?.(type);
       });
     });
   }
@@ -629,11 +956,39 @@ window.AIIDKIT = (() => {
     try {
       _initTheme();
       state.config = await fetchConfig();
+      state.selectedTask = state.config.task || 'infection_bacteria';
+      state.selectedHorizon = state.config.default_horizon || _getAvailableHorizons()[0] || 90;
 
+      if (Array.isArray(state.config.available_tasks) && state.config.available_tasks.length > 0) {
+        const sel = document.getElementById('task-select');
+        if (sel) {
+          const hasGroups = state.config.available_tasks.some(t => t.group);
+          if (hasGroups) {
+            const groups = [];
+            const groupMap = new Map();
+            state.config.available_tasks.forEach(t => {
+              const g = t.group || 'Other';
+              if (!groupMap.has(g)) {
+                groupMap.set(g, []);
+                groups.push(g);
+              }
+              groupMap.get(g).push(t);
+            });
+            sel.innerHTML = groups
+              .map(g => `<optgroup label="${_escHtml(g)}">${groupMap.get(g).map(t => `<option value="${_escHtml(t.key)}">${_escHtml(t.label)}</option>`).join('')}</optgroup>`)
+              .join('');
+          } else {
+            sel.innerHTML = state.config.available_tasks
+              .map(t => `<option value="${_escHtml(t.key)}">${_escHtml(t.label)}</option>`)
+              .join('');
+          }
+          sel.value = state.selectedTask;
+        }
+      }
+
+      renderHorizonCards();
       state.selectedFup = state.config.default_fup || 30;
-
       window.AIIDKIT_FORM?.initForm?.(state.config.vocabulary);
-
       state.cohort = await fetchCohort(state.selectedFup);
 
       _setupListeners();

@@ -8,7 +8,29 @@
 
 window.AIIDKIT_CHARTS = (() => {
 
-  // ---- Fluid font helpers -------------------------------------------
+  // ---- Fluid font & formatting helpers ------------------------------
+  function _escHtml(val) {
+    return String(val ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function _shortHorizonLabel(h) {
+    const n = parseInt(h, 10);
+    if (n >= 360 && n % 360 === 0) return `${n / 360}y`;
+    if (n === 180) return '6m';
+    return `${n}d`;
+  }
+
+  function _scoreTitle(taskKey) {
+    return String(taskKey || 'infection_bacteria').startsWith('infection_')
+      ? 'Infection Score'
+      : 'Risk Score';
+  }
+
   // Returns the current computed root font size in px (tracks CSS clamp).
   function _rootFontSize() {
     return parseFloat(getComputedStyle(document.documentElement).fontSize) || 14;
@@ -25,17 +47,18 @@ window.AIIDKIT_CHARTS = (() => {
 
   // UMAP dot radii — set at initUMAP() from canvas size so they stay
   // visually proportional regardless of screen width/DPI.
-  let _umapDotR  = 4.5;   // normal cohort dots
+  let _umapDotR = 4.5;   // normal cohort dots
   let _umapEventR = 6.5;  // event-positive dots (slightly larger)
   let _umapStarOuter = 13; // new-patient star outer radius
   let _umapStarInner = 5.5; // new-patient star inner radius
 
   // Module-level chart instances (preserved for update calls)
   let _umapG = null, _umapScaleX = null, _umapScaleY = null;
+  let _umapCurScaleX = null, _umapCurScaleY = null;
   let _umapPatientG = null;
   let _umapColorMode = 'cluster';
   let _umapData = [];
-  let _kmChart = null, _attrChart = null, _histChart = null;
+  let _histChart = null;
 
   function _getThemeColors() {
     const isLight = document.documentElement.getAttribute('data-theme') === 'light';
@@ -51,101 +74,49 @@ window.AIIDKIT_CHARTS = (() => {
   // ================================================================
 
   let _umapViewBoxW = 420;
+  let _lastGlobalBounds = null;
+  let _lastPatientData = null;
+  let _lastPatientCoords = null;
+  let _lastTrajectory = null;
+  let _lastSelectedFup = null;
+  let _showTrajectory = true;
+  let _onSelectFupCb = null;
 
-  function initUMAP(cohortData) {
-    const container = document.getElementById('umap-svg-container');
-    if (!container) return;
-    container.innerHTML = '';
-    _umapData = cohortData.patients || [];
+  function _computeDotFill(d, mode) {
+    if (mode === 'cluster') return d.cluster_color || '#888';
+    if (mode === 'risk') {
+      const t = d.risk_score;
+      if (t < 0.5) {
+        const u = t * 2;
+        return `rgb(${Math.round(79 + 176 * u)},${Math.round(142 + 23 * u)},${Math.round(247 - 245 * u)})`;
+      } else {
+        const u = (t - 0.5) * 2;
+        return `rgb(255,${Math.round(165 - 94 * u)},${Math.round(2 + 85 * u)})`;
+      }
+    }
+    if (mode === 'imminence') {
+      const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+      const startColor = isLight ? [200, 200, 200] : [120, 130, 150];
+      const endColor = [255, 71, 87];
+      const imminence = d.event_imminence || 0.0;
+      const r = Math.round(startColor[0] + (endColor[0] - startColor[0]) * imminence);
+      const g = Math.round(startColor[1] + (endColor[1] - startColor[1]) * imminence);
+      const b = Math.round(startColor[2] + (endColor[2] - startColor[2]) * imminence);
+      return `rgb(${r},${g},${b})`;
+    }
+    return d.cluster_color || '#888';
+  }
 
-    const W = container.clientWidth  || 420;
-    const H = container.clientHeight || 300;
-    _umapViewBoxW = W;
-    // Match legend width used by _drawUMAPLegend so clip region is consistent
-    const _legW = Math.round(_rootFontSize() * 7.5);
-    const m = { top: 14, right: _legW + 14, bottom: 14, left: 14 };
-    const iW = W - m.left - m.right;
-    const iH = H - m.top  - m.bottom;
-
-    // Dot radii: scale with iH so dots stay visually consistent at any viewport width.
-    // The chart row has a fixed CSS height (~480px), so iH is roughly stable, giving
-    // similar-looking dots at 1080p, 1440p, and 4K.  Clamped to avoid extremes.
-    _umapDotR    = Math.max(3.5, Math.min(7,  iH * 0.012));
-    _umapEventR  = Math.max(5.0, Math.min(10, iH * 0.016));
-    _umapStarOuter = Math.max(11, Math.min(18, iH * 0.034));
-    _umapStarInner = _umapStarOuter * 0.42;
-
-    const xs = _umapData.map(d => d.umap_x);
-    const ys = _umapData.map(d => d.umap_y);
-    const px = (d3.max(xs) - d3.min(xs)) * 0.08;
-    const py = (d3.max(ys) - d3.min(ys)) * 0.08;
-
-    _umapScaleX = d3.scaleLinear().domain([d3.min(xs) - px, d3.max(xs) + px]).range([0, iW]);
-    _umapScaleY = d3.scaleLinear().domain([d3.min(ys) - py, d3.max(ys) + py]).range([iH, 0]);
-
-    const svg = d3.select(container)
-      .append('svg')
-      .attr('viewBox', `0 0 ${W} ${H}`)
-      .attr('width', '100%').attr('height', '100%');
-
-    svg.append('rect').attr('width', W).attr('height', H).attr('fill', 'var(--umap-bg)');
-
-    svg.append('defs').append('clipPath').attr('id', 'umap-clip')
-      .append('rect').attr('x', -15).attr('y', -15).attr('width', iW + 30).attr('height', iH + 30);
-
-    _umapG = svg.append('g').attr('transform', `translate(${m.left},${m.top})`);
-    const ptG = _umapG.append('g').attr('clip-path', 'url(#umap-clip)').attr('class', 'pts');
-
-    const zoom = d3.zoom().scaleExtent([0.4, 12]).on('zoom', ev => {
-      ptG.attr('transform', ev.transform);
-      if (_umapPatientG) _umapPatientG.attr('transform', ev.transform);
-    });
-    svg.call(zoom);
-
-    const tip = d3.select(container).append('div').attr('class', 'umap-tooltip');
-
-    ptG.selectAll('circle')
-      .data(_umapData.sort((a, b) => (a.true_label || 0) - (b.true_label || 0)), d => d.id)
-      .join('circle')
-      .attr('class', 'umap-pt')
-      .attr('cx', d => _umapScaleX(d.umap_x))
-      .attr('cy', d => _umapScaleY(d.umap_y))
-      .attr('r',  d => d.true_label === 1 ? _umapEventR : _umapDotR)
-      .attr('fill', d => {
-        if (_umapColorMode === 'cluster') return d.cluster_color || '#888';
-        if (_umapColorMode === 'risk') {
-          const t = d.risk_score;
-          if (t < 0.5) {
-            const u = t * 2;
-            return `rgb(${Math.round(79 + 176 * u)},${Math.round(142 + 23 * u)},${Math.round(247 - 245 * u)})`;
-          } else {
-            const u = (t - 0.5) * 2;
-            return `rgb(255,${Math.round(165 - 94 * u)},${Math.round(2 + 85 * u)})`;
-          }
-        }
-        if (_umapColorMode === 'imminence') {
-          const isLight = document.documentElement.getAttribute('data-theme') === 'light';
-          const startColor = isLight ? [200, 200, 200] : [120, 130, 150];
-          const endColor = [255, 71, 87]; // #FF4757 (red)
-          const imminence = d.event_imminence || 0.0;
-          const r = Math.round(startColor[0] + (endColor[0] - startColor[0]) * imminence);
-          const g = Math.round(startColor[1] + (endColor[1] - startColor[1]) * imminence);
-          const b = Math.round(startColor[2] + (endColor[2] - startColor[2]) * imminence);
-          return `rgb(${r},${g},${b})`;
-        }
-        return d.cluster_color || '#888';
-      })
-      .attr('opacity', d => d.true_label === 1 ? 1.0 : 0.65)
-      .attr('stroke', d => d.true_label === 1 ? (document.documentElement.getAttribute('data-theme') === 'light' ? '#475569' : '#ffffff') : 'none')
-      .attr('stroke-width', d => d.true_label === 1 ? 1.8 : 0)
+  function _bindUMAPDotEvents(selection, container, tip) {
+    selection
       .style('cursor', 'pointer')
-      .on('mouseover', function(ev, d) {
+      .on('mouseover', function (ev, d) {
         d3.select(this).attr('opacity', 1).attr('r', d.true_label === 1 ? _umapEventR * 1.25 : _umapDotR * 1.45);
-        const bx  = container.getBoundingClientRect();
+        const bx = container.getBoundingClientRect();
         const tipW = 195;
-        const ex   = ev.clientX - bx.left;
-        const ey   = ev.clientY - bx.top;
-        
+        const ex = ev.clientX - bx.left;
+        const ey = ev.clientY - bx.top;
+
         let summaryLine = '';
         if (d.days_to_event !== undefined && d.days_to_event !== null) {
           summaryLine = `Next event: ${d.days_to_event} days`;
@@ -155,33 +126,186 @@ window.AIIDKIT_CHARTS = (() => {
         } else {
           summaryLine = 'No event observed';
         }
-        
+
         let featuresHtml = '';
         if (d.summary && d.summary !== 'Stable course' && d.summary !== 'Standard profile') {
-          featuresHtml = `<div class="tooltip-features" style="font-size:0.65rem;color:var(--text-muted);margin-top:2px;">Features: ${d.summary}</div>`;
+          featuresHtml = `<div class="tooltip-features" style="font-size:0.65rem;color:var(--text-muted);margin-top:2px;">Features: ${_escHtml(d.summary)}</div>`;
         }
 
         tip.classed('visible', true)
           .style('left', `${ex + tipW > bx.width ? ex - tipW - 8 : ex + 10}px`)
-          .style('top',  `${ey - 12}px`)
+          .style('top', `${ey - 12}px`)
           .html(`
-            <div class="tooltip-id">${d.id}</div>
-            <div class="tooltip-risk">Score: <strong style="color:${d.cluster_color}">${Math.round(d.risk_score * 100)}/100</strong></div>
-            <div class="tooltip-risk" style="font-size: 0.65rem; color: var(--text-muted);">Risk: ${d.calibrated_risk != null ? (d.calibrated_risk * 100).toFixed(1) + '%' : (d.risk_score * 100).toFixed(1) + '%'}</div>
-            <div class="tooltip-cluster" style="color:${d.cluster_color}">${d.cluster_name}</div>
+            <div class="tooltip-id">${_escHtml(d.id)}</div>
+            <div class="tooltip-risk">Score: <strong style="color:${_escHtml(d.cluster_color)}">${Math.round(d.risk_score * 100)}/100</strong></div>
+            <div class="tooltip-risk" style="font-size: 0.65rem; color: var(--text-muted);">Prob: ${d.calibrated_risk != null ? (d.calibrated_risk * 100).toFixed(1) + '%' : (d.risk_score * 100).toFixed(1) + '%'}</div>
+            <div class="tooltip-cluster" style="color:${_escHtml(d.cluster_color)}">${_escHtml(d.cluster_name)}</div>
             <div class="tooltip-summary" style="font-weight: 600;">${summaryLine}</div>
             ${featuresHtml}
           `);
       })
-      .on('mouseout', function(ev, d) {
+      .on('mouseout', function (ev, d) {
         d3.select(this).attr('opacity', d.true_label === 1 ? 1.0 : 0.65).attr('r', d.true_label === 1 ? _umapEventR : _umapDotR);
         tip.classed('visible', false);
       });
+  }
+
+  function initUMAP(cohortData, globalBounds) {
+    const container = document.getElementById('umap-svg-container');
+    if (!container) return;
+    container.innerHTML = '';
+    _umapData = cohortData.patients || [];
+    if (globalBounds) _lastGlobalBounds = globalBounds;
+
+    const W = container.clientWidth || 420;
+    const H = container.clientHeight || 260;
+    _umapViewBoxW = W;
+    const _legW = Math.round(_rootFontSize() * 7.8);
+    const m = { top: 14, right: _legW + 14, bottom: 14, left: 14 };
+    const iW = W - m.left - m.right;
+    const iH = H - m.top - m.bottom;
+
+    _umapDotR = Math.max(3.5, Math.min(7, iH * 0.012));
+    _umapEventR = Math.max(5.0, Math.min(10, iH * 0.016));
+    _umapStarOuter = Math.max(11, Math.min(18, iH * 0.034));
+    _umapStarInner = _umapStarOuter * 0.42;
+
+    const bounds = _lastGlobalBounds || cohortData.global_umap_bounds;
+    const xs = _umapData.map(d => d.umap_x);
+    const ys = _umapData.map(d => d.umap_y);
+    const minX = bounds?.min_x != null ? Math.min(bounds.min_x, d3.min(xs) ?? bounds.min_x) : d3.min(xs);
+    const maxX = bounds?.max_x != null ? Math.max(bounds.max_x, d3.max(xs) ?? bounds.max_x) : d3.max(xs);
+    const minY = bounds?.min_y != null ? Math.min(bounds.min_y, d3.min(ys) ?? bounds.min_y) : d3.min(ys);
+    const maxY = bounds?.max_y != null ? Math.max(bounds.max_y, d3.max(ys) ?? bounds.max_y) : d3.max(ys);
+    const px = ((maxX - minX) || 1) * 0.09;
+    const py = ((maxY - minY) || 1) * 0.09;
+
+    _umapScaleX = d3.scaleLinear().domain([minX - px, maxX + px]).range([0, iW]);
+    _umapScaleY = d3.scaleLinear().domain([minY - py, maxY + py]).range([iH, 0]);
+    _umapCurScaleX = _umapScaleX;
+    _umapCurScaleY = _umapScaleY;
+
+    const svg = d3.select(container)
+      .append('svg')
+      .attr('viewBox', `0 0 ${W} ${H}`)
+      .attr('width', '100%').attr('height', '100%');
+
+    svg.append('rect').attr('width', W).attr('height', H).attr('fill', 'var(--umap-bg)');
+
+    const defs = svg.append('defs');
+    defs.append('clipPath').attr('id', 'umap-clip')
+      .append('rect').attr('x', -15).attr('y', -15).attr('width', iW + 30).attr('height', iH + 30);
+
+    // Arrowhead marker for patient longitudinal trajectory segments
+    defs.append('marker')
+      .attr('id', 'umap-traj-arrow')
+      .attr('viewBox', '0 -4 8 8')
+      .attr('refX', 7)
+      .attr('refY', 0)
+      .attr('markerWidth', 5.5)
+      .attr('markerHeight', 5.5)
+      .attr('orient', 'auto')
+      .append('path')
+      .attr('d', 'M0,-3.2L7,0L0,3.2Z')
+      .attr('fill', '#F59E0B');
+
+    _umapG = svg.append('g').attr('transform', `translate(${m.left},${m.top})`);
+    const ptG = _umapG.append('g').attr('clip-path', 'url(#umap-clip)').attr('class', 'pts');
+
+    // Semantic zoom: rescales X/Y coordinates without scaling dot radii, stars, or text
+    const zoom = d3.zoom().scaleExtent([0.4, 20]).on('zoom', ev => {
+      _umapCurScaleX = ev.transform.rescaleX(_umapScaleX);
+      _umapCurScaleY = ev.transform.rescaleY(_umapScaleY);
+      ptG.selectAll('circle.umap-pt')
+        .attr('cx', d => _umapCurScaleX(d.umap_x))
+        .attr('cy', d => _umapCurScaleY(d.umap_y));
+      if (_umapPatientG) {
+        _umapPatientG.selectAll('line.umap-traj-seg')
+          .attr('x1', d => _umapCurScaleX(d.p1.umap_x))
+          .attr('y1', d => _umapCurScaleY(d.p1.umap_y))
+          .attr('x2', d => _umapCurScaleX(d.p2.umap_x))
+          .attr('y2', d => _umapCurScaleY(d.p2.umap_y));
+        _umapPatientG.selectAll('g.umap-traj-milestone')
+          .attr('transform', d => `translate(${_umapCurScaleX(d.umap_x)},${_umapCurScaleY(d.umap_y)})`);
+        _umapPatientG.selectAll('g.umap-active-star')
+          .attr('transform', d => `translate(${_umapCurScaleX(d.umapX)},${_umapCurScaleY(d.umapY)})`);
+        _umapPatientG.selectAll('circle.umap-pulse-circle')
+          .attr('cx', d => _umapCurScaleX(d.umapX))
+          .attr('cy', d => _umapCurScaleY(d.umapY));
+      }
+    });
+    svg.call(zoom);
+
+    const tip = d3.select(container).append('div').attr('class', 'umap-tooltip');
+    const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+
+    const circles = ptG.selectAll('circle.umap-pt')
+      .data([..._umapData].sort((a, b) => (a.true_label || 0) - (b.true_label || 0)), d => d.id)
+      .join('circle')
+      .attr('class', 'umap-pt')
+      .attr('cx', d => _umapCurScaleX(d.umap_x))
+      .attr('cy', d => _umapCurScaleY(d.umap_y))
+      .attr('r', d => d.true_label === 1 ? _umapEventR : _umapDotR)
+      .attr('fill', d => _computeDotFill(d, _umapColorMode))
+      .attr('opacity', d => d.true_label === 1 ? 1.0 : 0.65)
+      .attr('stroke', d => d.true_label === 1 ? (isLight ? '#475569' : '#ffffff') : 'none')
+      .attr('stroke-width', d => d.true_label === 1 ? 1.8 : 0);
+
+    _bindUMAPDotEvents(circles, container, tip);
 
     _umapPatientG = _umapG.append('g').attr('clip-path', 'url(#umap-clip)');
     if (_lastPatientCoords) {
       updateUMAPWithPatient();
     }
+    _drawUMAPLegend(_umapColorMode);
+  }
+
+  function updateUMAPCohort(cohortData, globalBounds) {
+    if (!cohortData) return;
+    if (globalBounds) _lastGlobalBounds = globalBounds;
+    if (!_umapG || !_umapScaleX || !_umapScaleY) {
+      initUMAP(cohortData, globalBounds);
+      return;
+    }
+    const sx = _umapCurScaleX || _umapScaleX;
+    const sy = _umapCurScaleY || _umapScaleY;
+    _umapData = cohortData.patients || [];
+    const container = document.getElementById('umap-svg-container');
+    if (!container) return;
+    let tip = d3.select(container).select('.umap-tooltip');
+    if (tip.empty()) {
+      tip = d3.select(container).append('div').attr('class', 'umap-tooltip');
+    }
+
+    const ptG = _umapG.select('g.pts');
+    const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+    const strokeCol = isLight ? '#475569' : '#ffffff';
+
+    const joined = ptG.selectAll('circle.umap-pt')
+      .data([..._umapData].sort((a, b) => (a.true_label || 0) - (b.true_label || 0)), d => d.id)
+      .join(
+        enter => enter.append('circle')
+          .attr('class', 'umap-pt')
+          .attr('cx', d => sx(d.umap_x))
+          .attr('cy', d => sy(d.umap_y))
+          .attr('r', 0)
+          .attr('fill', d => _computeDotFill(d, _umapColorMode))
+          .attr('opacity', 0),
+        update => update,
+        exit => exit.transition().duration(250).attr('r', 0).attr('opacity', 0).remove()
+      );
+
+    _bindUMAPDotEvents(joined, container, tip);
+
+    joined.transition().duration(380).ease(d3.easeCubicOut)
+      .attr('cx', d => sx(d.umap_x))
+      .attr('cy', d => sy(d.umap_y))
+      .attr('r', d => d.true_label === 1 ? _umapEventR : _umapDotR)
+      .attr('fill', d => _computeDotFill(d, _umapColorMode))
+      .attr('opacity', d => d.true_label === 1 ? 1.0 : 0.65)
+      .attr('stroke', d => d.true_label === 1 ? strokeCol : 'none')
+      .attr('stroke-width', d => d.true_label === 1 ? 1.8 : 0);
+
     _drawUMAPLegend(_umapColorMode);
   }
 
@@ -199,22 +323,18 @@ window.AIIDKIT_CHARTS = (() => {
       viewBoxW = svgNode.viewBox.baseVal.width;
     }
 
-    // Legend box width scales with root font so text never clips on 4K
-    const legW = Math.round(_rootFontSize() * 7.5);
+    const legW = Math.round(_rootFontSize() * 7.8);
 
-    // ---- Sizing -------------------------------------------------------
-    const legDotR      = _umapDotR;           // matches scatter dot size
-    const legStarOuter = legDotR * 1.3;       // star slightly larger (original ratio)
+    const legDotR = _umapDotR;
+    const legStarOuter = legDotR * 1.3;
     const legStarInner = legStarOuter * 0.42;
-    const legFontPx    = _scaledPx(0.68);     // px value for SVG font-size attr
+    const legFontPx = _scaledPx(0.68);
 
-    // Row height must fit the tallest symbol (star) plus a small gap
-    const rowH = Math.max(legStarOuter * 2 + 6, _scaledPx(1.6));
-    const cy   = rowH / 2;              // vertical centre for every row
-    const symX = legStarOuter + 3;      // horizontal centre for all symbols
-    const textX = symX + legStarOuter + 7; // text starts after widest symbol
+    const rowH = Math.max(legStarOuter * 2 + 6, _scaledPx(1.55));
+    const cy = rowH / 2;
+    const symX = legStarOuter + 3;
+    const textX = symX + legStarOuter + 7;
 
-    // Determine all items
     const isLight = document.documentElement.getAttribute('data-theme') === 'light';
     const strokeColor = isLight ? '#475569' : '#ffffff';
 
@@ -227,35 +347,33 @@ window.AIIDKIT_CHARTS = (() => {
       if (hasMedium) {
         colorItems.push({ label: 'Medium risk', color: '#FFA502' });
       }
-      colorItems.push({ label: 'Low risk',  color: '#00C9A7' });
+      colorItems.push({ label: 'Low risk', color: '#00C9A7' });
     } else if (mode === 'risk') {
       colorItems = [
         { label: 'High risk', color: '#FF4757' },
-        { label: 'Low risk',  color: '#4F8EF7' },
+        { label: 'Low risk', color: '#4F8EF7' },
       ];
     } else if (mode === 'imminence') {
       colorItems = [
-        { label: 'Close',      color: '#FF4757' },
+        { label: 'Close', color: '#FF4757' },
         { label: 'Distant/No', color: '#7C8DB5' },
       ];
     }
 
-    const numRows   = colorItems.length + 2;  // + "Event observed" + "New patient"
-    const legHeight = numRows * rowH + 8;     // 4px top + 4px bottom padding
+    const hasTraj = _showTrajectory && Array.isArray(_lastTrajectory) && _lastTrajectory.length > 1;
+    const numRows = colorItems.length + 2 + (hasTraj ? 1 : 0);
+    const legHeight = numRows * rowH + 8;
 
-    // ---- Legend group anchored to top-right corner of viewBox -------
     const lg = svg.append('g')
       .attr('class', 'umap-legend-group')
       .attr('transform', `translate(${viewBoxW - legW - 10}, 18)`);
 
-    // Background rect (computed height so nothing is clipped)
     lg.append('rect')
       .attr('x', -4).attr('y', -4)
       .attr('width', legW).attr('height', legHeight)
       .attr('rx', 6)
       .attr('fill', 'var(--legend-bg)').attr('stroke', 'var(--legend-border)');
 
-    // Helper: append a text label centred on cy
     function _legText(parent, label) {
       parent.append('text')
         .attr('x', textX).attr('y', cy)
@@ -266,7 +384,6 @@ window.AIIDKIT_CHARTS = (() => {
         .text(label);
     }
 
-    // Colour rows (high/low risk or equivalent)
     colorItems.forEach((e, i) => {
       const g = lg.append('g').attr('transform', `translate(0,${i * rowH})`);
       g.append('circle')
@@ -275,7 +392,6 @@ window.AIIDKIT_CHARTS = (() => {
       _legText(g, e.label);
     });
 
-    // "Event observed" row — bordered circle
     const evRow = lg.append('g').attr('transform', `translate(0,${colorItems.length * rowH})`);
     evRow.append('circle')
       .attr('cx', symX).attr('cy', cy).attr('r', legDotR)
@@ -283,71 +399,63 @@ window.AIIDKIT_CHARTS = (() => {
       .attr('stroke', strokeColor).attr('stroke-width', 1.8);
     _legText(evRow, 'Event observed');
 
-    // "New patient" row — golden star
     const stRow = lg.append('g').attr('transform', `translate(0,${(colorItems.length + 1) * rowH})`);
     stRow.append('path')
       .attr('d', _starPath(symX, cy, legStarOuter, legStarInner, 5))
       .attr('fill', '#FFD700').attr('stroke', 'none');
-    _legText(stRow, 'New patient');
+    _legText(stRow, 'Active stage');
+
+    if (hasTraj) {
+      const trRow = lg.append('g').attr('transform', `translate(0,${(colorItems.length + 2) * rowH})`);
+      trRow.append('line')
+        .attr('x1', symX - legStarOuter).attr('x2', symX + legStarOuter)
+        .attr('y1', cy).attr('y2', cy)
+        .attr('stroke', '#F59E0B').attr('stroke-width', 2.2);
+      trRow.append('circle')
+        .attr('cx', symX).attr('cy', cy).attr('r', Math.max(2.5, legDotR * 0.68))
+        .attr('fill', '#FFD700').attr('stroke', strokeColor).attr('stroke-width', 1.2);
+      _legText(trRow, 'Patient course');
+    }
   }
 
-
-  let _lastPatientData   = null;
-  let _lastPatientCoords = null;
-
-  function updateUMAPWithPatient(umapX, umapY, patientData) {
+  function updateUMAPWithPatient(umapX, umapY, patientData, trajectory, selectedFup, showTrajectory, onSelectFup) {
     if (umapX != null && umapY != null) {
       _lastPatientCoords = { umapX, umapY };
     }
     if (patientData) {
       _lastPatientData = patientData;
     }
-    
+    if (Array.isArray(trajectory)) {
+      _lastTrajectory = trajectory;
+    }
+    if (selectedFup != null) {
+      _lastSelectedFup = selectedFup;
+    }
+    if (typeof showTrajectory === 'boolean') {
+      _showTrajectory = showTrajectory;
+    }
+    if (typeof onSelectFup === 'function') {
+      _onSelectFupCb = onSelectFup;
+    }
+
     const activeCoords = _lastPatientCoords || (patientData ? { umapX: patientData.umap_x, umapY: patientData.umap_y } : null);
-    const activeData   = patientData || _lastPatientData;
+    const activeData = patientData || _lastPatientData;
+    const activeTraj = _lastTrajectory || activeData?.trajectory || [];
+    const activeFup = _lastSelectedFup != null ? _lastSelectedFup : (activeData?.fup ?? 0);
 
     if (!activeCoords || !_umapPatientG || !_umapScaleX || !_umapScaleY) return;
 
-    const px = _umapScaleX(activeCoords.umapX);
-    const py = _umapScaleY(activeCoords.umapY);
+    const sx = _umapCurScaleX || _umapScaleX;
+    const sy = _umapCurScaleY || _umapScaleY;
+    const px = sx(activeCoords.umapX);
+    const py = sy(activeCoords.umapY);
     _umapPatientG.selectAll('*').remove();
     _umapPatientG.raise();
 
-    // Scale pulse circle and star with canvas-derived sizes stored at initUMAP
-    const pulseR   = _umapStarOuter * 1.08;
-    const pulseEnd = _umapStarOuter * 2.5;
-
-    _umapPatientG.append('circle')
-      .attr('cx', px).attr('cy', py).attr('r', pulseR)
-      .attr('fill', 'none').attr('stroke', '#FFD700').attr('stroke-width', 2)
-      .attr('opacity', 0.8)
-      .transition().duration(1200).ease(d3.easeExpOut)
-      .attr('r', pulseEnd).attr('opacity', 0);
-
     const isLight = document.documentElement.getAttribute('data-theme') === 'light';
-    const starStroke = isLight ? '#475569' : '#ffffff';
-
-    const starGroup = _umapPatientG.append('g')
-      .style('cursor', 'pointer')
-      .attr('pointer-events', 'all');
-
-    // Generous invisible hit target circle (r = 22px) for smooth hover detection
-    starGroup.append('circle')
-      .attr('cx', px)
-      .attr('cy', py)
-      .attr('r', 22)
-      .attr('fill', 'transparent')
-      .attr('pointer-events', 'all');
-
-    const starNode = starGroup.append('path')
-      .attr('d', _starPath(px, py, _umapStarOuter * 1.4, _umapStarInner * 1.4, 5))
-      .attr('fill', '#FFD700')
-      .attr('stroke', starStroke)
-      .attr('stroke-width', 2)
-      .attr('opacity', 0)
-      .attr('pointer-events', 'none');
-
-    starNode.transition().duration(450).attr('opacity', 1);
+    const starStroke = isLight ? '#1E293B' : '#ffffff';
+    const haloStroke = isLight ? 'rgba(255,255,255,0.88)' : 'rgba(15,17,21,0.88)';
+    const pathColor = isLight ? '#D97706' : '#FBBF24';
 
     const container = document.getElementById('umap-svg-container');
     if (!container) return;
@@ -356,23 +464,197 @@ window.AIIDKIT_CHARTS = (() => {
       tip = d3.select(container).append('div').attr('class', 'umap-tooltip');
     }
 
+    // 1. Draw longitudinal patient trajectory across FUP landmarks if enabled
+    if (_showTrajectory && activeTraj.length > 1) {
+      const trajG = _umapPatientG.append('g').attr('class', 'umap-trajectory-layer');
+
+      // Draw segment-by-segment lines (solid up to activeFup, dashed after activeFup)
+      for (let i = 0; i < activeTraj.length - 1; i++) {
+        const p1 = activeTraj[i];
+        const p2 = activeTraj[i + 1];
+        const x1 = sx(p1.umap_x);
+        const y1 = sy(p1.umap_y);
+        const x2 = sx(p2.umap_x);
+        const y2 = sy(p2.umap_y);
+        const isPast = p2.fup <= activeFup;
+
+        // Subtle high-contrast halo under segment
+        trajG.append('line')
+          .datum({ p1, p2 })
+          .attr('class', 'umap-traj-seg')
+          .attr('x1', x1).attr('y1', y1)
+          .attr('x2', x2).attr('y2', y2)
+          .attr('stroke', haloStroke)
+          .attr('stroke-width', isPast ? 5.2 : 3.8)
+          .attr('stroke-linecap', 'round')
+          .attr('opacity', isPast ? 0.75 : 0.45);
+
+        trajG.append('line')
+          .datum({ p1, p2 })
+          .attr('class', 'umap-traj-seg')
+          .attr('x1', x1).attr('y1', y1)
+          .attr('x2', x2).attr('y2', y2)
+          .attr('stroke', pathColor)
+          .attr('stroke-width', isPast ? 2.6 : 1.9)
+          .attr('stroke-dasharray', isPast ? 'none' : '4,4')
+          .attr('stroke-linecap', 'round')
+          .attr('opacity', isPast ? 0.95 : 0.65)
+          .attr('marker-end', isPast ? 'url(#umap-traj-arrow)' : null);
+      }
+
+      // Draw clickable milestone nodes at each non-active FUP landmark
+      activeTraj.forEach(pt => {
+        if (pt.fup === activeFup) return;
+        const mx = sx(pt.umap_x);
+        const my = sy(pt.umap_y);
+        const isPast = pt.fup < activeFup;
+        const nodeR = Math.max(4.8, _umapDotR * 1.15);
+
+        const mGroup = trajG.append('g')
+          .datum(pt)
+          .attr('class', 'umap-traj-milestone')
+          .attr('transform', `translate(${mx},${my})`)
+          .style('cursor', 'pointer')
+          .attr('pointer-events', 'all');
+
+        // Hit target
+        mGroup.append('circle')
+          .attr('cx', 0).attr('cy', 0).attr('r', 15)
+          .attr('fill', 'transparent');
+
+        const mCircle = mGroup.append('circle')
+          .attr('cx', 0).attr('cy', 0)
+          .attr('r', nodeR)
+          .attr('fill', isPast ? '#FFD700' : (isLight ? '#FFFFFF' : '#1E222B'))
+          .attr('stroke', isPast ? starStroke : pathColor)
+          .attr('stroke-width', 2)
+          .attr('opacity', isPast ? 0.95 : 0.78);
+
+        // Compact day label next to milestone node
+        const lblText = `${pt.fup}d`;
+        mGroup.append('text')
+          .attr('x', 0)
+          .attr('y', -nodeR - 5)
+          .attr('text-anchor', 'middle')
+          .attr('font-family', "'Inter', sans-serif")
+          .attr('font-size', `${_scaledPx(0.60)}px`)
+          .attr('font-weight', '700')
+          .attr('fill', isLight ? '#111827' : '#F3F4F6')
+          .attr('stroke', haloStroke)
+          .attr('stroke-width', 3)
+          .attr('paint-order', 'stroke')
+          .text(lblText);
+
+        mGroup
+          .on('mouseenter mouseover', function (ev) {
+            mCircle.attr('r', nodeR * 1.3).attr('stroke-width', 2.8);
+            const bx = container.getBoundingClientRect();
+            const tipW = 215;
+            const ex = ev.clientX - bx.left;
+            const ey = ev.clientY - bx.top;
+            const pData = activeData || {};
+            const activeTask = pData.task || 'infection_bacteria';
+            const activeHorizon = pData.selected_horizon || 90;
+            const hKey = `${activeHorizon}d`;
+            const stTask = pt.tasks?.[activeTask];
+            const stScore = stTask?.risk_scores?.[hKey] != null ? Math.round(stTask.risk_scores[hKey] * 100) : '—';
+            const stCalib = stTask?.calibrated_risks?.[hKey] != null ? (stTask.calibrated_risks[hKey] * 100).toFixed(1) + '%' : '—';
+
+            tip.classed('visible', true)
+              .style('left', `${ex + tipW > bx.width ? ex - tipW - 10 : ex + 12}px`)
+              .style('top', `${ey - 15}px`)
+              .html(`
+                <div class="tooltip-id" style="color:#F59E0B; font-weight:700; font-size:0.76rem;">● Patient at Day ${pt.fup}</div>
+                <div class="tooltip-risk" style="font-size:0.72rem;">${_scoreTitle(activeTask)}: <strong>${stScore}/100</strong> <span style="font-size:0.65rem; opacity:0.8;">(${_shortHorizonLabel(activeHorizon)})</span></div>
+                <div class="tooltip-risk" style="font-size:0.66rem; color:var(--text-muted);">Calibrated prob: ${stCalib} · ${pt.n_events ?? '—'} events</div>
+                <div class="tooltip-summary" style="font-weight:600; margin-top:3px; font-size:0.66rem; color:var(--accent);">Click to inspect Day ${pt.fup} stage</div>
+              `);
+          })
+          .on('mouseleave mouseout', function () {
+            mCircle.attr('r', nodeR).attr('stroke-width', 2);
+            tip.classed('visible', false);
+          })
+          .on('click', function (ev) {
+            ev.stopPropagation();
+            tip.classed('visible', false);
+            if (typeof _onSelectFupCb === 'function') {
+              _onSelectFupCb(pt.fup);
+            }
+          });
+      });
+    }
+
+    // 2. Draw pulsing halo and golden star at the active FUP stage
+    const pulseR = _umapStarOuter * 1.08;
+    const pulseEnd = _umapStarOuter * 2.5;
+
+    _umapPatientG.append('circle')
+      .datum(activeCoords)
+      .attr('class', 'umap-pulse-circle')
+      .attr('cx', px).attr('cy', py).attr('r', pulseR)
+      .attr('fill', 'none').attr('stroke', '#FFD700').attr('stroke-width', 2)
+      .attr('opacity', 0.8)
+      .transition().duration(1000).ease(d3.easeExpOut)
+      .attr('r', pulseEnd).attr('opacity', 0);
+
+    const starGroup = _umapPatientG.append('g')
+      .datum(activeCoords)
+      .attr('class', 'umap-active-star')
+      .attr('transform', `translate(${px},${py})`)
+      .style('cursor', 'pointer')
+      .attr('pointer-events', 'all');
+
+    starGroup.append('circle')
+      .attr('cx', 0)
+      .attr('cy', 0)
+      .attr('r', 22)
+      .attr('fill', 'transparent')
+      .attr('pointer-events', 'all');
+
+    const starNode = starGroup.append('path')
+      .attr('d', _starPath(0, 0, _umapStarOuter * 1.4, _umapStarInner * 1.4, 5))
+      .attr('fill', '#FFD700')
+      .attr('stroke', starStroke)
+      .attr('stroke-width', 2)
+      .attr('opacity', 0)
+      .attr('pointer-events', 'none');
+
+    starNode.transition().duration(350).attr('opacity', 1);
+
+    if (activeTraj.length > 1) {
+      starGroup.append('text')
+        .attr('x', 0)
+        .attr('y', -_umapStarOuter * 1.4 - 5)
+        .attr('text-anchor', 'middle')
+        .attr('font-family', "'Plus Jakarta Sans', 'Inter', sans-serif")
+        .attr('font-size', `${_scaledPx(0.65)}px`)
+        .attr('font-weight', '800')
+        .attr('fill', isLight ? '#B45309' : '#FFD700')
+        .attr('stroke', haloStroke)
+        .attr('stroke-width', 3.5)
+        .attr('paint-order', 'stroke')
+        .attr('pointer-events', 'none')
+        .text(`Day ${activeFup}`);
+    }
+
     starGroup
-      .on('mouseenter mouseover', function(ev) {
+      .on('mouseenter mouseover', function (ev) {
         starNode.attr('stroke-width', 3.5);
         const bx = container.getBoundingClientRect();
-        const tipW = 230;
+        const tipW = 235;
         const ex = ev.clientX - bx.left;
         const ey = ev.clientY - bx.top;
 
         const pData = activeData || {};
+        const activeTask = pData.task || 'infection_bacteria';
         const activeHorizon = pData.selected_horizon || 90;
         const horizonKey = `${activeHorizon}d`;
         const scoreVal = pData.risk_scores?.[horizonKey] ?? pData.risk_score ?? 0;
         const scoreInt = Math.round(scoreVal * 100);
-        const catName = pData.risk_category || pData.cluster_name || 'Active Patient';
-        const catColor = pData.risk_color || pData.cluster_color || (catName === 'Medium risk' ? '#FFA502' : catName === 'Low risk' ? '#00C9A7' : '#FF4757');
-        const horizonLabel = `${activeHorizon}-day`;
-        
+        const catName = _escHtml(pData.risk_category || pData.cluster_name || 'Active Patient');
+        const catColor = _escHtml(pData.risk_color || pData.cluster_color || (catName === 'Medium risk' ? '#FFA502' : catName === 'Low risk' ? '#00C9A7' : '#FF4757'));
+        const horizonLabel = _shortHorizonLabel(activeHorizon);
+
         let nextEv = 'Stable course (no imminent event)';
         if (pData.days_to_event != null) {
           nextEv = `Next event: ~${pData.days_to_event} days`;
@@ -380,25 +662,30 @@ window.AIIDKIT_CHARTS = (() => {
 
         let summaryHtml = '';
         if (pData.events_with_scores && pData.events_with_scores.length > 0) {
-          const topEvs = pData.events_with_scores.slice(0, 3).map(e => `${e.entity || ''}: ${e.attribute || ''} (${e.value || ''})`).join('<br>');
-          summaryHtml = `<div class="tooltip-features" style="font-size:0.65rem;color:var(--text-muted);margin-top:4px;line-height:1.3;"><strong>Key events:</strong><br>${topEvs}</div>`;
+          const topEvs = pData.events_with_scores
+            .slice(0, 3)
+            .map(e => `${_escHtml(e.entity || '')}: ${_escHtml(e.attribute || '')} (${_escHtml(e.value || '')})`)
+            .join('<br>');
+          summaryHtml = `<div class="tooltip-features" style="font-size:0.65rem;color:var(--text-muted);margin-top:4px;line-height:1.3;"><strong>Key events (up to Day ${activeFup}):</strong><br>${topEvs}</div>`;
         }
 
         tip.classed('visible', true)
           .style('left', `${ex + tipW > bx.width ? ex - tipW - 10 : ex + 12}px`)
           .style('top', `${ey - 15}px`)
           .html(`
-            <div class="tooltip-id" style="color:#FFD700; font-weight:700; font-size:0.78rem;">★ Active Patient</div>
-            <div class="tooltip-risk" style="font-size:0.74rem;">Infection Score: <strong style="color:${catColor}">${scoreInt}/100</strong> <span style="font-size:0.68rem; opacity:0.8;">(${horizonLabel})</span></div>
+            <div class="tooltip-id" style="color:#FFD700; font-weight:700; font-size:0.78rem;">★ Active Patient (Day ${activeFup})</div>
+            <div class="tooltip-risk" style="font-size:0.74rem;">${_scoreTitle(activeTask)}: <strong style="color:${catColor}">${scoreInt}/100</strong> <span style="font-size:0.68rem; opacity:0.8;">(${horizonLabel})</span></div>
             <div class="tooltip-cluster" style="color:${catColor}; font-weight:600; font-size:0.72rem;">Subgroup: ${catName}</div>
             <div class="tooltip-summary" style="font-weight:600; margin-top:2px; font-size:0.70rem;">${nextEv}</div>
             ${summaryHtml}
           `);
       })
-      .on('mouseleave mouseout', function() {
+      .on('mouseleave mouseout', function () {
         starNode.attr('stroke-width', 2);
         tip.classed('visible', false);
       });
+
+    _drawUMAPLegend(_umapColorMode);
   }
 
   function _starPath(cx, cy, outerR, innerR, pts) {
@@ -417,130 +704,20 @@ window.AIIDKIT_CHARTS = (() => {
     document.getElementById('umap-toggle-cluster')?.classList.toggle('active', mode === 'cluster');
     document.getElementById('umap-toggle-risk')?.classList.toggle('active', mode === 'risk');
     document.getElementById('umap-toggle-imminence')?.classList.toggle('active', mode === 'imminence');
-    
+
     _drawUMAPLegend(mode);
-
-    if (!_umapG || !_umapData.length) return;
-    
-    const isLight = document.documentElement.getAttribute('data-theme') === 'light';
-    const startColor = isLight ? [200, 200, 200] : [120, 130, 150];
-    const endColor = [255, 71, 87]; // #FF4757 (red)
-    
-    _umapG.selectAll('circle.umap-pt')
-      .transition().duration(350)
-      .attr('fill', d => {
-        if (mode === 'cluster') return d.cluster_color || '#888';
-        if (mode === 'risk') {
-          const t = d.risk_score;
-          if (t < 0.5) {
-            const u = t * 2;
-            return `rgb(${Math.round(79 + 176 * u)},${Math.round(142 + 23 * u)},${Math.round(247 - 245 * u)})`;
-          } else {
-            const u = (t - 0.5) * 2;
-            return `rgb(255,${Math.round(165 - 94 * u)},${Math.round(2 + 85 * u)})`;
-          }
-        }
-        if (mode === 'imminence') {
-          const imminence = d.event_imminence || 0.0;
-          const r = Math.round(startColor[0] + (endColor[0] - startColor[0]) * imminence);
-          const g = Math.round(startColor[1] + (endColor[1] - startColor[1]) * imminence);
-          const b = Math.round(startColor[2] + (endColor[2] - startColor[2]) * imminence);
-          return `rgb(${r},${g},${b})`;
-        }
-        return '#888';
-      });
-  }
-
-  function getUMAPColorMode() { return _umapColorMode; }
-
-  function updateUMAPHorizon(patients, mode) {
-    _umapData = patients;
     if (!_umapG || !_umapData.length) return;
 
-    const isLight = document.documentElement.getAttribute('data-theme') === 'light';
-    const startColor = isLight ? [200, 200, 200] : [120, 130, 150];
-    const endColor = [255, 71, 87]; // #FF4757 (red)
-
     _umapG.selectAll('circle.umap-pt')
-      .data(_umapData, d => d.id)
-      .attr('stroke', d => d.true_label === 1 ? (document.documentElement.getAttribute('data-theme') === 'light' ? '#475569' : '#ffffff') : 'none')
-      .sort((a, b) => (a.true_label || 0) - (b.true_label || 0))
       .transition().duration(350)
-      .attr('r', d => d.true_label === 1 ? _umapEventR : _umapDotR)
-      .attr('opacity', d => d.true_label === 1 ? 1.0 : 0.65)
-      .attr('stroke-width', d => d.true_label === 1 ? 1.8 : 0)
-      .attr('fill', d => {
-        if (mode === 'cluster') return d.cluster_color || '#888';
-        if (mode === 'risk') {
-          const t = d.risk_score;
-          if (t < 0.5) {
-            const u = t * 2;
-            return `rgb(${Math.round(79 + 176 * u)},${Math.round(142 + 23 * u)},${Math.round(247 - 245 * u)})`;
-          } else {
-            const u = (t - 0.5) * 2;
-            return `rgb(255,${Math.round(165 - 94 * u)},${Math.round(2 + 85 * u)})`;
-          }
-        }
-        if (mode === 'imminence') {
-          const imminence = d.event_imminence || 0.0;
-          const r = Math.round(startColor[0] + (endColor[0] - startColor[0]) * imminence);
-          const g = Math.round(startColor[1] + (endColor[1] - startColor[1]) * imminence);
-          const b = Math.round(startColor[2] + (endColor[2] - startColor[2]) * imminence);
-          return `rgb(${r},${g},${b})`;
-        }
-        return '#888';
-      });
-  }
-
-  // ================================================================
-  // FEATURE ATTRIBUTION  (Chart.js v4)
-  // ================================================================
-
-  function initAttributionChart(attributions) {
-    const canvas = document.getElementById('attr-canvas');
-    if (!canvas) return;
-    if (_attrChart) { _attrChart.destroy(); _attrChart = null; }
-    const { labels, scores, colors } = _prepAttrib(attributions);
-    const tc = _getThemeColors();
-    _attrChart = new Chart(canvas, {
-      type: 'bar',
-      data: { labels, datasets: [{ label: 'Attribution', data: scores, backgroundColor: colors, borderRadius: 4, borderSkipped: false }] },
-      options: {
-        indexAxis: 'y', responsive: true, maintainAspectRatio: false, animation: { duration: 500 },
-        plugins: { legend: { display: false }, tooltip: { backgroundColor: 'rgba(6,13,31,0.92)', borderColor: 'rgba(255,255,255,0.1)', borderWidth: 1, callbacks: { label: ctx => ` ${ctx.parsed.x >= 0 ? '+' : ''}${ctx.parsed.x.toFixed(3)}` } } },
-        scales: {
-          x: { title: { display: true, text: 'Attribution score (integrated gradients)', color: tc.textMuted, font: { size: _scaledPx(0.71) } }, grid: { color: tc.grid }, ticks: { color: tc.textMuted, font: { size: _scaledPx(0.71) }, callback: v => v >= 0 ? `+${v.toFixed(2)}` : v.toFixed(2) } },
-          y: { grid: { display: false }, ticks: { color: tc.text, font: { size: _scaledPx(0.71) }, autoSkip: false } },
-        },
-      },
-    });
-  }
-
-  function updateAttributionChart(attributions) {
-    if (!_attrChart) { initAttributionChart(attributions); return; }
-    const { labels, scores, colors } = _prepAttrib(attributions);
-    _attrChart.data.labels = labels;
-    _attrChart.data.datasets[0].data = scores;
-    _attrChart.data.datasets[0].backgroundColor = colors;
-    _attrChart.update();
-  }
-
-  function _prepAttrib(attributions) {
-    if (!attributions?.length) return { labels: [], scores: [], colors: [] };
-    const formatFeat = feat => feat.replace(/^Infection\b/, 'Previous infection');
-    const sorted = [...attributions].sort((a, b) => Math.abs(b.score) - Math.abs(a.score)).slice(0, 15);
-    return {
-      labels: sorted.map(a => `${formatFeat(a.feature)}: ${a.value}`),
-      scores: sorted.map(a => a.score),
-      colors: sorted.map(a => a.score >= 0 ? 'rgba(255,71,87,0.83)' : 'rgba(79,142,247,0.83)'),
-    };
+      .attr('fill', d => _computeDotFill(d, mode));
   }
 
   // ================================================================
   // RISK HISTOGRAM  (Chart.js v4)
   // ================================================================
 
-  function initHistogram(distribution) {
+  function initHistogram(distribution, taskKey = 'infection_bacteria') {
     const canvas = document.getElementById('hist-canvas');
     if (!canvas) return;
     if (_histChart) { _histChart.destroy(); _histChart = null; }
@@ -575,18 +752,19 @@ window.AIIDKIT_CHARTS = (() => {
         ctx.lineTo(xPx, yBot);
         ctx.strokeStyle = textCol;
         ctx.lineWidth = 2;
-        ctx.setLineDash([5, 4]);
+        ctx.setLineDash([4, 3]);
         ctx.stroke();
+        ctx.setLineDash([]);
 
         // 2. Setup text styling for badge — scale with root font size
-        const badgeFontPx = _scaledPx(0.64);
-        ctx.font = `bold ${badgeFontPx}px Inter, sans-serif`;
+        const badgeFontPx = _scaledPx(0.62);
+        ctx.font = `700 ${badgeFontPx}px Inter, sans-serif`;
         ctx.textBaseline = 'alphabetic';
-        const text = '★ NEW PATIENT';
+        const text = 'Active Patient';
         const textWidth = ctx.measureText(text).width;
 
         // 3. Compute badge dimensions and position
-        const rectW = textWidth + 12; // 6px padding left & right
+        const rectW = textWidth + 14;
         const rectH = 16;
         const rectY = yTop - 22;
         let rectX = xPx - rectW / 2;
@@ -598,21 +776,12 @@ window.AIIDKIT_CHARTS = (() => {
           rectX = scales.x.right - rectW;
         }
 
-        // 4. Draw rounded badge container
-        const radius = 4;
+        // 4. Draw subtle rounded Swiss badge container
         ctx.beginPath();
         if (typeof ctx.roundRect === 'function') {
-          ctx.roundRect(rectX, rectY, rectW, rectH, radius);
+          ctx.roundRect(rectX, rectY, rectW, rectH, 4);
         } else {
-          ctx.moveTo(rectX + radius, rectY);
-          ctx.lineTo(rectX + rectW - radius, rectY);
-          ctx.quadraticCurveTo(rectX + rectW, rectY, rectX + rectW, rectY + radius);
-          ctx.lineTo(rectX + rectW, rectY + rectH - radius);
-          ctx.quadraticCurveTo(rectX + rectW, rectY + rectH, rectX + rectW - radius, rectY + rectH);
-          ctx.lineTo(rectX + radius, rectY + rectH);
-          ctx.quadraticCurveTo(rectX, rectY + rectH, rectX, rectY + rectH - radius);
-          ctx.lineTo(rectX, rectY + radius);
-          ctx.quadraticCurveTo(rectX, rectY, rectX + radius, rectY);
+          ctx.rect(rectX, rectY, rectW, rectH);
         }
         ctx.fillStyle = bgCol;
         ctx.fill();
@@ -631,7 +800,7 @@ window.AIIDKIT_CHARTS = (() => {
         ctx.lineTo(xPx + 4, yTop - 6);
         ctx.lineTo(xPx, yTop - 1);
         ctx.closePath();
-        ctx.fillStyle = textCol;
+        ctx.fillStyle = borderCol;
         ctx.fill();
 
         ctx.restore();
@@ -641,14 +810,14 @@ window.AIIDKIT_CHARTS = (() => {
     const tc = _getThemeColors();
     _histChart = new Chart(canvas, {
       type: 'bar',
-      data: { labels: binLabels, datasets: [{ label: 'Patients', data: counts, backgroundColor: barColors, borderRadius: 3 }] },
+      data: { labels: binLabels, datasets: [{ label: 'Patients', data: counts, backgroundColor: barColors, borderRadius: 4 }] },
       plugins: [histLinePlugin],
       options: {
         responsive: true, maintainAspectRatio: false, animation: { duration: 500 },
         layout: { padding: { top: 25 } },
         plugins: { legend: { display: false }, tooltip: { backgroundColor: 'rgba(6,13,31,0.92)', borderColor: 'rgba(255,255,255,0.1)', borderWidth: 1, callbacks: { label: ctx => ` ${ctx.parsed.y} patients` } }, histLine: { riskScore: null } },
         scales: {
-          x: { title: { display: true, text: 'Infection score', color: tc.textMuted, font: { size: _scaledPx(0.71) } }, grid: { display: false }, ticks: { color: tc.textMuted, font: { size: _scaledPx(0.71) }, maxTicksLimit: 6 } },
+          x: { title: { display: true, text: _scoreTitle(taskKey).toLowerCase(), color: tc.textMuted, font: { size: _scaledPx(0.71) } }, grid: { display: false }, ticks: { color: tc.textMuted, font: { size: _scaledPx(0.71) }, maxTicksLimit: 6 } },
           y: { title: { display: true, text: 'N patients', color: tc.textMuted, font: { size: _scaledPx(0.71) } }, grid: { color: tc.grid }, ticks: { color: tc.textMuted, font: { size: _scaledPx(0.71) } } },
         },
       },
@@ -661,16 +830,18 @@ window.AIIDKIT_CHARTS = (() => {
     _histChart.update('none');
   }
 
-  function updateHistogramData(distribution) {
+  function updateHistogramData(distribution, taskKey = 'infection_bacteria') {
     if (!_histChart) return;
     const { binLabels, counts } = _binValues(distribution.values, 10);
+    _histChart.data.labels = binLabels;
     _histChart.data.datasets[0].data = counts;
+    _histChart.options.scales.x.title.text = _scoreTitle(taskKey).toLowerCase();
     _histChart.update();
   }
 
   function _binValues(values, nBins) {
     const counts = new Array(nBins).fill(0);
-    const step   = 1 / nBins;
+    const step = 1 / nBins;
     for (const v of values) {
       if (typeof v !== 'number') continue;
       const idx = Math.min(Math.floor(v / step), nBins - 1);
@@ -696,15 +867,14 @@ window.AIIDKIT_CHARTS = (() => {
       return;
     }
 
-    const formatFeat = feat => feat.replace(/^Infection\b/, 'Previous infection');
-    const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+    const formatFeat = feat => String(feat ?? '').replace(/^Infection\b/, 'Previous infection');
 
     const renderTraitCard = (f) => {
       const fullFeat = formatFeat(f.feature);
       const parts = fullFeat.split(' - ');
-      const entity = parts[0] || 'Feature';
-      const attr = parts.slice(1).join(' - ') || fullFeat;
-      const val = f.value;
+      const entity = _escHtml(parts[0] || 'Feature');
+      const attr = _escHtml(parts.slice(1).join(' - ') || fullFeat);
+      const val = _escHtml(f.value);
       const isPos = f.score >= 0;
       const cardClass = isPos ? 'pos' : 'neg';
 
@@ -742,7 +912,7 @@ window.AIIDKIT_CHARTS = (() => {
           card.dataset.clusterId = id;
           card.style.setProperty('--card-color', prof.color);
           const evRate = prof.event_rate != null ? `${(prof.event_rate * 100).toFixed(0)}%` : '—';
-          
+
           card.innerHTML = `
             <div class="cluster-profile-header">
               <div class="cluster-name-cell">
@@ -751,7 +921,7 @@ window.AIIDKIT_CHARTS = (() => {
                 <span class="cluster-n-separator">&ndash;</span>
                 <span class="cluster-n-label">N</span>
                 <span class="cluster-n-value">${prof.n_patients ?? 0}</span>
-                <span class="active-patient-badge">★ New Patient</span>
+                <span class="active-patient-badge">Active Patient</span>
               </div>
               <div class="cluster-metric-item">
                 <span class="metric-label">Event Rate</span>
@@ -777,11 +947,6 @@ window.AIIDKIT_CHARTS = (() => {
     }
   }
 
-  function _short(feature) {
-    const parts = feature.split(' - ');
-    return parts.length > 1 ? parts.slice(1).join(' - ') : feature;
-  }
-
   function highlightCluster(clusterId) {
     document.querySelectorAll('.cluster-profile-card').forEach(card => {
       card.classList.toggle('active-cluster', card.dataset.clusterId === String(clusterId));
@@ -789,27 +954,14 @@ window.AIIDKIT_CHARTS = (() => {
   }
 
   function resizeCharts() {
-    if (_attrChart) _attrChart.resize();
     if (_histChart) _histChart.resize();
   }
 
   function updateThemeColors() {
     const tc = _getThemeColors();
-    // Also refresh global font size in case viewport was resized
     Chart.defaults.color = tc.textMuted;
     Chart.defaults.font.size = _scaledPx(0.78);
 
-    if (_attrChart) {
-      const axFontPx = _scaledPx(0.71);
-      _attrChart.options.scales.x.grid.color = tc.grid;
-      _attrChart.options.scales.x.ticks.color = tc.textMuted;
-      _attrChart.options.scales.x.ticks.font = { size: axFontPx };
-      _attrChart.options.scales.x.title.color = tc.textMuted;
-      _attrChart.options.scales.x.title.font = { size: axFontPx };
-      _attrChart.options.scales.y.ticks.color = tc.text;
-      _attrChart.options.scales.y.ticks.font = { size: axFontPx };
-      _attrChart.update();
-    }
     if (_histChart) {
       const axFontPx = _scaledPx(0.71);
       _histChart.options.scales.x.ticks.color = tc.textMuted;
@@ -845,13 +997,13 @@ window.AIIDKIT_CHARTS = (() => {
   // RISK TIMELINE GRAPH (MODE 2)
   // ================================================================
 
-  function drawRiskTimelineGraph(eventsWithScores, finalScore) {
+  function drawRiskTimelineGraph(eventsWithScores, finalScore, taskKey = 'infection_bacteria') {
     const container = document.getElementById('timeline-graph-svg');
     if (!container) return;
 
     // Clear SVG container
     d3.select(container).selectAll('*').remove();
-    
+
     // Track active pinned node for toggle-off re-clicking
     let activePinnedData = null;
 
@@ -886,10 +1038,13 @@ window.AIIDKIT_CHARTS = (() => {
     // Target Final Risk Score (e.g. 51 for 51/100) shown in Risk Assessment panel
     const endScore = Math.round((finalScore || 0.5) * 100);
 
-    // Helper: identify baseline/static events
+    const STATIC_ENTITIES = new Set([
+      'Patient info', 'Donor info', 'Mismatch info', 'Transplant info',
+      'Serology info', 'Patient serology', 'Immunology', 'History', 'Patient', 'Donor',
+    ]);
     const isStaticEvent = ev => {
       const d = ev.days_since_tpx ?? 0;
-      return d <= 0 || ['Patient info', 'Donor info', 'Mismatch info', 'Transplant info', 'Patient'].includes(ev.entity);
+      return d <= 0 || STATIC_ENTITIES.has(ev.entity);
     };
 
     const postBaselineEvents = eventsWithScores.filter(ev => !isStaticEvent(ev));
@@ -1000,7 +1155,7 @@ window.AIIDKIT_CHARTS = (() => {
     const daySpan = Math.max(30, maxDay - startDay);
     const containerW = container.clientWidth || 550;
     const containerH = 340;
-    const pxPerDay  = 8;
+    const pxPerDay = 8;
     const calculatedW = Math.max(containerW, Math.round(daySpan * pxPerDay + 120));
 
     const m = { top: 56, right: 60, bottom: 48, left: 24 };
@@ -1044,7 +1199,7 @@ window.AIIDKIT_CHARTS = (() => {
       .attr('class', 'y-axis-group')
       .attr('transform', `translate(${m.left},${m.top})`);
 
-    const bgGutterFill = isLight ? '#ffffff' : '#1A2C42';
+    const bgGutterFill = isLight ? '#F8FAFC' : '#12151B';
     yAxisG.append('rect')
       .attr('x', -m.left - 60)
       .attr('y', -m.top)
@@ -1144,11 +1299,11 @@ window.AIIDKIT_CHARTS = (() => {
 
     // Dedicated SVG layer groups for proper z-ordering:
     // Area -> Staircase Line -> Stems -> Callout Badges -> Interactive Dots (on top!)
-    const gArea          = g.append('g').attr('class', 'timeline-area-layer');
-    const gLines         = g.append('g').attr('class', 'timeline-line-layer');
-    const gCalloutStems  = g.append('g').attr('class', 'timeline-stems-layer');
+    const gArea = g.append('g').attr('class', 'timeline-area-layer');
+    const gLines = g.append('g').attr('class', 'timeline-line-layer');
+    const gCalloutStems = g.append('g').attr('class', 'timeline-stems-layer');
     const gCalloutBadges = g.append('g').attr('class', 'timeline-badges-layer');
-    const gNodes         = g.append('g').attr('class', 'timeline-nodes-layer');
+    const gNodes = g.append('g').attr('class', 'timeline-nodes-layer');
 
     // Gradient Area Fill under Staircase
     const areaDef = svg.append('defs').append('linearGradient')
@@ -1208,12 +1363,12 @@ window.AIIDKIT_CHARTS = (() => {
         let calloutTextColor, calloutBorder, calloutBg;
         if (d.delta > 0) {
           calloutTextColor = isLight ? '#B32431' : '#FF8A95';
-          calloutBorder    = isLight ? '#EF4444' : '#FF4757';
-          calloutBg        = isLight ? '#FFF1F2' : 'rgba(255, 71, 87, 0.25)';
+          calloutBorder = isLight ? '#EF4444' : '#FF4757';
+          calloutBg = isLight ? '#FFF1F2' : 'rgba(255, 71, 87, 0.25)';
         } else {
           calloutTextColor = isLight ? '#1D4ED8' : '#93C5FD';
-          calloutBorder    = isLight ? '#3B82F6' : '#5B9BF8';
-          calloutBg        = isLight ? '#EFF6FF' : 'rgba(37, 99, 235, 0.25)';
+          calloutBorder = isLight ? '#3B82F6' : '#5B9BF8';
+          calloutBg = isLight ? '#EFF6FF' : 'rgba(37, 99, 235, 0.25)';
         }
 
         // Measure text dimensions
@@ -1241,7 +1396,7 @@ window.AIIDKIT_CHARTS = (() => {
 
         const clampedX = Math.max(boxW / 2 + 4, Math.min(iW - boxW / 2 - 4, cx));
         // Generous initial vertical gap (longer dashed connecting lines)
-        const idealY   = targetSide === 'above' ? (cy - 58) : (cy + 58);
+        const idealY = targetSide === 'above' ? (cy - 58) : (cy + 58);
 
         calloutCandidates.push({
           idx,
@@ -1368,7 +1523,7 @@ window.AIIDKIT_CHARTS = (() => {
       // Long vertical leader stem line: connecting dot (cx, cy) to badge (x, y)
       const isAbove = c.y < c.cy;
       const stemYStart = isAbove ? c.cy - c.dotR - 1 : c.cy + c.dotR + 1;
-      const stemYEnd   = isAbove ? c.y + c.boxH / 2 : c.y - c.boxH / 2;
+      const stemYEnd = isAbove ? c.y + c.boxH / 2 : c.y - c.boxH / 2;
 
       gCalloutStems.append('line')
         .attr('x1', c.cx).attr('y1', stemYStart)
@@ -1426,8 +1581,8 @@ window.AIIDKIT_CHARTS = (() => {
         const topY = headerEl ? headerEl.getBoundingClientRect().bottom + 8 : panelRect.top + 52;
 
         tip.style('left', `${panelCenterX}px`)
-           .style('top', `${topY}px`)
-           .style('transform', 'translateX(-50%)');
+          .style('top', `${topY}px`)
+          .style('transform', 'translateX(-50%)');
       }
 
       // Function to open / unfold Click-to-Open Popover Card with Close Button (✕)
@@ -1448,15 +1603,15 @@ window.AIIDKIT_CHARTS = (() => {
             const sc = (e.score || 0) * 100;
             const sign = sc >= 0 ? '+' : '';
             const color = sc > 0 ? '#FF4757' : (sc < 0 ? '#2563EB' : 'var(--text-muted)');
-            const valPart = (e.value !== undefined && e.value !== null && e.value !== '') ? `: <strong>${e.value}</strong>` : '';
+            const valPart = (e.value !== undefined && e.value !== null && e.value !== '') ? `: <strong>${_escHtml(e.value)}</strong>` : '';
             return `<div style="display:flex; justify-content:space-between; margin-top:3px; font-size:0.7rem; gap:12px; align-items:baseline;">
-              <span style="color:var(--text); line-height:1.35; word-break:break-word;"><strong>${e.entity}</strong> &ndash; ${e.attribute}${valPart}</span>
+              <span style="color:var(--text); line-height:1.35; word-break:break-word;"><strong>${_escHtml(e.entity)}</strong> &ndash; ${_escHtml(e.attribute)}${valPart}</span>
               <strong style="color:${color}; flex-shrink:0; font-size:0.72rem;">${sign}${sc.toFixed(1)}%</strong>
             </div>`;
           }).join('');
 
           contentHtml += `
-            <div style="font-size:0.75rem; margin-bottom:4px;">Initial Infection Score: <strong style="color:${dotColor};">${d.riskBefore}/100</strong></div>
+            <div style="font-size:0.75rem; margin-bottom:4px;">Initial ${_scoreTitle(taskKey)}: <strong style="color:${dotColor};">${d.riskBefore}/100</strong></div>
             <div style="margin-top:4px; border-top:1px dashed var(--border); padding-top:4px;">${evRows}</div>
           `;
         } else {
@@ -1465,9 +1620,9 @@ window.AIIDKIT_CHARTS = (() => {
             const sc = e.scaled_delta !== undefined ? e.scaled_delta : (e.score || 0) * 100;
             const sign = sc >= 0 ? '+' : '';
             const color = sc > 0 ? '#FF4757' : (sc < 0 ? '#2563EB' : 'var(--text-muted)');
-            const valPart = (e.value !== undefined && e.value !== null && e.value !== '') ? `: <strong>${e.value}</strong>` : '';
+            const valPart = (e.value !== undefined && e.value !== null && e.value !== '') ? `: <strong>${_escHtml(e.value)}</strong>` : '';
             return `<div style="display:flex; justify-content:space-between; margin-top:3px; font-size:0.7rem; gap:12px; align-items:baseline;">
-              <span style="color:var(--text); line-height:1.35; word-break:break-word;"><strong>${e.entity}</strong> &ndash; ${e.attribute}${valPart}</span>
+              <span style="color:var(--text); line-height:1.35; word-break:break-word;"><strong>${_escHtml(e.entity)}</strong> &ndash; ${_escHtml(e.attribute)}${valPart}</span>
               <strong style="color:${color}; flex-shrink:0; font-size:0.72rem;">${sign}${sc.toFixed(1)}%</strong>
             </div>`;
           }).join('');
@@ -1496,7 +1651,7 @@ window.AIIDKIT_CHARTS = (() => {
 
       // Click event handler: Toggle OFF if clicking active dot, otherwise unfold info popover!
       nodeG
-        .on('click', function(ev) {
+        .on('click', function (ev) {
           ev.stopPropagation();
 
           if (activePinnedData === d && tip.classed('visible')) {
@@ -1512,16 +1667,16 @@ window.AIIDKIT_CHARTS = (() => {
             openPopoverCard();
           }
         })
-        .on('mouseenter mouseover', function() {
+        .on('mouseenter mouseover', function () {
           if (!activePinnedData) {
             circle.attr('r', dotR + 2.5).attr('stroke-width', 3);
             tip.classed('visible', true)
               .style('pointer-events', 'none')
-              .html(`<div style="font-size:0.72rem; font-weight:600; text-align:center; padding:2px 12px;">Click to pin details 🔍</div>`);
+              .html(`<div style="font-size:0.70rem; font-weight:600; text-align:center; padding:2px 10px;">Click to pin details</div>`);
             positionTipInPanelCenter();
           }
         })
-        .on('mouseleave mouseout', function() {
+        .on('mouseleave mouseout', function () {
           if (!activePinnedData) {
             circle.attr('r', dotR).attr('stroke-width', 2);
             tip.classed('visible', false).style('pointer-events', 'none');
@@ -1547,8 +1702,7 @@ window.AIIDKIT_CHARTS = (() => {
   // PUBLIC
   // ================================================================
   return {
-    initUMAP, updateUMAPWithPatient, toggleUMAPColorMode, updateUMAPHorizon,
-    initAttributionChart, updateAttributionChart,
+    initUMAP, updateUMAPCohort, updateUMAPWithPatient, toggleUMAPColorMode,
     initHistogram, updateHistogramWithPatient, updateHistogramData,
     initClusterProfiles, updateClusterProfiles: initClusterProfiles, highlightCluster, resizeCharts, updateThemeColors,
     drawRiskTimelineGraph,

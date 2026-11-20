@@ -3,13 +3,13 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>AIIDKIT — Infection Risk Assessment | Kidney Transplant DST</title>
-  <meta name="description" content="AI-powered decision support tool for predicting bacterial infection risk in kidney transplant recipients using timed clinical event sequences." />
+  <title>AIIDKIT — Clinical &amp; Infection Risk Assessment | Kidney Transplant DST</title>
+  <meta name="description" content="AI-powered decision support tool for predicting multi-horizon bacterial, viral, and fungal infection, graft loss, and mortality risk in kidney transplant recipients." />
 
-  <!-- Google Fonts -->
+  <!-- Google Fonts: Inter & Plus Jakarta Sans (Modern Neo-Grotesque) -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet" />
 
   <!-- Chart.js v4 -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
@@ -17,7 +17,7 @@
   <!-- D3.js v7 -->
   <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
 
-  <link rel="stylesheet" href="/static/css/style.css?v=1.9" />
+  <link rel="stylesheet" href="/static/css/style.css?v=6.0" />
   <link rel="icon" type="image/png" href="/static/favicon.png" />
 </head>
 <body>
@@ -38,7 +38,7 @@
 <div id="toast-container" class="toast-container" aria-live="polite"></div>
 
 <!-- ================================================================
-     HEADER
+     HEADER — Modern Swiss Masthead
 ================================================================ -->
 <header class="app-header">
   <div class="header-inner">
@@ -46,10 +46,15 @@
       <img class="brand-logo" src="/static/logo_graphics.png" alt="AIIDKIT Logo" />
       <div class="brand-text">
         <span class="brand-title"><span class="logo-accent-blue">AIID</span><span class="logo-accent-teal">KIT</span></span>
+        <span class="brand-subtitle">Clinical Decision Support · Unified Post-Transplant Risk</span>
       </div>
     </div>
 
     <div class="header-right">
+      <button id="header-new-patient-btn" class="theme-toggle-btn hidden" type="button" title="Return to welcome screen to analyse a new patient">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+        <span>New patient</span>
+      </button>
       <button id="theme-toggle" class="theme-toggle-btn" aria-label="Toggle light/dark theme"></button>
     </div>
   </div>
@@ -65,9 +70,11 @@
   -------------------------------------------------------- -->
   <section class="results-container">
 
-    <!-- Empty state (shown before first submission) -->
+    <!-- Empty state (shown before first submission) — Modern Swiss Editorial Layout -->
     <div id="empty-state" class="empty-state">
       <div class="empty-inner">
+        <div class="empty-kicker">Clinical Decision Support</div>
+
         <div class="empty-logo-container">
           <img class="empty-icon" src="/static/logo_graphics.png" alt="AIIDKIT Logo" />
           <div class="empty-text-brand">
@@ -75,16 +82,34 @@
             <span class="empty-brand-tagline">Artificial Intelligence for<br>Improved Infectious<br>Diseases Outcomes</span>
           </div>
         </div>
-        <h3 class="empty-title">Welcome to AIIDKIT Decision Support</h3>
-        <p class="empty-body">An AI decision support tool that predicts post-transplant bacterial infection risk to assist clinical teams.</p>
-        
-        <div class="empty-instructions" style="margin-top: 14px; text-align: left; background: var(--surface); padding: 14px 18px; border-radius: var(--radius-sm); border: 1px solid var(--border-strong);">
-          <strong style="display: block; margin-bottom: 6px; font-size: 0.80rem; color: var(--text);">Quick Start Guide:</strong>
-          <ol style="margin: 0; padding-left: 18px; font-size: 0.76rem; color: var(--text-muted); line-height: 1.6;">
-            <li><strong>Enter Patient Data:</strong> Use the right sidebar to add clinical events or select an example patient (<em>High risk</em> / <em>Low risk</em>).</li>
-            <li><strong>Analyse Patient:</strong> Click <strong>Analyse patient</strong> to compute infection risk scores across 30, 60, and 90-day time horizons.</li>
-            <li><strong>Review Insights:</strong> Inspect clinical risk drivers, compare cohort positioning, and explore risk subgroup profiles.</li>
-          </ol>
+
+        <div class="empty-editorial-rule"></div>
+
+        <div class="empty-editorial-grid">
+          <div class="empty-editorial-col">
+            <h3 class="empty-title">Unified Post-Transplant Outcome &amp; Infection Risk Assessment</h3>
+            <p class="empty-body">
+              Quantitative decision support for kidney transplant recipients. Longitudinal clinical event sequences are encoded to estimate calibrated multi-horizon risk (30 days to 5 years) across bacterial, viral, and fungal pathogens, allograft loss, and mortality.
+            </p>
+          </div>
+
+          <div class="empty-instructions">
+            <div class="empty-instructions-header">Quick Start</div>
+            <ol class="swiss-protocol-list">
+              <li>
+                <span class="protocol-num">01</span>
+                <div class="protocol-text"><strong>Enter Patient Data</strong> — Add timed clinical events in the right-hand panel, upload a CSV/JSON trajectory, or load a reference profile (<em>High risk</em> / <em>Low risk</em>).</div>
+              </li>
+              <li>
+                <span class="protocol-num">02</span>
+                <div class="protocol-text"><strong>Analyse Patient</strong> — Compute calibrated risk probabilities across prediction horizons from 30 days through 5 years.</div>
+              </li>
+              <li>
+                <span class="protocol-num">03</span>
+                <div class="protocol-text"><strong>Review Insights</strong> — Explore event-level risk attributions, UMAP cohort trajectory, and stratified subgroup profiles.</div>
+              </li>
+            </ol>
+          </div>
         </div>
       </div>
     </div>
@@ -92,20 +117,67 @@
     <!-- Results area (hidden until first prediction) -->
     <div id="results-area" class="results-area hidden">
 
-      <!-- ---- ROW 1: Infection Risk Assessment & Impact of Clinical Events ---- -->
+      <!-- ---- TOP BAR: Outcome Selector + Post-Transplant Follow-Up (FUP) Stage Slider & Trajectory Control Bar ---- -->
+      <div id="fup-slider-bar" class="panel fup-slider-bar">
+        <div class="fup-slider-top">
+          <div class="fup-bar-outcome-group">
+            <h3 class="panel-title">Target outcome</h3>
+            <span class="panel-help-btn" tabindex="0" data-tooltip="Select the target clinical outcome (bacterial, viral, or fungal infection, pathogen group, graft loss, or mortality). Charts update instantaneously.">?</span>
+            <select id="task-select" class="task-select task-select-topbar" aria-label="Target clinical outcome" title="Switch target clinical outcome">
+              <optgroup label="Bacterial Infections">
+                <option value="infection_bacteria">All Bacteria (General)</option>
+                <option value="infection_grp_enterobacterales">Enterobacterales</option>
+                <option value="infection_grp_gram_positive">Gram-positive cocci</option>
+                <option value="infection_grp_gn_nonfermenters">GN non-fermenters</option>
+                <option value="infection_grp_clostridium">C. difficile</option>
+              </optgroup>
+              <optgroup label="Viral Infections">
+                <option value="infection_virus">All Viruses (General)</option>
+                <option value="infection_grp_herpes_viruses">Herpesviruses</option>
+                <option value="infection_grp_cmv">Cytomegalovirus (CMV)</option>
+                <option value="infection_grp_bkpyv">BK Polyomavirus (BKPyV)</option>
+              </optgroup>
+              <optgroup label="Fungal Infections">
+                <option value="infection_fungi">All Fungi (General)</option>
+                <option value="infection_grp_candida">Candida spp.</option>
+              </optgroup>
+              <optgroup label="Long-Term Clinical Outcomes">
+                <option value="death">Patient Mortality (Death)</option>
+                <option value="graft_loss">Allograft Failure (Graft Loss)</option>
+              </optgroup>
+            </select>
+          </div>
+          <span class="fup-bar-divider" aria-hidden="true"></span>
+          <div class="fup-slider-title-group">
+            <h3 class="panel-title">Post-transplant follow-up stage</h3>
+            <span class="panel-help-btn" tabindex="0" data-tooltip="Scrub across post-transplant landmarks (0d, 30d, 60d, …) to inspect how the patient's predicted risk, clinical event attributions, UMAP cohort trajectory, and subgroup comparison evolve over time.">?</span>
+            <span id="fup-slider-val-badge" class="fup-stage-pill">Day 60</span>
+          </div>
+          <div class="fup-slider-right-controls">
+            <span id="fup-bg-status" class="fup-bg-status ready">✓ Trajectory ready</span>
+            <button id="fup-trajectory-toggle" class="toggle-btn active fup-traj-btn" type="button" title="Toggle display of the patient's longitudinal trajectory across post-transplant stages on the UMAP plot">Course path</button>
+          </div>
+        </div>
+        <div class="fup-slider-track-wrap">
+          <input id="fup-slider" class="fup-range-slider" type="range" min="0" max="0" step="1" value="0" aria-label="Post-transplant follow-up stage slider" />
+          <div id="fup-slider-ticks" class="fup-slider-ticks"></div>
+        </div>
+      </div>
+
+      <!-- ---- ROW 1: Outcome Risk Assessment & Impact of Clinical Events ---- -->
       <div class="row row-top-unified">
-        <!-- Panel 1: Infection Risk Assessment -->
+        <!-- Panel 1: Risk Assessment -->
         <div class="panel panel-unified-assessment">
           <div class="panel-header">
-            <svg class="panel-icon" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8" stroke="currentColor" stroke-width="1.5"/><path d="M10 6v4l2.5 2.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-            <h3 class="panel-title">Infection risk assessment</h3>
-            <span class="panel-help-btn" tabindex="0" data-tooltip="Predicts the patient's overall likelihood of developing a bacterial infection within 30, 60, or 90 days post-transplant based on their clinical history.">?</span>
-            <button id="reset-analysis-btn" class="btn btn-ghost btn-xs" style="margin-left: auto; margin-right: 8px;">New analysis</button>
-            <span id="risk-badge" class="risk-badge badge-low">Low risk</span>
+            <h3 id="assessment-panel-title" class="panel-title">Infection risk assessment</h3>
+            <span class="panel-help-btn" tabindex="0" data-tooltip="Displays the patient's relative risk score (0–100) and Platt-calibrated probability across every prediction horizon supported by the active model.">?</span>
+            <span id="assessment-task-badge" class="fup-stage-pill fup-stage-pill-subtle" title="Currently selected target outcome">All Bacteria (General)</span>
+            <span id="assessment-fup-badge" class="fup-stage-pill fup-stage-pill-subtle" title="Post-transplant stage currently selected on the follow-up slider">Day 60</span>
+            <span id="risk-badge" class="risk-badge badge-low" style="margin-left: auto;">Low risk</span>
           </div>
-          
+
           <!-- Top Row: Metrics side-by-side -->
-          <div class="unified-metrics-row">
+          <div id="unified-metrics-row" class="unified-metrics-row">
             <!-- Column 1: Cohort Risk Distribution Histogram -->
             <div class="hist-wrapper">
               <div class="hist-chart-header">
@@ -116,17 +188,17 @@
               </div>
             </div>
 
-            <!-- Column 2: Vertical Horizon Breakdowns -->
-            <div class="risk-horizons">
-              <div class="risk-horizon-item" id="horizon-card-30">
+            <!-- Column 2: Dynamic Horizon Breakdowns (rendered by main.js from /api/config) -->
+            <div id="risk-horizons-container" class="risk-horizons">
+              <div class="risk-horizon-item" id="horizon-card-30" data-horizon="30">
                 <span class="horizon-label">30 days</span>
                 <span id="risk-30d" class="horizon-value">—</span>
               </div>
-              <div class="risk-horizon-item" id="horizon-card-60">
+              <div class="risk-horizon-item" id="horizon-card-60" data-horizon="60">
                 <span class="horizon-label">60 days</span>
                 <span id="risk-60d" class="horizon-value">—</span>
               </div>
-              <div class="risk-horizon-item active-horizon" id="horizon-card-90">
+              <div class="risk-horizon-item active-horizon" id="horizon-card-90" data-horizon="90">
                 <span class="horizon-label">90 days</span>
                 <span id="risk-90d" class="horizon-value">—</span>
               </div>
@@ -140,15 +212,14 @@
         <!-- Panel 2: Impact of Clinical Events on Risk -->
         <div class="panel panel-timeline">
           <div class="panel-header">
-            <svg class="panel-icon" viewBox="0 0 20 20" fill="none"><path d="M4 4v12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="4" cy="4" r="2" fill="currentColor"/><circle cx="4" cy="10" r="2" fill="currentColor" opacity=".6"/><circle cx="4" cy="16" r="2" fill="currentColor" opacity=".4"/><path d="M7 4h10M7 10h7M7 16h9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" opacity=".6"/></svg>
             <h3 class="panel-title">Impact of clinical events on risk</h3>
-            <span class="panel-help-btn" tabindex="0" data-tooltip="Shows how individual clinical events, laboratory findings, and medications in the patient's timeline increase (+) or decrease (-) their overall infection risk score. Switch to Risk Timeline to visualize risk evolution over time.">?</span>
-            <div class="timeline-toggle-group" style="margin-left: auto; display: flex; gap: 3px;">
+            <span class="panel-help-btn" tabindex="0" data-tooltip="Shows how individual clinical events, laboratory findings, and medications in the patient's timeline increase (+) or decrease (-) their predicted risk score. Switch between Risk Timeline and List view.">?</span>
+            <div class="timeline-toggle-group" style="margin-left: auto;">
               <button id="timeline-toggle-graph" class="toggle-btn active" title="View as cumulative risk timeline graph">Timeline</button>
               <button id="timeline-toggle-list" class="toggle-btn" title="View as structured event impact list">List</button>
             </div>
           </div>
-          
+
           <!-- Mode 1: Event Impact List View -->
           <div id="timeline-list-wrapper" class="timeline-scroll hidden">
             <ul id="timeline-list" class="timeline-list">
@@ -158,7 +229,7 @@
 
           <!-- Mode 2: Risk Timeline Graph View -->
           <div id="timeline-graph-outer" style="position: relative; width: 100%; height: 340px; overflow: hidden;">
-            <div class="graph-center-hint">💡 Click any dot to pin details</div>
+            <div class="graph-center-hint">Click any node to inspect event attribution</div>
             <div id="timeline-graph-wrapper" class="timeline-graph-container" style="position: relative; width: 100%; height: 100%; overflow-x: auto; overflow-y: hidden;">
               <div id="timeline-graph-svg" style="min-width: 100%; height: 100%;"></div>
             </div>
@@ -172,25 +243,24 @@
         <!-- Panel 3: Patient vs Cohort -->
         <div class="panel panel-umap">
           <div class="panel-header">
-            <svg class="panel-icon" viewBox="0 0 20 20" fill="none"><circle cx="6" cy="6" r="2" fill="currentColor" opacity=".6"/><circle cx="14" cy="8" r="2" fill="currentColor" opacity=".8"/><circle cx="9" cy="14" r="2" fill="currentColor"/><circle cx="4" cy="14" r="1.5" fill="currentColor" opacity=".5"/></svg>
             <h3 class="panel-title">Patient vs cohort</h3>
-            <span class="panel-help-btn" tabindex="0" data-tooltip="Visualizes where this patient sits relative to past transplant patients. Patients with similar clinical profiles appear closer in this representation space.">?</span>
+            <span class="panel-help-btn" tabindex="0" data-tooltip="Visualizes where this patient sits relative to reference transplant patients observed up to the same post-transplant follow-up landmark. Use the top slider to scrub through earlier post-transplant stages and inspect the patient's trajectory.">?</span>
             <div class="umap-toggle-group">
               <button id="umap-toggle-cluster" class="toggle-btn active" title="Color by subgroup">Subgroup</button>
               <button id="umap-toggle-risk"    class="toggle-btn"        title="Color by risk score">Risk score</button>
               <button id="umap-toggle-imminence" class="toggle-btn"     title="Color by event imminence">Event imminence</button>
             </div>
           </div>
+
           <div id="umap-svg-container" class="umap-container"></div>
-          <p class="chart-caption">Each point represents a past transplant patient from the reference cohort. Patients with similar clinical profiles appear closer together.</p>
+          <p id="umap-cohort-caption" class="chart-caption">Reference cohort projection (UMAP) — proximity reflects clinical profile similarity.</p>
         </div>
 
         <!-- Panel 4: Risk Subgroup Profiles -->
         <div class="panel panel-clusters">
           <div class="panel-header">
-            <svg class="panel-icon" viewBox="0 0 20 20" fill="none"><circle cx="6" cy="7" r="3" stroke="currentColor" stroke-width="1.5"/><circle cx="14" cy="13" r="3" stroke="currentColor" stroke-width="1.5"/><circle cx="14" cy="7" r="3" stroke="currentColor" stroke-width="1.5" opacity=".5"/></svg>
             <h3 class="panel-title">Risk subgroup profiles</h3>
-            <span class="panel-help-btn" tabindex="0" data-tooltip="Compares reference patient subgroups (High vs. Low risk) to highlight key baseline characteristics and recent clinical drivers associated with infection outcomes.">?</span>
+            <span class="panel-help-btn" tabindex="0" data-tooltip="Compares reference patient subgroups (High vs. Low risk) to highlight key baseline characteristics and recent clinical drivers associated with the selected outcome.">?</span>
           </div>
           <div id="cluster-profiles-container" class="cluster-profiles-container">
             <!-- Cards injected by charts.js -->
@@ -202,31 +272,42 @@
   </section><!-- /.results-container -->
 
   <!-- --------------------------------------------------------
-       RIGHT SIDEBAR — Patient Input
+       RIGHT SIDEBAR — Patient Input (Collapsible Lateral Drawer)
   -------------------------------------------------------- -->
-  <aside class="sidebar">
+  <aside id="app-sidebar" class="sidebar">
+    <!-- Thin vertical hider rail (shown when sidebar is collapsed after analysis) -->
+    <button id="sidebar-collapsed-rail" class="sidebar-collapsed-rail" type="button" title="Expand patient data panel" aria-label="Expand patient data panel">
+      <span class="sidebar-rail-arrow" aria-hidden="true">
+        <svg viewBox="0 0 16 16" fill="none"><path d="M10 3L5 8l5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </span>
+      <span class="sidebar-rail-label">Patient data</span>
+    </button>
+
     <div class="panel sidebar-panel">
       <div class="panel-header">
-        <svg class="panel-icon" viewBox="0 0 20 20" fill="none"><path d="M10 2a8 8 0 100 16A8 8 0 0010 2zm0 4v4l3 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        <svg class="panel-icon" viewBox="0 0 20 20" fill="none"><path d="M10 2a8 8 0 100 16A8 8 0 0010 2zm0 4v4l3 3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
         <h2 class="panel-title">Patient data</h2>
+        <button id="sidebar-collapse-btn" class="sidebar-collapse-btn hidden" type="button" title="Hide patient data panel" aria-label="Hide patient data panel">
+          <svg viewBox="0 0 16 16" fill="none"><path d="M6 3l5 5-5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
       </div>
 
       <!-- Tabs -->
       <div class="tab-bar" role="tablist">
         <button id="tab-btn-form" class="tab-btn active" role="tab" aria-selected="true" aria-controls="tab-form">
-          <svg viewBox="0 0 16 16" fill="none"><path d="M2 4h12M2 8h8M2 12h10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+          <svg viewBox="0 0 16 16" fill="none"><path d="M2 4h12M2 8h8M2 12h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
           Manual entry
         </button>
         <button id="tab-btn-upload" class="tab-btn" role="tab" aria-selected="false" aria-controls="tab-upload">
-          <svg viewBox="0 0 16 16" fill="none"><path d="M8 10V3m0-1l-3 3m3-3l3 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M2 13h12" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+          <svg viewBox="0 0 16 16" fill="none"><path d="M8 10V3m0-1l-3 3m3-3l3 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M2 13h12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
           File upload
         </button>
       </div>
 
-      <!-- FIXED HEIGHT TAB VIEWPORT — guarantees 0 movement between tab bar and buttons below -->
+      <!-- FIXED HEIGHT TAB VIEWPORT -->
       <div class="sidebar-tab-viewport">
         <!-- TAB: Manual Entry -->
-        <div id="tab-form" class="tab-content" role="tabpanel">
+        <div id="tab-form" class="tab-content active" role="tabpanel">
           <p class="form-help">Add one row per clinical event. Events are sorted by day automatically.</p>
 
           <div class="event-table-wrapper">
@@ -248,7 +329,7 @@
 
           <button id="add-event-btn" class="btn btn-ghost btn-sm" type="button">
             <svg viewBox="0 0 16 16" fill="none"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
-            Add Event
+            Add event
           </button>
         </div>
 
@@ -257,8 +338,8 @@
           <div id="file-drop-zone" class="drop-zone" tabindex="0" role="button" aria-label="Upload patient event file">
             <div class="drop-zone-inner">
               <svg class="drop-icon" viewBox="0 0 48 48" fill="none">
-                <path d="M24 32V16m0-4l-8 8m8-8l8 8" stroke="#4F8EF7" stroke-width="2.5" stroke-linecap="round"/>
-                <path d="M8 38h32" stroke="#4F8EF7" stroke-width="2.5" stroke-linecap="round"/>
+                <path d="M24 32V16m0-4l-8 8m8-8l8 8" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
+                <path d="M8 38h32" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
               </svg>
               <p class="drop-title">Drop CSV or JSON file here</p>
               <p class="drop-hint">or click to browse</p>
@@ -268,19 +349,22 @@
         </div>
       </div><!-- /.sidebar-tab-viewport -->
 
-      <!-- Synthetic patient loader (placed above Analyse patient button) -->
+      <!-- Synthetic patient loader -->
       <div class="example-section">
-        <span class="example-label">Or use synthetic patient data:</span>
+        <span class="example-label">Sample profiles:</span>
         <div class="example-btns">
           <button class="btn btn-ghost btn-xs example-btn" data-example="high">High risk</button>
           <button class="btn btn-ghost btn-xs example-btn" data-example="low">Low risk</button>
         </div>
       </div>
 
-      <!-- Global Analyse patient button -->
+      <!-- Global Analyse patient & New analysis buttons -->
       <button id="analyze-form-btn" class="btn btn-primary mt-lg" type="button">
         <svg viewBox="0 0 20 20" fill="none"><path d="M10 2a8 8 0 100 16A8 8 0 0010 2zM10 6v4l3 2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
         Analyse patient
+      </button>
+      <button id="reset-analysis-btn" class="btn btn-ghost btn-reset-sidebar" type="button">
+        New analysis
       </button>
 
     </div>
@@ -291,11 +375,10 @@
 <!-- ================================================================
      SCRIPTS
 ================================================================ -->
-<script src="/static/js/patient_form.js?v=4.4"></script>
-<script src="/static/js/charts.js?v=4.4"></script>
-<script src="/static/js/main.js?v=4.4"></script>
+<script src="/static/js/patient_form.js?v=6.0"></script>
+<script src="/static/js/charts.js?v=6.0"></script>
+<script src="/static/js/main.js?v=6.0"></script>
 <script>
-  // Boot the app once DOM is ready
   document.addEventListener('DOMContentLoaded', () => {
     window.AIIDKIT.init();
   });

@@ -1,6 +1,6 @@
 /**
  * AIIDKIT — patient_form.js
- * Handles the structured event entry form and CSV/JSON file upload.
+ * Handles the structured event entry form and header-aware CSV/JSON file upload.
  * Exposes window.AIIDKIT_FORM
  */
 'use strict';
@@ -8,10 +8,15 @@
 window.AIIDKIT_FORM = (() => {
 
   let _vocabulary = {};
-  let _uploadedEvents = [];
   let _rowCount = 0;
 
-  // Example patient configurations are now loaded dynamically from the backend CSV files.
+  function _notifyError(msg) {
+    if (window.AIIDKIT && typeof window.AIIDKIT.showToast === 'function') {
+      window.AIIDKIT.showToast(msg, 'error');
+    } else {
+      console.error('[AIIDKIT Form]', msg);
+    }
+  }
 
   // ------------------------------------------------------------------
   // INIT
@@ -20,20 +25,15 @@ window.AIIDKIT_FORM = (() => {
   function initForm(vocabulary) {
     _vocabulary = vocabulary || {};
 
-    // Tab switching
     document.getElementById('tab-btn-form')?.addEventListener('click',   () => switchTab('form'));
     document.getElementById('tab-btn-upload')?.addEventListener('click', () => switchTab('upload'));
 
-    // Add-event button
     document.getElementById('add-event-btn')?.addEventListener('click', () => {
       addEventRow();
       scrollToBottom();
     });
 
-    // File upload
     initFileUpload();
-
-    // Pre-load one blank starter row with placeholders
     addEventRow();
   }
 
@@ -44,7 +44,7 @@ window.AIIDKIT_FORM = (() => {
       document.getElementById(`tab-btn-${t}`)?.setAttribute('aria-selected', String(isActive));
       const panel = document.getElementById(`tab-${t}`);
       if (panel) {
-        panel.classList.toggle('active',  isActive);
+        panel.classList.toggle('active', isActive);
         panel.classList.toggle('hidden', !isActive);
       }
     });
@@ -62,30 +62,30 @@ window.AIIDKIT_FORM = (() => {
     const id = `r${_rowCount}`;
     const entities = Object.keys(_vocabulary);
 
-    const defaultEntity = defaults.entity || '';
+    const defaultEntity = defaults.entity ? String(defaults.entity).trim() : '';
     const defaultAttrs  = defaultEntity ? Object.keys(_vocabulary[defaultEntity] || {}) : [];
-    const defaultAttr   = defaults.attribute || '';
+    const defaultAttr   = defaults.attribute ? String(defaults.attribute).trim() : '';
     const defaultVals   = (defaultEntity && defaultAttr)
       ? (_vocabulary[defaultEntity]?.[defaultAttr] || [])
       : [];
-    const defaultValue  = defaults.value || '';
+    const defaultValue  = defaults.value != null ? String(defaults.value).trim() : '';
 
-    // --- build selects ---
     const entitySel = _makeSelect(`ent-${id}`, entities, defaultEntity, '—');
     const attrSel   = _makeSelect(`att-${id}`, defaultAttrs, defaultAttr, '—');
-    const valSel    = _makeSelect(`val-${id}`, defaultVals,  defaultValue, '—');
+    const valSel    = _makeSelect(`val-${id}`, defaultVals, defaultValue, '—');
 
     entitySel.addEventListener('change', () => _onEntityChange(entitySel, attrSel, valSel));
     attrSel.addEventListener('change',   () => _onAttrChange(entitySel, attrSel, valSel));
 
-    // --- day input ---
     const dayInput = document.createElement('input');
-    dayInput.type = 'number'; dayInput.min = '-9999'; dayInput.max = '9999';
+    dayInput.type = 'number';
+    dayInput.step = 'any';
+    dayInput.min = '-9999';
+    dayInput.max = '9999';
     dayInput.id = `day-${id}`;
     dayInput.value = defaults.days_since_tpx ?? '';
     dayInput.placeholder = '—';
 
-    // --- remove button ---
     const removeBtn = document.createElement('button');
     removeBtn.type = 'button';
     removeBtn.className = 'remove-row-btn';
@@ -93,10 +93,11 @@ window.AIIDKIT_FORM = (() => {
     removeBtn.textContent = '×';
     removeBtn.addEventListener('click', () => tr.remove());
 
-    // --- assemble row ---
     const tr = document.createElement('tr');
     [entitySel, attrSel, valSel, dayInput, removeBtn].forEach(el => {
-      const td = document.createElement('td'); td.appendChild(el); tr.appendChild(td);
+      const td = document.createElement('td');
+      td.appendChild(el);
+      tr.appendChild(td);
     });
     tbody.appendChild(tr);
   }
@@ -127,7 +128,7 @@ window.AIIDKIT_FORM = (() => {
 
   function _populateSelect(sel, options, selectedValue, placeholder = '—') {
     sel.innerHTML = '';
-    
+
     if (placeholder) {
       const ph = document.createElement('option');
       ph.value = '';
@@ -139,7 +140,13 @@ window.AIIDKIT_FORM = (() => {
       sel.appendChild(ph);
     }
 
-    options.forEach(opt => {
+    const finalOptions = Array.isArray(options) ? [...options] : [];
+    if (selectedValue && !finalOptions.includes(selectedValue)) {
+      // Preserve out-of-dropdown or raw numeric values from uploaded CSV/JSON files
+      finalOptions.push(selectedValue);
+    }
+
+    finalOptions.forEach(opt => {
       const o = document.createElement('option');
       o.value = opt;
       o.textContent = opt;
@@ -153,15 +160,11 @@ window.AIIDKIT_FORM = (() => {
   }
 
   function _updatePlaceholderClass(sel) {
-    if (!sel.value) {
-      sel.classList.add('is-placeholder');
-    } else {
-      sel.classList.remove('is-placeholder');
-    }
+    sel.classList.toggle('is-placeholder', !sel.value);
   }
 
   // ------------------------------------------------------------------
-  // COLLECT FORM EVENTS
+  // COLLECT FORM EVENTS (Chronologically Sorted)
   // ------------------------------------------------------------------
 
   function getFormEvents() {
@@ -169,20 +172,21 @@ window.AIIDKIT_FORM = (() => {
     if (!tbody) return [];
     const events = [];
     tbody.querySelectorAll('tr').forEach(tr => {
-      const entity  = tr.querySelector('[id^="ent-"]')?.value?.trim();
-      const attr    = tr.querySelector('[id^="att-"]')?.value?.trim();
-      const value   = tr.querySelector('[id^="val-"]')?.value?.trim();
-      const dayStr  = tr.querySelector('[id^="day-"]')?.value;
-      const day     = parseFloat(dayStr);
+      const entity = tr.querySelector('[id^="ent-"]')?.value?.trim();
+      const attr   = tr.querySelector('[id^="att-"]')?.value?.trim();
+      const value  = tr.querySelector('[id^="val-"]')?.value?.trim();
+      const dayStr = tr.querySelector('[id^="day-"]')?.value;
+      const day    = parseFloat(dayStr);
       if (entity && attr && value && !isNaN(day)) {
         events.push({ entity, attribute: attr, value, days_since_tpx: day });
       }
     });
+    events.sort((a, b) => a.days_since_tpx - b.days_since_tpx);
     return events;
   }
 
   // ------------------------------------------------------------------
-  // FILE UPLOAD
+  // FILE UPLOAD (Header-Aware RFC-4180 CSV + JSON)
   // ------------------------------------------------------------------
 
   function initFileUpload() {
@@ -191,11 +195,13 @@ window.AIIDKIT_FORM = (() => {
 
     if (dropZone) {
       dropZone.addEventListener('dragover', e => {
-        e.preventDefault(); dropZone.classList.add('drag-over');
+        e.preventDefault();
+        dropZone.classList.add('drag-over');
       });
       dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
       dropZone.addEventListener('drop', e => {
-        e.preventDefault(); dropZone.classList.remove('drag-over');
+        e.preventDefault();
+        dropZone.classList.remove('drag-over');
         const file = e.dataTransfer?.files[0];
         if (file) _handleFile(file);
       });
@@ -207,10 +213,93 @@ window.AIIDKIT_FORM = (() => {
     });
   }
 
+  function _splitCSVLine(line) {
+    const fields = [];
+    let cur = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (inQuotes && line[i + 1] === '"') {
+          cur += '"';
+          i++;
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else if (ch === ',' && !inQuotes) {
+        fields.push(cur.trim());
+        cur = '';
+      } else {
+        cur += ch;
+      }
+    }
+    fields.push(cur.trim());
+    return fields;
+  }
+
+  function parseCSV(text) {
+    const lines = text.trim().split(/\r?\n/).filter(l => l.trim());
+    if (!lines.length) return [];
+
+    const firstParts = _splitCSVLine(lines[0]).map(p => p.toLowerCase().replace(/^['"]|['"]$/g, ''));
+    const hasHeader = firstParts.some(h => ['entity', 'attribute', 'days_since_tpx', 'value_binned', 'value', 'time', 'day'].includes(h));
+
+    let idxEntity = 0, idxAttr = 1, idxValue = 2, idxDays = 3;
+    if (hasHeader) {
+      const findCol = (names, fallback) => {
+        for (const n of names) {
+          const pos = firstParts.indexOf(n);
+          if (pos >= 0) return pos;
+        }
+        return fallback;
+      };
+      idxEntity = findCol(['entity'], -1);
+      idxAttr   = findCol(['attribute', 'attr'], -1);
+      idxValue  = findCol(['value_binned', 'value', 'val'], -1);
+      idxDays   = findCol(['days_since_tpx', 'time', 'day', 'days'], -1);
+      if (idxEntity < 0 || idxAttr < 0 || idxValue < 0 || idxDays < 0) {
+        // Fallback to standard 4-column positional order
+        [idxEntity, idxAttr, idxValue, idxDays] = [0, 1, 2, 3];
+      }
+    }
+
+    const dataLines = hasHeader ? lines.slice(1) : lines;
+    const events = [];
+    for (const line of dataLines) {
+      const parts = _splitCSVLine(line).map(p => p.replace(/^['"]|['"]$/g, '').trim());
+      if (parts.length < 4) continue;
+      const entity    = parts[idxEntity];
+      const attribute = parts[idxAttr];
+      const value     = parts[idxValue];
+      const days      = parseFloat(parts[idxDays]);
+      if (entity && attribute && value !== '' && !isNaN(days)) {
+        events.push({ entity, attribute, value, days_since_tpx: days });
+      }
+    }
+    events.sort((a, b) => a.days_since_tpx - b.days_since_tpx);
+    return events;
+  }
+
+  function parseJSON(text) {
+    const data = JSON.parse(text);
+    const arr  = Array.isArray(data) ? data : (data.events ?? []);
+    const events = arr
+      .filter(ev => ev && ev.entity && ev.attribute && (ev.value != null || ev.value_binned != null) && (ev.days_since_tpx != null || ev.time != null))
+      .map(ev => ({
+        entity:         String(ev.entity).trim(),
+        attribute:      String(ev.attribute).trim(),
+        value:          String(ev.value ?? ev.value_binned).trim(),
+        days_since_tpx: parseFloat(ev.days_since_tpx ?? ev.time),
+      }))
+      .filter(ev => !isNaN(ev.days_since_tpx));
+    events.sort((a, b) => a.days_since_tpx - b.days_since_tpx);
+    return events;
+  }
+
   function _handleFile(file) {
     const ext = file.name.split('.').pop().toLowerCase();
     if (!['csv', 'json'].includes(ext)) {
-      alert('Unsupported file format. Please upload a .csv or .json file.');
+      _notifyError('Unsupported file format. Please upload a .csv or .json file.');
       return;
     }
     const reader = new FileReader();
@@ -219,77 +308,25 @@ window.AIIDKIT_FORM = (() => {
         const text = e.target?.result || '';
         const events = ext === 'json' ? parseJSON(text) : parseCSV(text);
         if (!events.length) {
-          alert('No valid events found in the uploaded file.');
+          _notifyError('No valid clinical events found in the uploaded file.');
           return;
         }
 
-        // Reset results first
-        if (window.AIIDKIT && typeof window.AIIDKIT.clearPredictionResults === 'function') {
-          window.AIIDKIT.clearPredictionResults();
-        }
+        window.AIIDKIT?.clearPredictionResults?.();
+        window.AIIDKIT?.setCurrentPatientRawEvents?.(events);
 
-        // Set raw events in main orchestrator state
-        if (window.AIIDKIT && typeof window.AIIDKIT.setCurrentPatientRawEvents === 'function') {
-          window.AIIDKIT.setCurrentPatientRawEvents(events);
-        }
-
-        // Load events into manual entry form
-        const tbody = document.getElementById('patient-events-tbody');
-        if (tbody) {
-          tbody.innerHTML = '';
-          _rowCount = 0;
-          events.forEach(ev => addEventRow(ev));
-        }
-
-        // Switch active tab to Manual Entry form
+        setEvents(events);
         switchTab('form');
-        scrollToBottom();
 
-        // Clear file input so it can be uploaded again
         const fileInput = document.getElementById('file-input');
         if (fileInput) fileInput.value = '';
 
-        // Show toast
-        if (window.AIIDKIT && typeof window.AIIDKIT.showToast === 'function') {
-          window.AIIDKIT.showToast(`${events.length} events loaded into manual entry form.`, 'success');
-        }
+        window.AIIDKIT?.showToast?.(`${events.length} events loaded into manual entry form.`, 'success');
       } catch (err) {
-        alert(`Could not parse file: ${err.message}`);
+        _notifyError(`Could not parse file: ${err.message}`);
       }
     };
     reader.readAsText(file);
-  }
-
-  function parseCSV(text) {
-    const lines = text.trim().split(/\r?\n/).filter(l => l.trim());
-    if (!lines.length) return [];
-    const first = lines[0].toLowerCase();
-    const hasHeader = first.includes('entity') || first.includes('attribute');
-    const data = hasHeader ? lines.slice(1) : lines;
-    const events = [];
-    for (const line of data) {
-      const parts = line.split(',').map(p => p.trim().replace(/^["']|["']$/g, ''));
-      if (parts.length < 4) continue;
-      const [entity, attribute, value, daysStr] = parts;
-      const days = parseFloat(daysStr);
-      if (entity && attribute && value && !isNaN(days)) {
-        events.push({ entity, attribute, value, days_since_tpx: days });
-      }
-    }
-    return events;
-  }
-
-  function parseJSON(text) {
-    const data = JSON.parse(text);
-    const arr  = Array.isArray(data) ? data : (data.events ?? []);
-    return arr
-      .filter(ev => ev && ev.entity && ev.attribute && ev.value != null && ev.days_since_tpx != null)
-      .map(ev => ({
-        entity:         String(ev.entity),
-        attribute:      String(ev.attribute),
-        value:          String(ev.value),
-        days_since_tpx: parseFloat(ev.days_since_tpx),
-      }));
   }
 
   // ------------------------------------------------------------------
@@ -297,42 +334,27 @@ window.AIIDKIT_FORM = (() => {
   // ------------------------------------------------------------------
 
   async function loadExample(type) {
-    if (window.AIIDKIT && typeof window.AIIDKIT.showLoading === 'function') {
-      window.AIIDKIT.showLoading('Loading example patient data…');
-    }
+    window.AIIDKIT?.showLoading?.('Loading example patient data…');
     try {
-      const res = await fetch(`/api/examples/${type}`);
+      const res = await fetch(`/api/examples/${encodeURIComponent(type)}`);
       if (!res.ok) {
         let msg = `HTTP ${res.status}`;
         try { const j = await res.json(); msg = j.error || msg; } catch (_) {}
         throw new Error(msg);
       }
       const events = await res.json();
-      
-      // Set raw events in main orchestrator state
-      if (window.AIIDKIT && typeof window.AIIDKIT.setCurrentPatientRawEvents === 'function') {
-        window.AIIDKIT.setCurrentPatientRawEvents(events);
-      }
+      events.sort((a, b) => parseFloat(a.days_since_tpx) - parseFloat(b.days_since_tpx));
 
-      const tbody = document.getElementById('patient-events-tbody');
-      if (!tbody) return;
-      tbody.innerHTML = '';
-      _rowCount = 0;
-      events.forEach(ev => addEventRow(ev));
-      scrollToBottom();
-      if (window.AIIDKIT && typeof window.AIIDKIT.showToast === 'function') {
-        const labels = { high: 'High', mod: 'Moderate', low: 'Low' };
-        window.AIIDKIT.showToast(`${labels[type] || type}-risk example patient loaded (${events.length} events).`, 'success');
-      }
+      window.AIIDKIT?.setCurrentPatientRawEvents?.(events);
+      setEvents(events);
+
+      const labels = { high: 'High', mod: 'Moderate', low: 'Low' };
+      window.AIIDKIT?.showToast?.(`${labels[type] || type}-risk example patient loaded (${events.length} events).`, 'success');
     } catch (err) {
       console.error('[AIIDKIT] Failed to load example patient:', err);
-      if (window.AIIDKIT && typeof window.AIIDKIT.showToast === 'function') {
-        window.AIIDKIT.showToast(`Failed to load example patient: ${err.message}`, 'error');
-      }
+      _notifyError(`Failed to load example patient: ${err.message}`);
     } finally {
-      if (window.AIIDKIT && typeof window.AIIDKIT.hideLoading === 'function') {
-        window.AIIDKIT.hideLoading();
-      }
+      window.AIIDKIT?.hideLoading?.();
     }
   }
 
@@ -366,8 +388,5 @@ window.AIIDKIT_FORM = (() => {
     scrollToBottom();
   }
 
-  // ------------------------------------------------------------------
-  // PUBLIC API
-  // ------------------------------------------------------------------
   return { initForm, addEventRow, getFormEvents, loadExample, clearForm, clearUpload, setEvents };
 })();

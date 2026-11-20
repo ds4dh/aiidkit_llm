@@ -1,28 +1,26 @@
 """
 AIIDKIT Decision Support Tool — Mock Data Generator
 ====================================================
-Generates 250 clinically-plausible synthetic patients for demonstration.
-Uses the exact t-EAV schema and clinical vocabulary of the real AIIDKIT
-dataset. No real patient data is exposed.
-
-When MODEL_PATH is set in config.py this module is bypassed entirely and
-real inference runs instead.
-
-Architecture
-------------
-generate_cohort_data(seed)  →  dict   (the /api/cohort payload)
-mock_predict(events, horizon, cohort)  →  dict  (the /api/predict payload)
+Generates 250 clinically-plausible synthetic patients for demonstration using
+the exact v3.9 t-EAV entity/attribute schema and supporting arbitrary unified
+task & horizon configurations (including all 13 canonical tasks across 7 horizons).
 """
 
+from collections import defaultdict
+import copy
+import hashlib
+import random
 import numpy as np
 from scipy.special import expit
-import config as CONFIG
-from collections import defaultdict
 
-# ---------------------------------------------------------------------------
-# CLUSTER PROFILES
-# Three archetypal patient phenotypes with distinct risk signatures.
-# ---------------------------------------------------------------------------
+import config as CONFIG
+from src.tasks import format_horizon_label, get_task_meta
+
+
+STATIC_ENTITY_SET = {
+    "Patient info", "Donor info", "Transplant info", "Mismatch info",
+    "Serology info", "Patient serology", "Immunology", "History",
+}
 
 CLUSTER_PROFILES = [
     {
@@ -30,44 +28,34 @@ CLUSTER_PROFILES = [
         "name": "High risk",
         "color": "#FF4757",
         "n": 120,
-        "base_risk": 0.45,
-        "risk_std": 0.12,
-        "event_rate": 0.32,
+        "base_risk": 0.42,
+        "risk_std": 0.11,
+        "event_rate": 0.28,
         "umap_center": (1.5, 2.3),
         "umap_spread": 1.2,
-        # Risk-elevating features (positive attribution)
         "risk_features": [
-            ("Medication",  "Tacrolimus",        "Higher",  0.18),
-            ("Lab result",  "WBC",               "Lowest",  0.16),
-            ("Lab result",  "Lymphocyte count",  "Lowest",  0.14),
-            ("Infection",   "CMV",               "1",       0.13),
-            ("Lab result",  "CRP",               "Higher",  0.12),
-            ("Comorbidity", "Diabetes mellitus", "1",       0.10),
-            ("Lab result",  "eGFR",              "Lowest",  0.09),
+            ("Patient lab",  "Tacrolimus level (µg/l)", "Higher",  0.18),
+            ("Patient lab",  "Leukocytes (G/l)",        "Lowest",  0.16),
+            ("Patient lab",  "Lymphocytes (G/l)",       "Lowest",  0.14),
+            ("Infection",    "Pathogen",                "CMV",     0.13),
+            ("Patient lab",  "CRP (mg/l)",              "Higher",  0.12),
+            ("Comorbidity",  "Diagnosis",               "Diabetes mellitus", 0.10),
+            ("Patient lab",  "eGFR (mL/min/1.73m²)",    "Lowest",  0.09),
         ],
-        # Protective features (negative attribution)
-        "protective_features": [
-            ("Medication", "Cotrimoxazole",  "1", -0.09),
-            ("Medication", "Valganciclovir", "1", -0.08),
-        ],
-        # Typical clinical profile for sequence generation
         "event_weights": {
-            ("Medication",    "Tacrolimus",           ("Higher", "Highest", "High")):   0.9,
-            ("Medication",    "Mycophenolate Mofetil",("1",)):                  0.9,
-            ("Medication",    "Glucocorticoid",       ("Middle", "High")):      0.8,
-            ("Medication",    "Cotrimoxazole",        ("0",)):                  0.6,
-            ("Medication",    "Valganciclovir",       ("0", "1")):              0.5,
-            ("Lab result",    "Creatinine",           ("High", "Higher")):      0.9,
-            ("Lab result",    "eGFR",                 ("Low", "Lowest")):       0.9,
-            ("Lab result",    "Tacrolimus level",     ("Higher", "Highest")):   0.9,
-            ("Lab result",    "WBC",                  ("Lowest", "Lower")):     0.8,
-            ("Lab result",    "Lymphocyte count",     ("Lowest", "Lower")):     0.7,
-            ("Lab result",    "CRP",                  ("High", "Higher")):      0.7,
-            ("Infection",     "CMV",                  ("1",)):                  0.6,
-            ("Clinical event","Rejection event",      ("0", "1")):              0.4,
-            ("Comorbidity",   "Diabetes mellitus",    ("1",)):                  0.6,
-            ("Comorbidity",   "Hypertension",         ("1",)):                  0.8,
-            ("Donor",         "CMV D/R status",       ("D+/R+", "D+/R-")):     0.6,
+            ("Medication",   "Start (immunosuppression)",    ("Tacrolimus", "Mycophenolate Mofetil", "Glucocorticoid")): 0.9,
+            ("Medication",   "Stop (infection prophylaxis)", ("Cotrimoxazole", "Valganciclovir")): 0.55,
+            ("Patient lab",  "Creatinine (µmol/l)",          ("High", "Higher")): 0.9,
+            ("Patient lab",  "eGFR (mL/min/1.73m²)",         ("Low", "Lowest")): 0.9,
+            ("Patient lab",  "Tacrolimus level (µg/l)",      ("Higher", "Highest")): 0.85,
+            ("Patient lab",  "Leukocytes (G/l)",             ("Lowest", "Lower")): 0.8,
+            ("Patient lab",  "Lymphocytes (G/l)",            ("Lowest", "Lower")): 0.75,
+            ("Patient lab",  "CRP (mg/l)",                   ("High", "Higher")): 0.75,
+            ("Infection",    "Pathogen",                     ("CMV", "E. coli", "Klebsiella pneumoniae")): 0.55,
+            ("Organ event",  "Diagnosis",                    ("Biops proven rj", "Graft pyelonephritis")): 0.45,
+            ("Comorbidity",  "Diagnosis",                    ("Diabetes mellitus", "Hypertension")): 0.65,
+            ("Donor info",   "Type",                         ("DBD", "DCD")): 0.7,
+            ("Serology info","CMV",                          ("D+/R-", "D+/R+")): 0.65,
         },
     },
     {
@@ -76,353 +64,282 @@ CLUSTER_PROFILES = [
         "color": "#00C9A7",
         "n": 130,
         "base_risk": 0.08,
-        "risk_std": 0.04,
-        "event_rate": 0.06,
+        "risk_std": 0.035,
+        "event_rate": 0.05,
         "umap_center": (-3.0, -2.0),
         "umap_spread": 1.2,
         "risk_features": [
-            ("Lab result",  "Creatinine", "High", 0.05),
-        ],
-        "protective_features": [
-            ("Medication",  "Cotrimoxazole",       "1",              -0.12),
-            ("Medication",  "Valganciclovir",      "1",              -0.09),
-            ("Lab result",  "eGFR",                "High",           -0.08),
-            ("Lab result",  "WBC",                 "Middle",         -0.06),
-            ("Donor",       "Donor type",          "Living related", -0.07),
-            ("Medication",  "Tacrolimus",          "Middle",         -0.05),
+            ("Patient lab", "Creatinine (µmol/l)", "Middle", 0.03),
         ],
         "event_weights": {
-            ("Medication",    "Tacrolimus",           ("Low", "Middle")):       0.9,
-            ("Medication",    "Mycophenolate Mofetil",("1",)):                  0.9,
-            ("Medication",    "Glucocorticoid",       ("Lowest", "Low")):       0.8,
-            ("Medication",    "Cotrimoxazole",        ("1",)):                  0.9,
-            ("Medication",    "Valganciclovir",       ("1",)):                  0.7,
-            ("Lab result",    "Creatinine",           ("Low", "Middle")):       0.9,
-            ("Lab result",    "eGFR",                 ("High", "Higher")):      0.9,
-            ("Lab result",    "Tacrolimus level",     ("Low", "Middle")):       0.9,
-            ("Lab result",    "WBC",                  ("Middle",)):             0.8,
-            ("Lab result",    "CRP",                  ("Low", "Middle")):       0.7,
-            ("Comorbidity",   "Diabetes mellitus",    ("0",)):                  0.8,
-            ("Comorbidity",   "Hypertension",         ("0", "1")):              0.6,
-            ("Donor",         "Donor type",           ("Living related", "DBD")):0.7,
-            ("Donor",         "CMV D/R status",       ("D-/R-", "D-/R+")):     0.6,
+            ("Medication",   "Start (immunosuppression)",    ("Tacrolimus", "Mycophenolate Mofetil")): 0.9,
+            ("Medication",   "Start (infection prophylaxis)",("Cotrimoxazole", "Valganciclovir")): 0.85,
+            ("Patient lab",  "Creatinine (µmol/l)",          ("Low", "Middle")): 0.9,
+            ("Patient lab",  "eGFR (mL/min/1.73m²)",         ("High", "Higher")): 0.9,
+            ("Patient lab",  "Tacrolimus level (µg/l)",      ("Low", "Middle")): 0.9,
+            ("Patient lab",  "Leukocytes (G/l)",             ("Middle",)): 0.85,
+            ("Patient lab",  "CRP (mg/l)",                   ("Lowest", "Low")): 0.8,
+            ("Donor info",   "Type",                         ("Living related", "Living unrelated")): 0.75,
+            ("Serology info","CMV",                          ("D-/R-", "D-/R+")): 0.7,
         },
     },
 ]
 
-# Common baseline events added for all patients at day 0
 BASELINE_EVENTS = [
-    ("Clinical event", "Transplantation event", ["1"]),
-    ("Patient",        "Age at transplant",     ["Lower", "Low", "Middle", "High", "Higher"]),
-    ("Patient",        "Sex",                   ["Male", "Female"]),
-    ("Patient",        "Dialysis duration",     ["Low", "Middle", "High"]),
+    ("Transplant info", "Transplant event",          ["Kidney"]),
+    ("Patient info",    "Age at transplant (years)", ["Lower", "Low", "Middle", "High", "Higher"]),
+    ("Patient info",    "Sex",                       ["Male", "Female"]),
+    ("Transplant info", "Dialysis Type (Pre-Tx)",    ["HD", "PD"]),
 ]
 
-# Follow-up time points where labs / meds are re-assessed (days since Tpx)
-FOLLOW_UP_DAYS = [0, 7, 14, 30, 60, 90]
+_RISK_FEATURE_SCORES: dict[tuple[str, str, str], float] = {
+    ("Patient lab",  "Tacrolimus level (µg/l)",       "Highest"): 0.20,
+    ("Patient lab",  "Tacrolimus level (µg/l)",       "Higher"):  0.17,
+    ("Patient lab",  "Tacrolimus level (µg/l)",       "High"):    0.11,
+    ("Patient lab",  "Leukocytes (G/l)",              "Lowest"):  0.16,
+    ("Patient lab",  "Leukocytes (G/l)",              "Lower"):   0.10,
+    ("Patient lab",  "Lymphocytes (G/l)",             "Lowest"):  0.14,
+    ("Patient lab",  "Lymphocytes (G/l)",             "Lower"):   0.09,
+    ("Infection",    "Pathogen",                      "CMV"):     0.13,
+    ("Infection",    "Pathogen",                      "E. coli"): 0.12,
+    ("Infection",    "Pathogen",                      "Klebsiella pneumoniae"): 0.13,
+    ("Patient lab",  "CRP (mg/l)",                    "Highest"): 0.15,
+    ("Patient lab",  "CRP (mg/l)",                    "Higher"):  0.12,
+    ("Patient lab",  "CRP (mg/l)",                    "High"):    0.08,
+    ("Comorbidity",  "Diagnosis",                     "Diabetes mellitus"): 0.10,
+    ("Patient lab",  "eGFR (mL/min/1.73m²)",          "Lowest"):  0.11,
+    ("Patient lab",  "eGFR (mL/min/1.73m²)",          "Lower"):   0.07,
+    ("Organ event",  "Diagnosis",                     "Biops proven rj"): 0.12,
+    ("Organ event",  "Diagnosis",                     "Graft pyelonephritis"): 0.15,
+    ("Medication",   "Stop (infection prophylaxis)",  "Cotrimoxazole"): 0.09,
+    ("Medication",   "Stop (infection prophylaxis)",  "Valganciclovir"): 0.09,
+    # Protective
+    ("Medication",   "Start (infection prophylaxis)", "Cotrimoxazole"): -0.11,
+    ("Medication",   "Start (infection prophylaxis)", "Valganciclovir"): -0.09,
+    ("Patient lab",  "eGFR (mL/min/1.73m²)",          "High"):    -0.08,
+    ("Patient lab",  "eGFR (mL/min/1.73m²)",          "Higher"):  -0.10,
+    ("Patient lab",  "eGFR (mL/min/1.73m²)",          "Highest"): -0.12,
+    ("Donor info",   "Type",                          "Living related"): -0.07,
+    ("Patient lab",  "Creatinine (µmol/l)",           "Lowest"):  -0.09,
+    ("Patient lab",  "Creatinine (µmol/l)",           "Low"):     -0.06,
+    ("Patient lab",  "CRP (mg/l)",                    "Lowest"):  -0.05,
+}
 
 
-# ---------------------------------------------------------------------------
-# HELPER: Kaplan-Meier estimator
-# ---------------------------------------------------------------------------
-
-def _km_estimate(durations, events, eval_times):
-    """
-    Right-censored Kaplan-Meier survival estimate with Greenwood CI.
-    Returns (survival, ci_lower, ci_upper) at each eval_time.
-    """
-    durations = np.asarray(durations, dtype=float)
-    events    = np.asarray(events,    dtype=int)
-    n_total   = len(durations)
-
-    # Unique event times
-    event_times = np.sort(np.unique(durations[events == 1]))
-
-    km_t = [0.0]
-    km_s = [1.0]
-    km_g = [0.0]   # Greenwood's accumulator
-
-    s = 1.0
-    g = 0.0
-    for t in event_times:
-        at_risk = int((durations >= t).sum())
-        d       = int(((durations == t) & (events == 1)).sum())
-        if at_risk > 0 and d > 0:
-            s *= (at_risk - d) / at_risk
-            if at_risk * (at_risk - d) > 0:
-                g += d / (at_risk * (at_risk - d))
-        km_t.append(float(t))
-        km_s.append(float(s))
-        km_g.append(float(g))
-
-    # Step-function lookup at each eval_time
-    survival, ci_lo, ci_hi = [], [], []
-    for ev_t in eval_times:
-        idx = 0
-        for i, tt in enumerate(km_t):
-            if tt <= ev_t:
-                idx = i
-        s_val = km_s[idx]
-        g_val = km_g[idx]
-        se    = s_val * np.sqrt(g_val)
-        survival.append(float(np.clip(s_val, 0, 1)))
-        ci_lo.append(float(np.clip(s_val - 1.96 * se, 0, 1)))
-        ci_hi.append(float(np.clip(s_val + 1.96 * se, 0, 1)))
-
-    return survival, ci_lo, ci_hi
+def _horizon_multiplier(horizon: int) -> float:
+    """Smooth monotone growth factor across arbitrary horizons (30d .. 1800d)."""
+    return float(1.0 + 0.18 * np.log1p(max(0.0, (float(horizon) - 30.0) / 30.0)))
 
 
-def _log_rank_p(t1, e1, t2, e2):
-    """Compute log-rank test statistic and p-value (chi-squared, df=1)."""
-    from scipy.stats import chi2
-    all_times = np.sort(np.unique(
-        np.concatenate([t1[e1 == 1], t2[e2 == 1]])
-    ))
-    O1 = O2 = E1 = E2 = 0.0
-    for t in all_times:
-        n1 = (t1 >= t).sum()
-        n2 = (t2 >= t).sum()
-        d1 = ((t1 == t) & (e1 == 1)).sum()
-        d2 = ((t2 == t) & (e2 == 1)).sum()
-        n  = n1 + n2
-        d  = d1 + d2
-        if n > 0:
-            O1 += d1;  O2 += d2
-            E1 += n1 * d / n
-            E2 += n2 * d / n
-    if E1 < 1e-9 or E2 < 1e-9:
-        return 1.0
-    chi2_stat = (O1 - E1)**2 / E1 + (O2 - E2)**2 / E2
-    return float(1 - chi2.cdf(chi2_stat, df=1))
+def _apply_horizon_multiplier(base_prob_30d: float, horizon: int) -> float:
+    """Monotonically scales a 30d probability in log-odds space so P(H1) <= P(H2)."""
+    p = float(np.clip(base_prob_30d, 0.005, 0.985))
+    if horizon <= 30:
+        return round(p, 4)
+    shift = 0.34 * np.log(float(horizon) / 30.0)
+    logit_p = np.log(p / (1.0 - p))
+    return round(float(np.clip(expit(logit_p + shift), p, 0.99)), 4)
 
 
-# ---------------------------------------------------------------------------
-# PATIENT SEQUENCE GENERATOR
-# ---------------------------------------------------------------------------
+def build_clinical_narrative(
+    *,
+    task_key: str,
+    task_label: str,
+    selected_horizon: int,
+    horizons: list[int],
+    risk_scores: dict[str, float],
+    calibrated_risks: dict[str, float],
+    cluster_name: str,
+) -> str:
+    """Builds an outcome-aware, multi-horizon clinical summary sentence."""
+    meta = get_task_meta(task_key)
+    clinical_noun = meta["clinical_noun"]
+    score_noun = "infection score" if meta["is_infection"] else "risk score"
+    h_lbl = format_horizon_label(selected_horizon, style="long")
+    sel_s = int(round(risk_scores.get(f"{selected_horizon}d", 0.0) * 100))
+    sel_c = float(calibrated_risks.get(f"{selected_horizon}d", 0.0)) * 100.0
+
+    other_hs = [h for h in horizons if h != selected_horizon]
+    ref_hs = [other_hs[0], other_hs[-1]] if len(other_hs) >= 2 else other_hs
+    ref_parts = [
+        f"{format_horizon_label(oh, style='short')} {int(round(risk_scores.get(f'{oh}d', 0.0) * 100))}/100 "
+        f"({calibrated_risks.get(f'{oh}d', 0.0) * 100.0:.1f}%)"
+        for oh in ref_hs
+    ]
+    ref_sentence = (
+        f" Reference trajectories span {' to '.join(ref_parts)} across the prediction window."
+        if ref_parts
+        else ""
+    )
+    return (
+        f"At the {h_lbl} horizon, the patient's {score_noun} for {task_label} is "
+        f"{sel_s}/100 (calibrated probability: {sel_c:.1f}%), placing them in the "
+        f"'{cluster_name}' subgroup.{ref_sentence} Overall, the patient is stratified as "
+        f"{cluster_name} for post-transplant {clinical_noun}."
+    )
+
 
 def _generate_patient_sequence(profile, rng, follow_up_days):
-    """Return a list of EAV event dicts for one patient."""
     events = []
-
-    # Baseline events (day 0 — transplantation day)
-    for (entity, attribute, values) in BASELINE_EVENTS:
-        val = rng.choice(values)
+    for entity, attribute, values in BASELINE_EVENTS:
         events.append({
-            "entity": entity, "attribute": attribute,
-            "value": val, "days_since_tpx": 0.0,
+            "entity": entity,
+            "attribute": attribute,
+            "value": str(rng.choice(values)),
+            "days_since_tpx": 0.0,
         })
 
-    # Donor data (day 0)
-    for (key, attr, values), prob in profile["event_weights"].items():
-        if key == "Donor" and rng.random() < prob:
-            val = rng.choice(values)
+    for (ent, attr, values), prob in profile["event_weights"].items():
+        if ent in STATIC_ENTITY_SET and rng.random() < prob:
             events.append({
-                "entity": key, "attribute": attr,
-                "value": val, "days_since_tpx": 0.0,
+                "entity": ent,
+                "attribute": attr,
+                "value": str(rng.choice(values)),
+                "days_since_tpx": 0.0,
             })
 
-    # Follow-up events (meds + labs per time point)
     for day in follow_up_days[1:]:
-        # Jitter time slightly
-        t = float(day) + rng.uniform(-2, 2)
-        t = max(1.0, t)
-        for (key, attr, values), prob in profile["event_weights"].items():
-            if key in ("Medication", "Lab result") and rng.random() < prob:
-                val = rng.choice(values)
+        t = round(max(1.0, float(day) + float(rng.uniform(-2.0, 2.0))), 1)
+        for (ent, attr, values), prob in profile["event_weights"].items():
+            if ent in ("Medication", "Patient lab") and rng.random() < prob:
                 events.append({
-                    "entity": key, "attribute": attr,
-                    "value": val, "days_since_tpx": round(t, 1),
+                    "entity": ent,
+                    "attribute": attr,
+                    "value": str(rng.choice(values)),
+                    "days_since_tpx": t,
+                })
+            elif ent in ("Infection", "Organ event", "Comorbidity") and rng.random() < prob * 0.4:
+                events.append({
+                    "entity": ent,
+                    "attribute": attr,
+                    "value": str(rng.choice(values)),
+                    "days_since_tpx": t,
                 })
 
-        # Occasional infection or clinical events
-        for (key, attr, values), prob in profile["event_weights"].items():
-            if key in ("Infection", "Clinical event", "Comorbidity") and rng.random() < prob * 0.4:
-                val = rng.choice(values)
-                events.append({
-                    "entity": key, "attribute": attr,
-                    "value": val, "days_since_tpx": round(t, 1),
-                })
-
-    # Sort by time
     events.sort(key=lambda e: e["days_since_tpx"])
     return events
 
 
 def _patient_summary(events):
-    """Build a short human-readable summary from the event sequence."""
     snippets = []
     for e in events:
-        attr = e["attribute"]
-        val  = e["value"]
-        if attr == "Tacrolimus" and val in ("Higher", "Highest"):
-            snippets.append("Tacrolimus\u2191")
-        if attr == "WBC" and val in ("Lowest", "Lower"):
-            snippets.append("Leucopenia")
-        if attr == "CMV" and val == "1":
-            snippets.append("CMV+")
-        if attr == "Cotrimoxazole" and val == "1":
-            snippets.append("Cotrimoxazole\u2713")
-        if attr == "Rejection event" and val == "1":
+        ent, attr, val = e.get("entity", ""), e.get("attribute", ""), e.get("value", "")
+        if "Tacrolimus" in attr and val in ("High", "Higher", "Highest"):
+            snippets.append("Tacrolimus↑")
+        elif "Leukocytes" in attr and val in ("Lowest", "Lower"):
+            snippets.append("Leukopenia")
+        elif ent == "Infection" and val not in ("0", "False", "No"):
+            snippets.append(f"{val}+")
+        elif ent == "Medication" and "Start" in attr and val == "Cotrimoxazole":
+            snippets.append("Cotrimoxazole✓")
+        elif ent == "Organ event" and "rj" in val.lower():
             snippets.append("Rejection")
-        if attr == "eGFR" and val in ("Lowest", "Lower"):
+        elif "eGFR" in attr and val in ("Lowest", "Lower"):
             snippets.append("Low eGFR")
-        if attr == "CRP" and val in ("High", "Higher", "Highest"):
-            snippets.append("CRP\u2191")
-        if attr == "Diabetes mellitus" and val == "1":
+        elif "CRP" in attr and val in ("High", "Higher", "Highest"):
+            snippets.append("CRP↑")
+        elif val == "Diabetes mellitus":
             snippets.append("DM")
-    seen = []
-    for s in snippets:
-        if s not in seen:
-            seen.append(s)
-    return ", ".join(seen[:5]) if seen else "Standard profile"
+    dedup = list(dict.fromkeys(snippets))
+    return ", ".join(dedup[:4]) if dedup else "Standard profile"
 
-
-# ---------------------------------------------------------------------------
-# MAIN COHORT GENERATOR
-# ---------------------------------------------------------------------------
 
 def generate_cohort_data(fup: int = 90, seed: int = 42) -> dict:
-    """
-    Generate all cohort data returned by GET /api/cohort.
-
-    Returns a dict ready to be jsonified.
-    """
     rng = np.random.default_rng(seed)
-
-    # Dynamically resolve follow-up days based on selected FUP
+    horizons = list(getattr(CONFIG, "AVAILABLE_HORIZONS", [30, 60, 90, 180, 360, 720, 1800]))
     all_fup_days = [0, 7, 14, 30, 60, 90, 180, 360, 720]
-    follow_up_days = [d for d in all_fup_days if d <= fup]
+    follow_up_days = [d for d in all_fup_days if d <= fup] or [0]
 
-    # 1. Create the base patient records (static fields)
     base_patients = []
     patient_seqs = []
+    fup_phase = float(fup) / 90.0
     for profile in CLUSTER_PROFILES:
         n = profile["n"]
         cx, cy = profile["umap_center"]
         spread = profile["umap_spread"]
         ux = rng.normal(cx, spread, n)
         uy = rng.normal(cy, spread, n)
-        
+        drift_x = rng.normal(0.18 if profile["id"] == 0 else -0.15, 0.12, n)
+        drift_y = rng.normal(0.15 if profile["id"] == 0 else -0.12, 0.12, n)
+
         for i in range(n):
             seq = _generate_patient_sequence(profile, rng, follow_up_days)
             base_patients.append({
-                "umap_x": float(ux[i]),
-                "umap_y": float(uy[i]),
+                "umap_x": float(ux[i] + drift_x[i] * np.tanh(fup_phase * 0.6)),
+                "umap_y": float(uy[i] + drift_y[i] * np.tanh(fup_phase * 0.6)),
                 "profile": profile,
                 "summary": _patient_summary(seq),
             })
             patient_seqs.append(seq)
 
-    # Shuffling index so patient IDs are randomized
     shuffled_indices = list(range(len(base_patients)))
     rng.shuffle(shuffled_indices)
 
-    # Generate labels and risk scores for each horizon dynamically
-    horizons_data = {}
-    
-    # Pre-generate risk scores and labels for all patients so we can maintain consistency
+    max_h = max(horizons)
     patient_metrics = []
     for bp in base_patients:
         prof = bp["profile"]
-        # Monotonal risks
-        r30 = float(np.clip(rng.normal(prof["base_risk"], prof["risk_std"]), 0.01, 0.99))
-        r60 = float(np.clip(r30 * 1.12, 0.01, 0.99))
-        r90 = float(np.clip(r30 * 1.22, 0.01, 0.99))
-        
-        # Generate consistent time to event
-        if prof["id"] == 0:  # High risk
-            u = rng.random()
-            if u < 0.32:
-                t_event = int(rng.uniform(5, 30))
-            elif u < 0.42:
-                t_event = int(rng.uniform(31, 60))
-            elif u < 0.48:
-                t_event = int(rng.uniform(61, 90))
-            elif u < 0.60:
-                t_event = int(rng.uniform(91, 360))
-            else:
-                t_event = None
-        else:  # Low risk
-            u = rng.random()
-            if u < 0.06:
-                t_event = int(rng.uniform(5, 30))
-            elif u < 0.09:
-                t_event = int(rng.uniform(31, 60))
-            elif u < 0.12:
-                t_event = int(rng.uniform(61, 90))
-            elif u < 0.18:
-                t_event = int(rng.uniform(91, 360))
-            else:
-                t_event = None
-                
-        # derive monotonic true labels
-        l30 = 1 if (t_event is not None and t_event <= 30) else 0
-        l60 = 1 if (t_event is not None and t_event <= 60) else 0
-        l90 = 1 if (t_event is not None and t_event <= 90) else 0
-        
+        r30 = float(np.clip(rng.normal(prof["base_risk"], prof["risk_std"]), 0.02, 0.95))
+        risks_by_h = {h: _apply_horizon_multiplier(r30, h) for h in horizons}
+
+        u = float(rng.random())
+        if prof["id"] == 0:
+            t_event = int(rng.exponential(scale=280.0)) + 4 if u < 0.72 else None
+        else:
+            t_event = int(rng.exponential(scale=950.0)) + 15 if u < 0.25 else None
+        if t_event is not None and t_event > max_h:
+            t_event = None
+
+        labels_by_h = {h: (1 if (t_event is not None and t_event <= h) else 0) for h in horizons}
         imminence = float(np.exp(-t_event / 365.0)) if t_event is not None else 0.0
-        
         patient_metrics.append({
-            "risks": {30: r30, 60: r60, 90: r90},
-            "labels": {30: l30, 60: l60, 90: l90},
+            "risks": risks_by_h,
+            "labels": labels_by_h,
             "days_to_event": t_event,
-            "event_imminence": round(imminence, 4)
+            "event_imminence": round(imminence, 4),
         })
 
-    # For each horizon, build the cohort data
-    for h in [30, 60, 90]:
+    horizons_data = {}
+    for h in horizons:
         h_patients = []
         all_risks = []
-        
-        for idx in shuffled_indices:
+
+        for out_idx, idx in enumerate(shuffled_indices):
             bp = base_patients[idx]
             metrics = patient_metrics[idx]
             prof = bp["profile"]
-            
             risk = metrics["risks"][h]
             label = metrics["labels"][h]
-            days_to_event = metrics["days_to_event"]
-            event_imminence = metrics["event_imminence"]
-            
-            # Determine UI cluster based on config method
-            if getattr(CONFIG, "CLUSTERING_METHOD", "model_risk") == "clusterer":
+
+            if getattr(CONFIG, "CLUSTERING_METHOD", "clusterer") == "clusterer":
                 best_cluster = prof
             else:
-                if risk >= CONFIG.RISK_THRESHOLD:
-                    best_cluster = CLUSTER_PROFILES[0]
-                else:
-                    best_cluster = CLUSTER_PROFILES[1]
-            
-            pid = f"PAT_{len(h_patients)+1:03d}"
-            logit_v = np.log(risk / (1.0 - risk))
-            cal_risk = float(np.clip(expit(logit_v - 1.5), 0.01, 0.95))
-            
+                best_cluster = CLUSTER_PROFILES[0] if risk >= CONFIG.RISK_THRESHOLD else CLUSTER_PROFILES[1]
+
+            logit_v = np.log(np.clip(risk, 1e-4, 1.0 - 1e-4) / (1.0 - np.clip(risk, 1e-4, 1.0 - 1e-4)))
+            cal_risk = float(np.clip(expit(logit_v - 1.35), 0.005, 0.96))
+
             h_patients.append({
-                "id":            pid,
-                "umap_x":        bp["umap_x"],
-                "umap_y":        bp["umap_y"],
-                "risk_score":    risk,
+                "id":              f"PAT_{out_idx + 1:03d}",
+                "umap_x":          round(bp["umap_x"], 3),
+                "umap_y":          round(bp["umap_y"], 3),
+                "risk_score":      risk,
                 "calibrated_risk": round(cal_risk, 4),
-                "cluster":       best_cluster["id"],
-                "cluster_name":  best_cluster["name"],
-                "cluster_color": best_cluster["color"],
-                "true_label":    label,
-                "summary":       bp["summary"],
-                "days_to_event": days_to_event,
-                "event_imminence": event_imminence,
-                "top_features":  [
-                    {"feature": f"{e} - {a}", "value": v, "score": s}
-                    for (e, a, v, s) in prof["risk_features"][:3]
-                ]
+                "cluster":         best_cluster["id"],
+                "cluster_name":    best_cluster["name"],
+                "cluster_color":   best_cluster["color"],
+                "true_label":      label,
+                "summary":         bp["summary"],
+                "days_to_event":   metrics["days_to_event"],
+                "event_imminence": metrics["event_imminence"],
             })
             all_risks.append(risk)
 
-        # Risk distribution
         rv = np.array(all_risks)
         risk_distribution = {
-            "values":      [round(float(x), 4) for x in rv],
-            "mean":        round(float(rv.mean()), 4),
-            "std":         round(float(rv.std()),  4),
+            "values": [round(float(x), 4) for x in rv],
+            "mean": round(float(rv.mean()), 4),
+            "std": round(float(rv.std()), 4),
             "percentiles": {
                 "p25": round(float(np.percentile(rv, 25)), 4),
                 "p50": round(float(np.percentile(rv, 50)), 4),
@@ -431,121 +348,77 @@ def generate_cohort_data(fup: int = 90, seed: int = 42) -> dict:
             },
         }
 
-        # Count patient-level features in each cluster for prevalence calculations
         cluster_sizes = {0: 0, 1: 0}
         for p in h_patients:
             cluster_sizes[p["cluster"]] = cluster_sizes.get(p["cluster"], 0) + 1
-            
+
         static_counts = {0: defaultdict(int), 1: defaultdict(int)}
         recent_counts = {0: defaultdict(int), 1: defaultdict(int)}
         all_static_features = set()
         all_recent_features = set()
 
-        for idx in shuffled_indices:
-            c_id = h_patients[shuffled_indices.index(idx)]["cluster"]
+        for out_idx, idx in enumerate(shuffled_indices):
+            c_id = h_patients[out_idx]["cluster"]
             seq = patient_seqs[idx]
-            
-            patient_static = set()
-            patient_recent = set()
-            
-            # Find the max time in the sequence
+            p_static = set()
+            p_recent = set()
             valid_times = [float(ev.get("days_since_tpx", 0.0)) for ev in seq if ev.get("entity") and ev.get("attribute")]
             max_t = max(valid_times) if valid_times else 0.0
-            
+
             for ev in seq:
                 ent = ev.get("entity", "")
                 attr = ev.get("attribute", "")
                 val = ev.get("value", "")
                 t_val = float(ev.get("days_since_tpx", 0.0))
-                
-                if not ent or not attr or not val:
+                if not ent or not attr or not val or attr in ("Transplant event", "Transplant procedure"):
                     continue
-                if attr in ["Transplantation event", "Transplant procedure"]:
-                    continue
-                    
                 feat = (ent, attr, val)
-                
-                # Check if static: Patient/Donor entity or time <= 0.0
-                is_static = (ent in ["Patient", "Donor"] or t_val <= 0.0)
-                # Check if recent: not static and occurred within the last month of the observation window
-                is_recent = (not is_static and t_val > 0.0 and t_val >= (max_t - 30.0))
-                
+                is_static = ent in STATIC_ENTITY_SET or t_val <= 0.0
                 if is_static:
-                    patient_static.add(feat)
-                elif is_recent:
-                    patient_recent.add(feat)
-                    
-            for feat in patient_static:
+                    p_static.add(feat)
+                elif t_val >= max(0.1, max_t - 30.0):
+                    p_recent.add(feat)
+
+            for feat in p_static:
                 static_counts[c_id][feat] += 1
                 all_static_features.add(feat)
-            for feat in patient_recent:
+            for feat in p_recent:
                 recent_counts[c_id][feat] += 1
                 all_recent_features.add(feat)
 
-        # Cluster profiles
         cluster_profiles = {}
         for profile in CLUSTER_PROFILES:
             c_id = profile["id"]
             other_c_id = 1 - c_id
             c_size = cluster_sizes.get(c_id, 0)
             other_size = cluster_sizes.get(other_c_id, 0)
-            
-            c_labels = [p["true_label"] for p in h_patients if p["cluster"] == c_id]
-            c_event_rate = float(np.mean(c_labels)) if c_labels else profile["event_rate"] * (1.25 if h==60 else 1.45 if h==90 else 1.0)
-            c_event_rate = min(0.99, c_event_rate)
-            
-            # Static differential features (enriched in current cluster vs opposite cluster)
-            static_diffs = []
-            for feat in all_static_features:
-                p_c = (static_counts[c_id][feat] / c_size) if c_size > 0 else 0.0
-                p_opp = (static_counts[other_c_id][feat] / other_size) if other_size > 0 else 0.0
-                p_global = (static_counts[c_id][feat] + static_counts[other_c_id][feat]) / float(len(h_patients))
-                if p_global > 0.85:
-                    continue
-                diff = p_c - p_opp
-                if diff >= 0.04 and (p_opp == 0 or (p_c / p_opp) >= 1.15):
-                    enrichment_score = diff * (p_c / (p_opp + 0.05))
-                    static_diffs.append((feat, diff, enrichment_score))
-            sorted_static = sorted(static_diffs, key=lambda x: x[2], reverse=True)[:10]
-            top_static = []
-            for (ent, attr, val), diff, _ in sorted_static:
-                score = diff if c_id == 0 else -diff
-                top_static.append({
-                    "feature": f"{ent} - {attr}",
-                    "value": val,
-                    "score": score
-                })
+            c_labels = [p["true_label"] for p in h_patients if p["cluster"] == c_id and p["true_label"] >= 0]
+            c_event_rate = min(0.99, float(np.mean(c_labels)) if c_labels else 0.0)
 
-            # Recent differential features (enriched in current cluster vs opposite cluster)
-            recent_diffs = []
-            for feat in all_recent_features:
-                p_c = (recent_counts[c_id][feat] / c_size) if c_size > 0 else 0.0
-                p_opp = (recent_counts[other_c_id][feat] / other_size) if other_size > 0 else 0.0
-                p_global = (recent_counts[c_id][feat] + recent_counts[other_c_id][feat]) / float(len(h_patients))
-                if p_global > 0.85:
-                    continue
-                diff = p_c - p_opp
-                if diff >= 0.04 and (p_opp == 0 or (p_c / p_opp) >= 1.15):
-                    enrichment_score = diff * (p_c / (p_opp + 0.05))
-                    recent_diffs.append((feat, diff, enrichment_score))
-            sorted_recent = sorted(recent_diffs, key=lambda x: x[2], reverse=True)[:10]
-            top_recent = []
-            for (ent, attr, val), diff, _ in sorted_recent:
-                score = diff if c_id == 0 else -diff
-                top_recent.append({
-                    "feature": f"{ent} - {attr}",
-                    "value": val,
-                    "score": score
-                })
-                
-            cluster_profiles[str(profile["id"])] = {
-                "name":        profile["name"],
-                "n_patients":  c_size,
-                "event_rate":  round(c_event_rate, 4),
-                "color":       profile["color"],
+            def _top_enriched(counts_dict, universe):
+                diffs = []
+                for feat in universe:
+                    p_c = (counts_dict[c_id][feat] / c_size) if c_size > 0 else 0.0
+                    p_opp = (counts_dict[other_c_id][feat] / other_size) if other_size > 0 else 0.0
+                    p_glob = (counts_dict[c_id][feat] + counts_dict[other_c_id][feat]) / float(max(1, len(h_patients)))
+                    if p_glob > 0.85:
+                        continue
+                    diff = p_c - p_opp
+                    if diff >= 0.04 and (p_opp == 0 or (p_c / p_opp) >= 1.15):
+                        diffs.append((feat, diff, diff * (p_c / (p_opp + 0.05))))
+                return [
+                    {"feature": f"{ent} - {attr}", "value": val, "score": (diff if c_id == 0 else -diff)}
+                    for (ent, attr, val), diff, _ in sorted(diffs, key=lambda x: x[2], reverse=True)[:10]
+                ]
+
+            cluster_profiles[str(c_id)] = {
+                "name":       profile["name"],
+                "n_patients": c_size,
+                "event_rate": round(c_event_rate, 4),
+                "color":      profile["color"],
                 "top_features": {
-                    "static": top_static,
-                    "recent": top_recent
+                    "static": _top_enriched(static_counts, all_static_features),
+                    "recent": _top_enriched(recent_counts, all_recent_features),
                 },
             }
 
@@ -555,257 +428,240 @@ def generate_cohort_data(fup: int = 90, seed: int = 42) -> dict:
             "cluster_profiles": cluster_profiles,
         }
 
-    # Compute global attributions from _RISK_FEATURE_SCORES
-    global_attrs = []
-    for (ent, attr, val), score in _RISK_FEATURE_SCORES.items():
-        global_attrs.append({
-            "feature": f"{ent} - {attr}",
-            "value": val,
-            "score": score
-        })
-    global_attributions = sorted(global_attrs, key=lambda x: abs(x["score"]), reverse=True)[:15]
+    tasks_data = {}
+    available_tasks = getattr(CONFIG, "AVAILABLE_TASKS", [{"key": CONFIG.TASK, "label": CONFIG.TASK}])
+    for t_info in available_tasks:
+        t_key = t_info["key"]
+        scale = float(get_task_meta(t_key).get("mock_scale", 0.80))
+        if abs(scale - 1.0) < 1e-6:
+            tasks_data[t_key] = {"horizons": horizons_data}
+        else:
+            t_horizons = copy.deepcopy(horizons_data)
+            for h_obj in t_horizons.values():
+                for p in h_obj["patients"]:
+                    p["risk_score"] = round(float(np.clip(p["risk_score"] * scale, 0.01, 0.99)), 4)
+                    p["calibrated_risk"] = round(float(np.clip(p["calibrated_risk"] * scale, 0.005, 0.98)), 4)
+                rv = np.array([p["risk_score"] for p in h_obj["patients"]])
+                h_obj["risk_distribution"] = {
+                    "values": [round(float(x), 4) for x in rv],
+                    "mean": round(float(rv.mean()), 4),
+                    "std": round(float(rv.std()), 4),
+                    "percentiles": {
+                        "p25": round(float(np.percentile(rv, 25)), 4),
+                        "p50": round(float(np.percentile(rv, 50)), 4),
+                        "p75": round(float(np.percentile(rv, 75)), 4),
+                        "p90": round(float(np.percentile(rv, 90)), 4),
+                    },
+                }
+                for c_prof in h_obj["cluster_profiles"].values():
+                    c_prof["event_rate"] = round(float(min(0.99, c_prof["event_rate"] * scale)), 4)
+            tasks_data[t_key] = {"horizons": t_horizons}
 
+    default_horizons = tasks_data.get(CONFIG.TASK, {"horizons": horizons_data})["horizons"]
     return {
-        "horizons": horizons_data,
-        "global_attributions": global_attributions,
+        "fup": fup,
+        "global_umap_bounds": {"min_x": -6.5, "max_x": 5.5, "min_y": -5.5, "max_y": 6.0},
+        "horizons": default_horizons,
+        "tasks": tasks_data,
     }
 
 
-# ---------------------------------------------------------------------------
-# MOCK PREDICTION
-# ---------------------------------------------------------------------------
-
-_RISK_FEATURE_SCORES: dict[tuple, float] = {
-    # Key: (entity, attribute, value) → attribution score
-    ("Medication",  "Tacrolimus",        "Highest"):     0.20,
-    ("Medication",  "Tacrolimus",        "Higher"):      0.18,
-    ("Medication",  "Tacrolimus",        "High"):        0.12,
-    ("Lab result",  "WBC",               "Lowest"):      0.16,
-    ("Lab result",  "WBC",               "Lower"):       0.10,
-    ("Lab result",  "Lymphocyte count",  "Lowest"):      0.14,
-    ("Lab result",  "Lymphocyte count",  "Lower"):       0.09,
-    ("Infection",   "CMV",               "1"):           0.13,
-    ("Lab result",  "CRP",               "Higher"):      0.12,
-    ("Lab result",  "CRP",               "Highest"):     0.14,
-    ("Lab result",  "CRP",               "High"):        0.08,
-    ("Comorbidity", "Diabetes mellitus", "1"):           0.10,
-    ("Lab result",  "eGFR",              "Lowest"):      0.09,
-    ("Lab result",  "eGFR",              "Lower"):       0.06,
-    ("Infection",   "Bacterial infection","1"):          0.11,
-    ("Infection",   "UTI",               "1"):           0.08,
-    ("Clinical event","Rejection event", "1"):           0.09,
-    # Protective
-    ("Medication",  "Cotrimoxazole",     "1"):          -0.12,
-    ("Medication",  "Valganciclovir",    "1"):          -0.09,
-    ("Lab result",  "eGFR",             "High"):        -0.08,
-    ("Lab result",  "eGFR",             "Higher"):      -0.10,
-    ("Lab result",  "eGFR",             "Highest"):     -0.12,
-    ("Donor",       "Donor type",        "Living related"): -0.07,
-    ("Medication",  "Tacrolimus",       "Low"):         -0.06,
-    ("Medication",  "Tacrolimus",       "Lowest"):      -0.08,
-    ("Lab result",  "WBC",             "High"):         -0.05,
-    ("Lab result",  "WBC",             "Middle"):       -0.04,
-    ("Lab result",  "Creatinine",       "Lowest"):      -0.10,
-    ("Lab result",  "Creatinine",       "Low"):         -0.07,
-    ("Lab result",  "Tacrolimus level", "Lowest"):      -0.09,
-    ("Lab result",  "Tacrolimus level", "Low"):         -0.06,
-}
-
-# Horizon multipliers for monotone risk (30d < 60d < 90d)
-_HORIZON_MULT = {30: 1.0, 60: 1.12, 90: 1.22}
-
-
-def _risk_category(score: float) -> tuple[str, str]:
-    if score < CONFIG.RISK_THRESHOLD:   return "Low risk",  "#00C9A7"
-    return                              "High risk", "#FF4757"
-
-
 def _deterministic_seed(events: list[dict]) -> int:
-    import hashlib
-    # Sort events to ensure order-independence
     sorted_events = sorted(
         events,
         key=lambda e: (
             float(e.get("days_since_tpx", 0.0)),
             str(e.get("entity", "")),
             str(e.get("attribute", "")),
-            str(e.get("value", ""))
-        )
+            str(e.get("value", "")),
+        ),
     )
     event_str = "".join(
         f"{e.get('entity')}-{e.get('attribute')}-{e.get('value')}-{e.get('days_since_tpx')}"
         for e in sorted_events
     )
-    return int(hashlib.md5(event_str.encode("utf-8")).hexdigest(), 16) & 0xffffffff
+    return int(hashlib.md5(event_str.encode("utf-8")).hexdigest(), 16) & 0xFFFFFFFF
 
 
-def mock_predict(events: list[dict], horizon: int, cohort: dict) -> dict:
-    """
-    Simulate a model prediction for a new patient.
+def _truncate_events_for_fup(events: list[dict], fup: int | None) -> list[dict]:
+    if fup is None or not events:
+        return list(events)
+    filtered = [e for e in events if float(e.get("days_since_tpx", 0.0)) <= float(fup)]
+    if not filtered:
+        min_day = min(float(e.get("days_since_tpx", 0.0)) for e in events)
+        filtered = [e for e in events if float(e.get("days_since_tpx", 0.0)) <= min_day]
+    return filtered
 
-    Parameters
-    ----------
-    events  : list of dicts with keys entity, attribute, value, days_since_tpx
-    horizon : prediction horizon in days (30, 60, or 90)
-    cohort  : the cohort dict returned by generate_cohort_data()
 
-    Returns
-    -------
-    dict ready to be jsonified as the /api/predict response.
-    """
-    # --- Compute attributions per event ---
-    attribution_map: dict[str, dict] = {}   # key: "entity-attribute: value"
+def _mock_stage_coords_and_scores(events_at_stage: list[dict], fup_val: int) -> tuple[float, float, float]:
     raw_score = 0.0
-
-    events_with_scores = []
-    for ev in events:
+    for ev in events_at_stage:
         key = (ev.get("entity", ""), ev.get("attribute", ""), ev.get("value", ""))
-        sc  = _RISK_FEATURE_SCORES.get(key, 0.0)
-        raw_score += sc
+        raw_score += _RISK_FEATURE_SCORES.get(key, 0.0)
+    if events_at_stage:
+        event_str = " ".join(
+            f"{e.get('entity', '')} {e.get('attribute', '')} {e.get('value', '') or e.get('value_binned', '')}"
+            for e in events_at_stage
+        ).lower()
+        if "pyelonephritis" in event_str:
+            raw_score += 0.21
+        elif "quinolone" in event_str or "pckd" in event_str:
+            raw_score -= 0.65
+
+    base_risk_30d_main = float(np.clip(expit(raw_score * 3.0), 0.04, 0.94))
+    risk_90d = _apply_horizon_multiplier(base_risk_30d_main, 90)
+    local_random = random.Random(_deterministic_seed(events_at_stage) ^ int(fup_val * 31))
+    alpha = float(np.clip((risk_90d - 0.10) / 0.65, 0.0, 1.0))
+    cx = -3.0 + alpha * 4.5
+    cy = -2.0 + alpha * 4.3
+    return (
+        round(float(cx + local_random.gauss(0, 0.22)), 3),
+        round(float(cy + local_random.gauss(0, 0.22)), 3),
+        base_risk_30d_main,
+    )
+
+
+def mock_predict(
+    events: list[dict],
+    horizon: int,
+    cohort: dict,
+    selected_task: str | None = None,
+    fup: int | None = None,
+    trajectory_fups: list[int] | None = None,
+) -> dict:
+    horizons = list(getattr(CONFIG, "AVAILABLE_HORIZONS", [30, 60, 90, 180, 360, 720, 1800]))
+    full_events = sorted(list(events), key=lambda e: float(e.get("days_since_tpx", 0.0)))
+    active_fup = fup if fup is not None else CONFIG.DEFAULT_FUP
+    stage_events = _truncate_events_for_fup(full_events, active_fup)
+
+    attribution_map: dict[str, dict] = {}
+    events_with_scores = []
+    for ev in stage_events:
+        key = (ev.get("entity", ""), ev.get("attribute", ""), ev.get("value", ""))
+        sc = _RISK_FEATURE_SCORES.get(key, 0.0)
         feat_key = f"{key[0]} - {key[1]}: {key[2]}"
         if feat_key not in attribution_map:
-            attribution_map[feat_key] = {
-                "feature": f"{key[0]} - {key[1]}",
-                "value":   key[2],
-                "score":   sc,
-            }
+            attribution_map[feat_key] = {"feature": f"{key[0]} - {key[1]}", "value": key[2], "score": sc}
         events_with_scores.append({**ev, "score": sc})
 
-    # Detect synthetic patients to calibrate their mock risk score in DEMO MODE
-    is_synth_low = False
-    is_synth_high = False
-    if events:
-        event_str = " ".join([f"{e.get('entity','')} {e.get('attribute','')} {e.get('value','') or e.get('value_binned','')}" for e in events]).lower()
-        if "pyelonephritis" in event_str or "graft pyelonephritis" in event_str:
-            # Synthetic high risk -> target high risk (~65%+)
-            raw_score += 0.21
-            is_synth_high = True
-        elif "quinolone" in event_str or "pckd" in event_str:
-            # Synthetic low risk -> target low risk (~10%)
-            raw_score += -0.73
-            is_synth_low = True
+    umap_x, umap_y, base_risk_30d_main = _mock_stage_coords_and_scores(stage_events, active_fup)
+    attributions = sorted(attribution_map.values(), key=lambda x: abs(x["score"]), reverse=True)[:15]
 
-    # Map raw attributions to [0.05, 0.95] via sigmoid
-    base_risk_30d = float(np.clip(expit(raw_score * 3.0), 0.05, 0.95))
+    available_tasks = getattr(CONFIG, "AVAILABLE_TASKS", [{"key": CONFIG.TASK, "label": CONFIG.TASK}])
+    cohort_tasks = cohort.get("tasks", {})
+    tasks_predictions = {}
 
-    # Apply horizon multiplier (monotone)
-    risk_scores = {
-        "30d": round(float(np.clip(base_risk_30d,        0.05, 0.95)), 4),
-        "60d": round(float(np.clip(base_risk_30d * 1.12, 0.05, 0.95)), 4),
-        "90d": round(float(np.clip(base_risk_30d * 1.22, 0.05, 0.95)), 4),
-    }
-    selected_risk = risk_scores[f"{horizon}d"]
-    
-    # Simulate calibrated risk by shifting mock logits by -1.5
-    calibrated_risks = {}
-    for k, v in risk_scores.items():
-        logit_v = np.log(v / (1.0 - v))
-        calibrated_risks[k] = round(float(np.clip(expit(logit_v - 1.5), 0.01, 0.95)), 4)
-        
-    selected_calibrated_risk = calibrated_risks[f"{horizon}d"]
-    # --- Assign cluster based on profile risk proximity ---
-    best_cluster = min(
-        CLUSTER_PROFILES,
-        key=lambda p: abs(p["base_risk"] - selected_risk),
-    )
-    cluster_id    = best_cluster["id"]
-    cluster_name  = best_cluster["name"]
-    cluster_color = best_cluster["color"]
-    category      = cluster_name
-    color         = cluster_color
+    for t_info in available_tasks:
+        t_key = t_info["key"]
+        t_label = t_info["label"]
+        scale = float(get_task_meta(t_key).get("mock_scale", 0.80))
+        b30 = float(np.clip(base_risk_30d_main * scale, 0.02, 0.94))
 
-    if category == "High risk":
-        q_t_event = 25
-        q_imminence = float(np.exp(-25.0 / 365.0))
-    else:
-        q_t_event = None
-        q_imminence = 0.0
+        risk_scores = {f"{h}d": _apply_horizon_multiplier(b30, h) for h in horizons}
+        calibrated_risks = {}
+        for hk, hv in risk_scores.items():
+            lv = np.log(np.clip(hv, 1e-4, 1.0 - 1e-4) / (1.0 - np.clip(hv, 1e-4, 1.0 - 1e-4)))
+            calibrated_risks[hk] = round(float(np.clip(expit(lv - 1.35), 0.005, 0.96)), 4)
 
-    # UMAP position near cluster center (with deterministic noise)
-    import random
-    seed_val = _deterministic_seed(events)
-    local_random = random.Random(seed_val)
-    cx, cy = best_cluster["umap_center"]
-    umap_x = round(float(cx + local_random.gauss(0, 0.3)), 3)
-    umap_y = round(float(cy + local_random.gauss(0, 0.3)), 3)
+        t_cohort = cohort_tasks.get(t_key, cohort)
+        first_cohort_pts = t_cohort["horizons"][str(horizons[0])]["patients"]
+        if first_cohort_pts:
+            umap_pts = np.array([[p["umap_x"], p["umap_y"]] for p in first_cohort_pts])
+            dists = np.sum((umap_pts - np.array([umap_x, umap_y])) ** 2, axis=1)
+            top_idx = np.argsort(dists)[:3]
+        else:
+            top_idx = np.array([], dtype=int)
 
-    # --- Percentile rank in cohort ---
-    active_cohort = cohort["horizons"][str(horizon)]
-    cohort_risks = np.array([p["risk_score"] for p in active_cohort["patients"]])
-    percentile   = int(np.round((cohort_risks < selected_risk).mean() * 100))
+        by_horizon = {}
+        for h in horizons:
+            selected_risk = risk_scores[f"{h}d"]
+            selected_calibrated_risk = calibrated_risks[f"{h}d"]
+            best_cluster = min(CLUSTER_PROFILES, key=lambda p: abs(p["base_risk"] * scale - selected_risk))
+            cluster_id = best_cluster["id"]
+            cluster_name = best_cluster["name"]
+            cluster_color = best_cluster["color"]
 
-    # --- Top attributions (sorted by abs score, top 15) ---
-    attributions = sorted(
-        attribution_map.values(),
-        key=lambda x: abs(x["score"]),
-        reverse=True,
-    )[:15]
+            active_cohort = t_cohort["horizons"][str(h)]
+            c_pts = active_cohort["patients"]
+            cohort_risks = np.array([p["risk_score"] for p in c_pts]) if c_pts else np.array([0.5])
+            percentile = int(np.round((cohort_risks < selected_risk).mean() * 100))
+            similar = [
+                {"id": c_pts[i]["id"], "risk_score": c_pts[i]["risk_score"], "summary": c_pts[i]["summary"]}
+                for i in top_idx if i < len(c_pts)
+            ]
 
-    # --- Similar patients (nearest in UMAP space) ---
-    umap_pts  = np.array([[p["umap_x"], p["umap_y"]] for p in active_cohort["patients"]])
-    query_pt  = np.array([umap_x, umap_y])
-    dists     = np.linalg.norm(umap_pts - query_pt, axis=1)
-    top_idx   = np.argsort(dists)[:3]
-    similar   = []
-    for i in top_idx:
-        p = active_cohort["patients"][i]
-        similar.append({
-            "id": p["id"],
-            "risk_score": p["risk_score"],
-            "summary": p["summary"],
+            risk_txt = build_clinical_narrative(
+                task_key=t_key,
+                task_label=t_label,
+                selected_horizon=h,
+                horizons=horizons,
+                risk_scores=risk_scores,
+                calibrated_risks=calibrated_risks,
+                cluster_name=cluster_name,
+            )
+
+            by_horizon[str(h)] = {
+                "task":               t_key,
+                "task_label":         t_label,
+                "risk_scores":        risk_scores,
+                "calibrated_risks":   calibrated_risks,
+                "selected_horizon":   h,
+                "risk_score":         selected_risk,
+                "calibrated_risk":    selected_calibrated_risk,
+                "risk_category":      cluster_name,
+                "risk_color":         cluster_color,
+                "percentile":         percentile,
+                "cluster":            cluster_id,
+                "cluster_name":       cluster_name,
+                "cluster_color":      cluster_color,
+                "umap_x":             umap_x,
+                "umap_y":             umap_y,
+                "days_to_event":      25 if cluster_id == 0 else None,
+                "event_imminence":    round(float(np.exp(-25.0 / 365.0)), 4) if cluster_id == 0 else 0.0,
+                "attributions":       [{**a, "score": round(a["score"] * scale, 4)} for a in attributions],
+                "events_with_scores": [{**ev, "score": round(ev["score"] * scale, 4)} for ev in events_with_scores],
+                "similar_patients":   similar,
+                "narrative":          risk_txt,
+                "ig_computed":        True,
+            }
+
+        sel_h_str = str(horizon if horizon in horizons else horizons[0])
+        tasks_predictions[t_key] = {
+            **by_horizon[sel_h_str],
+            "fup": active_fup,
+            "ig_computed": True,
+            "by_horizon": by_horizon,
+        }
+
+    if trajectory_fups is None:
+        trajectory_fups = [f for f in getattr(CONFIG, "AVAILABLE_FUPS", [0, 30, 60, 90]) if f <= active_fup]
+    trajectory = []
+    for f_step in trajectory_fups:
+        evs_f = _truncate_events_for_fup(full_events, f_step)
+        ux_f, uy_f, r30_f = _mock_stage_coords_and_scores(evs_f, f_step)
+        t_scores = {}
+        for t_info in available_tasks:
+            t_k = t_info["key"]
+            sc = float(get_task_meta(t_k).get("mock_scale", 0.80))
+            b30 = float(np.clip(r30_f * sc, 0.02, 0.94))
+            rs = {f"{h}d": _apply_horizon_multiplier(b30, h) for h in horizons}
+            cs = {
+                hk: round(float(np.clip(expit(np.log(hv / (1.0 - hv)) - 1.35), 0.005, 0.96)), 4)
+                for hk, hv in rs.items()
+            }
+            t_scores[t_k] = {"risk_scores": rs, "calibrated_risks": cs}
+        trajectory.append({
+            "fup": f_step,
+            "umap_x": ux_f,
+            "umap_y": uy_f,
+            "n_events": len(evs_f),
+            "tasks": t_scores,
         })
 
-    # --- Clinical narrative ---
-    h30_score = int(round(risk_scores.get("30d", selected_risk) * 100))
-    h60_score = int(round(risk_scores.get("60d", selected_risk) * 100))
-    h90_score = int(round(risk_scores.get("90d", selected_risk) * 100))
-    
-    h30_calib = int(round(calibrated_risks.get("30d", selected_calibrated_risk) * 100))
-    h60_calib = int(round(calibrated_risks.get("60d", selected_calibrated_risk) * 100))
-    h90_calib = int(round(calibrated_risks.get("90d", selected_calibrated_risk) * 100))
-
-    if horizon == 90:
-        risk_txt = (
-            f"The patient's predicted 90-day infection score is {h90_score}/100 (calibrated risk: {h90_calib}%), "
-            f"placing them in the '{cluster_name}' risk group. "
-            f"Shorter-term 30-day and 60-day infection scores are {h30_score}/100 ({h30_calib}%) and {h60_score}/100 ({h60_calib}%), respectively. "
-            f"Overall, the patient is categorized as {category} for post-transplant bacterial infection."
-        )
-    elif horizon == 60:
-        risk_txt = (
-            f"The patient's predicted 60-day infection score is {h60_score}/100 (calibrated risk: {h60_calib}%), "
-            f"placing them in the '{cluster_name}' risk group. "
-            f"Corresponding 30-day and 90-day infection scores are {h30_score}/100 ({h30_calib}%) and {h90_score}/100 ({h90_calib}%), respectively. "
-            f"Overall, the patient is categorized as {category} for post-transplant bacterial infection."
-        )
-    else:
-        risk_txt = (
-            f"The patient's predicted 30-day infection score is {h30_score}/100 (calibrated risk: {h30_calib}%), "
-            f"placing them in the '{cluster_name}' risk group. "
-            f"Longer-term 60-day and 90-day infection scores are {h60_score}/100 ({h60_calib}%) and {h90_score}/100 ({h90_calib}%), respectively. "
-            f"Overall, the patient is categorized as {category} for post-transplant bacterial infection."
-        )
-
+    active_task = selected_task if (selected_task and selected_task in tasks_predictions) else CONFIG.TASK
     return {
-        "risk_scores":       risk_scores,
-        "calibrated_risks":  calibrated_risks,
-        "selected_horizon":  horizon,
-        "risk_score":        selected_risk,
-        "calibrated_risk":   selected_calibrated_risk,
-        "risk_category":     category,
-        "risk_color":        color,
-        "percentile":        percentile,
-        "cluster":           cluster_id,
-        "cluster_name":      cluster_name,
-        "cluster_color":     cluster_color,
-        "umap_x":            umap_x,
-        "umap_y":            umap_y,
-        "days_to_event":     q_t_event,
-        "event_imminence":   round(q_imminence, 4),
-        "attributions":      [
-            {**a, "score": round(a["score"], 4)} for a in attributions
-        ],
-        "events_with_scores": events_with_scores,
-        "similar_patients":   similar,
-        "narrative":          risk_txt,
+        **tasks_predictions[active_task],
+        "fup": active_fup,
+        "trajectory": trajectory,
+        "tasks": tasks_predictions,
     }
