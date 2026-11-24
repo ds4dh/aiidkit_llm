@@ -97,14 +97,9 @@ def resolve_survival_label_keys(task_key: str) -> tuple[str, str, bool]:
     """
     Resolves a prediction task key into survival label column names.
 
-    Returns:
-        (time_key, status_key, is_derived)
-        `is_derived` is True for the three category task keys, i.e. endpoints that
-        pre-v3.9 datasets did not store. It is only a hint: whether pooling
-        actually happens is decided by the presence of `status_key` in the dataset
-        (checked inside `derive_category_survival_labels` and by both call sites),
-        so on v3.9+ data nothing is ever derived. Group endpoints ('grp_{group}')
-        and plain endpoints are always read exactly as stored.
+    Accepts both survival group keys ('grp_enterobacterales') and canonical
+    binary group keys ('infection_grp_enterobacterales'), mapping both to the
+    stored v3.9 `label_grp_{group}_{time,status}` columns.
     """
     category = CATEGORY_TASKS.get(task_key)
     if category is not None:
@@ -112,7 +107,8 @@ def resolve_survival_label_keys(task_key: str) -> tuple[str, str, bool]:
         status_key = f"label_{task_key}_status"
         # Category endpoint: stored columns win, pooling is a pre-v3.9 fallback only
         return time_key, status_key, True
-    return f"label_{task_key}_time", f"label_{task_key}_status", False
+    raw_key = task_key.removeprefix("infection_") if task_key.startswith("infection_grp_") else task_key
+    return f"label_{raw_key}_time", f"label_{raw_key}_status", False
 
 
 def derive_category_survival_labels(

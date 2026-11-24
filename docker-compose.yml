@@ -1,0 +1,34 @@
+services:
+  aiidkit-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: aiidkit-web-tool:latest
+    container_name: aiidkit-web-tool
+    restart: unless-stopped
+    ports:
+      - "${AIIDKIT_BIND_IP:-127.0.0.1}:${AIIDKIT_PORT:-5000}:5000"
+    env_file:
+      - path: ./web_tool/.env
+        required: false
+    environment:
+      AIIDKIT_BUNDLE_DIR: /data/bundle
+      AIIDKIT_RUNTIME_CACHE_DIR: /var/cache/aiidkit/runtime
+      NUMBA_CACHE_DIR: /var/cache/aiidkit/numba
+      AIIDKIT_USE_GPU: "${AIIDKIT_USE_GPU:-false}"
+      AIIDKIT_TRUST_PROXY: "${AIIDKIT_TRUST_PROXY:-true}"
+      AIIDKIT_BASIC_AUTH_USER: "${AIIDKIT_BASIC_AUTH_USER:-aiidkit}"
+      AIIDKIT_BASIC_AUTH_PASS: "${AIIDKIT_BASIC_AUTH_PASS:-}"
+    volumes:
+      # Mount ONLY the de-identified embeddings-only server bundle (read-only)
+      - ./web_tool/server_bundle:/data/bundle:ro
+      # Named cache volume persists Numba JIT + derived UMAP reducer across restarts (<2s warm boot)
+      - aiidkit-runtime-cache:/var/cache/aiidkit
+    read_only: true
+    tmpfs:
+      - /tmp:size=256M,mode=1777
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  aiidkit-runtime-cache:

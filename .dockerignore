@@ -1,0 +1,30 @@
+# Exclude all raw/processed data, training checkpoints, caches, and HPC images from Docker build context.
+# The embeddings-only server_bundle is mounted read-only at runtime (/data/bundle:ro), never baked into layers.
+.git
+.gitignore
+.github
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.venv
+venv
+env
+*.sif
+results
+results*
+data
+data*
+logs
+scratch
+configs
+scripts
+web_tool/.cache
+web_tool/server_bundle
+web_tool/.env
+**/*.pkl
+**/*.safetensors
+**/*.pt
+**/*.pth
+**/*.bin
+**/*.arrow
+**/*.parquet

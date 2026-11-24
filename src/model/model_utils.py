@@ -9,7 +9,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Any
-from datasets import DatasetDict
+try:
+    from datasets import DatasetDict
+except ImportError:
+    DatasetDict = Any
 
 
 # -------------------------------------------------------------------

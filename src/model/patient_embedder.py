@@ -252,7 +252,13 @@ class PatientEmbeddingModelFactory:
         )
 
         # Patch model structure before loading weights
-        model = cls._patch_model(model, custom_embed, cfg_overrides or embedding_layer_config, task=task)
+        model = cls._patch_model(
+            model,
+            custom_embed,
+            cfg_overrides or embedding_layer_config,
+            task=task,
+            survival_head_config=kwargs.get("survival_head_config"),
+        )
 
         # Return a randomly initialized model if requested
         if reset_weights:
@@ -289,10 +295,10 @@ class PatientEmbeddingModelFactory:
         raise ValueError("Task must be 'masked', 'classification' or 'survival'")
 
     @classmethod
-    def _patch_model(cls, model, custom_embed, config_dict, task: str | None = None):
+    def _patch_model(cls, model, custom_embed, config_dict, task: str | None = None, survival_head_config: dict | None = None):
         """
         Attaches the custom layer (and dedicated continuous MLM head / causal next-event query head
-        when task == 'masked') and overrides the forward method.
+        when task == 'masked', or `SurvivEHRHead` when `survival_head_config` is supplied) and overrides forward.
         """
         # Attach layer as a submodule so it saves/loads with state_dict
         custom_embed.to(dtype=model.dtype, device=model.device)
@@ -310,6 +316,24 @@ class PatientEmbeddingModelFactory:
             for p in base_in_emb.parameters():
                 if id(p) not in out_emb_params:
                     p.requires_grad = False
+
+        if task == "survival" and survival_head_config:
+            from src.model.survival_utils import SurvivEHRHead
+            cls_drop = float(
+                config_dict.get(
+                    "dropout_classifier",
+                    getattr(model.config, "dropout_classifier", getattr(model.config, "classifier_dropout", 0.1)),
+                ) or 0.0
+            )
+            surv_kwargs = dict(survival_head_config)
+            surv_kwargs.setdefault("dropout_prob", cls_drop)
+            model.survival_head = SurvivEHRHead(hidden_size=hidden_size, **surv_kwargs).to(device=model.device)
+            # Freeze unused default sequence classifier weights so optimizer/DDP stay clean
+            for unused_attr in ("head", "classifier", "score"):
+                sub_mod = getattr(model, unused_attr, None)
+                if isinstance(sub_mod, nn.Module):
+                    for p in sub_mod.parameters():
+                        p.requires_grad = False
 
         if is_causal and task == "masked":
             # Causal Next-Event Query projector: fuses causal history state h_{t-1} with
@@ -391,9 +415,38 @@ class PatientEmbeddingModelFactory:
             return (loss_disc.float() if loss_disc is not None else 0.0) + 0.0 * logits_tensor.float().sum()
 
         # Define custom forward
-        def custom_forward(self, input_dict=None, inputs_embeds=None, labels=None, labels_num=None, **kwargs):
+        def custom_forward(self, input_dict=None, inputs_embeds=None, labels=None, labels_num=None, landmark_fup=None, **kwargs):
             is_causal_model = getattr(self.config, "is_causal_decoder", False)
             has_num_mlm_head = hasattr(self, "numerical_mlm_head") and getattr(self.patient_embedder, "use_numerical_embedding", True)
+            has_surv_ehr_head = hasattr(self, "survival_head")
+
+            if has_surv_ehr_head and input_dict is not None:
+                inputs_embeds = self.patient_embedder(**input_dict)
+                need_hidden = bool(kwargs.pop("output_hidden_states", False))
+                attn_mask = kwargs.get("attention_mask", None)
+                if hasattr(self, "model"):
+                    enc_kwargs = {"inputs_embeds": inputs_embeds, "attention_mask": attn_mask, "return_dict": True}
+                    if is_causal_model:
+                        enc_kwargs["use_cache"] = False
+                    backbone_out = self.model(**enc_kwargs)
+                    last_hidden = backbone_out.last_hidden_state
+                else:
+                    fw_kwargs = {k: v for k, v in kwargs.items() if k != "labels"}
+                    backbone_out = self.original_forward(inputs_embeds=inputs_embeds, output_hidden_states=True, **fw_kwargs)
+                    last_hidden = backbone_out.hidden_states[-1]
+                time_key = getattr(self.patient_embedder, "time_key", "days_since_tpx")
+                tok_times = input_dict.get(time_key, None) if isinstance(input_dict, dict) else None
+                logits = self.survival_head(
+                    last_hidden=last_hidden,
+                    attention_mask=attn_mask,
+                    token_times=tok_times,
+                    landmark_fup=landmark_fup,
+                )
+                return SequenceClassifierOutput(
+                    loss=None,
+                    logits=logits,
+                    hidden_states=(last_hidden,) if need_hidden else None,
+                )
 
             # ------------------------------------------------------------------
             # PATH 1: Generative / Causal Decoder Pre-Training (task == 'masked')
@@ -1150,22 +1203,40 @@ class PatientDataCollatorForClassification(PatientDataCollatorForMaskedLanguageM
 @dataclass
 class PatientDataCollatorForSurvival(PatientDataCollatorForClassification):
     """
-    Data collator for survival fine-tuning (Cox proportional hazards).
+    Data collator for single-task or multi-task survival fine-tuning.
 
-    Instead of one binary label per horizon, each patient provides a pair of
-    survival labels (already present in the raw datasets as
-    `label_{outcome}_time` and `label_{outcome}_status`). The collator stacks
-    them into a [batch, 2] label tensor with columns (time, status), matching
-    the target format expected by `CoxNLLLoss`.
+    Single-task: pass `time_label` and `status_label` -> labels tensor `[batch, 2]`.
+    Multi-task (K outcomes): pass `survival_label_pairs=[(t_0, s_0), ..., (t_{K-1}, s_{K-1})]`
+    -> labels tensor `[batch, 2*K]` (plus optional trailing Horvitz-Thompson `ipw_weight`
+       column `[batch, 2*K + 1]` when present on subsampled training splits), and
+       top-level float32 `landmark_fup` tensor `[batch]` when `fup` is present.
     """
-    time_label: str | None = None    # e.g. "label_infection_bacteria_time"
-    status_label: str | None = None  # e.g. "label_infection_bacteria_status"
+    time_label: str | None = None
+    status_label: str | None = None
+    survival_label_pairs: list[tuple[str, str]] | None = None
 
     def __post_init__(self):
-        if self.time_label is None or self.status_label is None:
-            raise ValueError(
-                "PatientDataCollatorForSurvival requires 'time_label' and 'status_label'."
-            )
-        # The parent collator pops label keys in order -> labels = [time, status]
-        self.label_keys = [self.time_label, self.status_label]
+        if self.survival_label_pairs is not None:
+            if not self.survival_label_pairs:
+                raise ValueError("PatientDataCollatorForSurvival: 'survival_label_pairs' must not be empty.")
+            self.label_keys = [col for t_col, s_col in self.survival_label_pairs for col in (t_col, s_col)]
+        else:
+            if self.time_label is None or self.status_label is None:
+                raise ValueError(
+                    "PatientDataCollatorForSurvival requires 'time_label' and 'status_label' (or 'survival_label_pairs')."
+                )
+            self.label_keys = [self.time_label, self.status_label]
         super().__post_init__()
+
+    def torch_call(self, samples: list[dict[str, np.ndarray]]) -> dict:
+        ipw_vals = None
+        if samples and "ipw_weight" in samples[0]:
+            samples = [dict(s) for s in samples]
+            ipw_vals = [float(s.pop("ipw_weight")) for s in samples]
+        batch = super().torch_call(samples)
+        if ipw_vals is not None:
+            w_col = torch.tensor(ipw_vals, dtype=torch.float32).unsqueeze(1)
+            batch["labels"] = torch.cat([batch["labels"], w_col], dim=1)
+        if "fup" in batch:
+            batch["landmark_fup"] = torch.as_tensor(batch["fup"], dtype=torch.float32)
+        return batch
