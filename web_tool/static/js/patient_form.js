@@ -336,7 +336,7 @@ window.AIIDKIT_FORM = (() => {
   async function loadExample(type) {
     window.AIIDKIT?.showLoading?.('Loading example patient data…');
     try {
-      const res = await fetch(`/api/examples/${encodeURIComponent(type)}`);
+      const res = await fetch(`api/examples/${encodeURIComponent(type)}`);
       if (!res.ok) {
         let msg = `HTTP ${res.status}`;
         try { const j = await res.json(); msg = j.error || msg; } catch (_) {}

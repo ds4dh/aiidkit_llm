@@ -1,7 +1,8 @@
 /**
  * AIIDKIT — main.js
- * Application orchestrator: state management, API calls,
- * dynamic multi-horizon cards, UI updates, and event listeners.
+ * Application orchestrator: multi-domain specialist routing (Bacteria, Viruses,
+ * Fungi, Graft Loss, Mortality), state management, dynamic horizon cards,
+ * per-domain UMAP manifolds & trajectories, and UI event listeners.
  * Exposes window.AIIDKIT  (call init() on DOMContentLoaded)
  */
 'use strict';
@@ -29,35 +30,73 @@ window.AIIDKIT = (() => {
   }
 
   // ================================================================
-  // STATE
+  // STATE (Multi-Domain Specialist Aware)
   // ================================================================
   const state = {
-    config:           null,
-    cohort:           null,
-    cohortsByFup:     {},
-    prediction:       null,
-    predictionsByFup: {},
-    trajectory:       [],
-    fupSteps:         [],
-    maxFup:           0,
-    patientMaxDay:    0,
-    showTrajectory:   true,
-    bgFetchToken:     0,
-    selectedTask:     'infection_bacteria',
-    selectedHorizon:  90,
-    selectedFup:      30,
-    chartsInitialized: false,
+    config:                  null,
+    cohortsByDomain:         {},   // { [domain]: { [fup]: cohortObj } }
+    predictionsByDomain:     {},   // { [domain]: { [fup]: predObj } }
+    trajectoriesByDomain:    {},   // { [domain]: trajectoryArray }
+    renderedUmapDomain:      null,
+    fupSteps:                [],
+    maxFup:                  0,
+    patientMaxDay:           0,
+    showTrajectory:          true,
+    bgFetchToken:            0,
+    selectedTask:            'infection_bacteria',
+    selectedHorizon:         90,
+    preferredAcuteHorizon:   90,
+    preferredLongHorizon:    360,
+    selectedFup:             30,
+    chartsInitialized:       false,
     currentPatientRawEvents: null,
   };
 
-  function _getAvailableHorizons() {
+  function _getTaskDomain(taskKey = state.selectedTask) {
+    return state.config?.task_to_domain?.[taskKey] || 'default';
+  }
+
+  function _getDomainLabel(domainKey) {
+    const dObj = (state.config?.domains || []).find(d => d.domain === domainKey);
+    return dObj?.label || '';
+  }
+
+  function _getAvailableHorizons(taskKey = state.selectedTask) {
+    const taskSpecific = state.config?.task_horizons?.[taskKey];
+    if (Array.isArray(taskSpecific) && taskSpecific.length > 0) {
+      return taskSpecific;
+    }
     return state.config?.available_horizons?.length
       ? state.config.available_horizons
       : [30, 60, 90];
   }
 
+  function _syncHorizonForTask(taskKey) {
+    const allowed = _getAvailableHorizons(taskKey);
+    if (allowed.includes(state.selectedHorizon)) return false;
+    const isLongTerm = allowed[0] >= 180;
+    const pref = isLongTerm ? state.preferredLongHorizon : state.preferredAcuteHorizon;
+    state.selectedHorizon = allowed.includes(pref) ? pref : allowed[Math.min(2, allowed.length - 1)];
+    return true;
+  }
+
+  function _rememberHorizonPreference(h) {
+    if (h >= 360) {
+      state.preferredLongHorizon = h;
+    } else {
+      state.preferredAcuteHorizon = h;
+    }
+  }
+
+  function _getActiveTrajectory() {
+    const dom = _getTaskDomain(state.selectedTask);
+    return state.trajectoriesByDomain[dom] || [];
+  }
+
   function getActiveTaskCohort() {
-    const activeCohortObj = state.cohortsByFup[state.selectedFup] || state.cohort;
+    const dom = _getTaskDomain(state.selectedTask);
+    const domMap = state.cohortsByDomain[dom] || {};
+    const activeCohortObj = domMap[state.selectedFup] || domMap[state.config?.default_fup ?? 30] || Object.values(domMap)[0];
     if (!activeCohortObj) return null;
     const taskCohort = activeCohortObj.tasks?.[state.selectedTask] || activeCohortObj;
     if (activeCohortObj.global_umap_bounds && !taskCohort.global_umap_bounds) {
@@ -67,11 +106,15 @@ window.AIIDKIT = (() => {
   }
 
   function _buildLightweightStagePred(fup) {
-    const basePred = state.predictionsByFup[state.maxFup] || state.prediction;
+    const dom = _getTaskDomain(state.selectedTask);
+    const domPreds = state.predictionsByDomain[dom] || {};
+    const basePred = domPreds[state.maxFup] || Object.values(domPreds)[0];
     if (!basePred) return null;
+
     const baseTask = basePred.tasks?.[state.selectedTask] || basePred;
     const baseHoriz = baseTask.by_horizon?.[String(state.selectedHorizon)] || baseTask;
-    const trajPt = (state.trajectory || []).find(pt => pt.fup === fup);
+    const traj = _getActiveTrajectory();
+    const trajPt = traj.find(pt => pt.fup === fup);
     if (!trajPt) return baseHoriz;
 
     const stTask = trajPt.tasks?.[state.selectedTask];
@@ -122,14 +165,33 @@ window.AIIDKIT = (() => {
     };
   }
 
+  function _getUnifiedTimelineContext() {
+    const dom = _getTaskDomain(state.selectedTask);
+    const domPreds = state.predictionsByDomain[dom] || {};
+    const fullPred = domPreds[state.maxFup] || Object.values(domPreds)[0];
+    if (!fullPred) return null;
+    const fullTask = fullPred.tasks?.[state.selectedTask] || fullPred;
+    const fullHoriz = fullTask.by_horizon?.[String(state.selectedHorizon)] || fullTask;
+    const fullEvents = fullHoriz.events_with_scores || [];
+    const finalFullScore = fullHoriz.risk_score;
+
+    const traj = _getActiveTrajectory();
+    const day0Pt = traj.find(pt => pt.fup === 0) || traj[0];
+    const baselineScore = day0Pt?.tasks?.[state.selectedTask]?.risk_scores?.[`${state.selectedHorizon}d`];
+    return {
+      fullEvents,
+      visibleEvents: fullEvents.filter(e => parseFloat(e.days_since_tpx ?? 0) <= state.selectedFup),
+      finalFullScore,
+      baselineScore,
+      cutoffFup: state.selectedFup,
+    };
+  }
+
   function getActiveTaskPrediction() {
-    const fupPred = state.predictionsByFup[state.selectedFup];
-    if (fupPred) {
-      const taskPred = fupPred.tasks?.[state.selectedTask] || fupPred;
-      return taskPred.by_horizon?.[String(state.selectedHorizon)] || taskPred;
-    }
-    if (state.prediction && state.selectedFup === state.maxFup) {
-      const taskPred = state.prediction.tasks?.[state.selectedTask] || state.prediction;
+    const dom = _getTaskDomain(state.selectedTask);
+    const domPreds = state.predictionsByDomain[dom] || {};
+    if (state.selectedFup === state.maxFup && domPreds[state.maxFup]) {
+      const taskPred = domPreds[state.maxFup].tasks?.[state.selectedTask] || domPreds[state.maxFup];
       return taskPred.by_horizon?.[String(state.selectedHorizon)] || taskPred;
     }
     return _buildLightweightStagePred(state.selectedFup);
@@ -149,19 +211,24 @@ window.AIIDKIT = (() => {
     return res.json();
   }
 
-  const fetchConfig = () => _fetch('/api/config');
-  const fetchCohort = async (fup) => {
+  const fetchConfig = () => _fetch('api/config');
+
+  const fetchCohort = async (fup, domainKey = null) => {
     const targetFup = fup != null ? fup : 30;
-    if (state.cohortsByFup[targetFup]) {
-      return state.cohortsByFup[targetFup];
+    const dom = domainKey || _getTaskDomain(state.selectedTask);
+    if (!state.cohortsByDomain[dom]) {
+      state.cohortsByDomain[dom] = {};
     }
-    const c = await _fetch(`/api/cohort?fup=${targetFup}`);
-    state.cohortsByFup[targetFup] = c;
+    if (state.cohortsByDomain[dom][targetFup]) {
+      return state.cohortsByDomain[dom][targetFup];
+    }
+    const c = await _fetch(`api/cohort?fup=${targetFup}&domain=${encodeURIComponent(dom)}`);
+    state.cohortsByDomain[dom][targetFup] = c;
     return c;
   };
 
   function submitPrediction(events, horizon, fup, task, maxFup, background = false) {
-    return _fetch('/api/predict', {
+    return _fetch('api/predict', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -216,24 +283,30 @@ window.AIIDKIT = (() => {
   function _refreshChartsAfterLayoutChange() {
     if (!state.chartsInitialized) return;
     const C = window.AIIDKIT_CHARTS;
+    const dom = _getTaskDomain(state.selectedTask);
     const taskCohort = getActiveTaskCohort();
     const activeCohort = taskCohort?.horizons?.[state.selectedHorizon];
     const activePred = getActiveTaskPrediction();
     if (!C || !activeCohort) return;
 
     C.initUMAP(activeCohort, taskCohort.global_umap_bounds);
+    state.renderedUmapDomain = dom;
     if (activePred) {
       C.updateUMAPWithPatient(
         activePred.umap_x,
         activePred.umap_y,
         activePred,
-        state.trajectory,
+        _getActiveTrajectory(),
         state.selectedFup,
         state.showTrajectory,
         (clickedFup) => setSelectedFup(clickedFup)
       );
-      if (activePred.events_with_scores) {
-        C.drawRiskTimelineGraph?.(activePred.events_with_scores, activePred.risk_score, state.selectedTask);
+      const tlCtx = _getUnifiedTimelineContext();
+      if (tlCtx && tlCtx.fullEvents.length) {
+        C.drawRiskTimelineGraph?.(tlCtx.fullEvents, tlCtx.finalFullScore, state.selectedTask, {
+          cutoffFup: tlCtx.cutoffFup,
+          baselineScore: tlCtx.baselineScore,
+        });
       }
     }
     C.resizeCharts?.();
@@ -258,6 +331,7 @@ window.AIIDKIT = (() => {
 
     if (!state.chartsInitialized) {
       const C = window.AIIDKIT_CHARTS;
+      const dom = _getTaskDomain(state.selectedTask);
       const taskCohort = getActiveTaskCohort();
       if (C && taskCohort) {
         requestAnimationFrame(() => {
@@ -265,6 +339,7 @@ window.AIIDKIT = (() => {
             const activeCohort = taskCohort.horizons[state.selectedHorizon];
             const activePred = getActiveTaskPrediction();
             C.initUMAP(activeCohort, taskCohort.global_umap_bounds);
+            state.renderedUmapDomain = dom;
             C.initHistogram(activeCohort.risk_distribution, state.selectedTask);
             C.initClusterProfiles(activeCohort.cluster_profiles);
 
@@ -273,15 +348,19 @@ window.AIIDKIT = (() => {
                 activePred.umap_x,
                 activePred.umap_y,
                 activePred,
-                state.trajectory,
+                _getActiveTrajectory(),
                 state.selectedFup,
                 state.showTrajectory,
                 (clickedFup) => setSelectedFup(clickedFup)
               );
               C.updateHistogramWithPatient(activePred.risk_score);
               C.highlightCluster(activePred.cluster);
-              if (activePred.events_with_scores) {
-                C.drawRiskTimelineGraph?.(activePred.events_with_scores, activePred.risk_score, state.selectedTask);
+              const tlCtx = _getUnifiedTimelineContext();
+              if (tlCtx && tlCtx.fullEvents.length) {
+                C.drawRiskTimelineGraph?.(tlCtx.fullEvents, tlCtx.finalFullScore, state.selectedTask, {
+                  cutoffFup: tlCtx.cutoffFup,
+                  baselineScore: tlCtx.baselineScore,
+                });
               }
             }
             state.chartsInitialized = true;
@@ -322,7 +401,7 @@ window.AIIDKIT = (() => {
     const metricsRow = document.getElementById('unified-metrics-row');
     if (!container) return;
 
-    const horizons = _getAvailableHorizons();
+    const horizons = _getAvailableHorizons(state.selectedTask);
     const isMultiGrid = horizons.length > 3;
     container.classList.toggle('multi-horizon-grid', isMultiGrid);
     metricsRow?.classList.toggle('has-multi-horizons', isMultiGrid);
@@ -343,6 +422,7 @@ window.AIIDKIT = (() => {
       item.addEventListener('click', () => {
         if (state.selectedHorizon === h) return;
         state.selectedHorizon = h;
+        _rememberHorizonPreference(h);
         applyActiveTaskAndHorizon(true);
       });
       container.appendChild(item);
@@ -350,7 +430,11 @@ window.AIIDKIT = (() => {
   }
 
   function updateRiskScoreCards(riskScores, calibratedRisks, horizon) {
-    const horizons = _getAvailableHorizons();
+    const horizons = _getAvailableHorizons(state.selectedTask);
+    if (!document.getElementById(`horizon-card-${horizons[0]}`) ||
+        document.querySelectorAll('#risk-horizons-container .risk-horizon-item').length !== horizons.length) {
+      renderHorizonCards();
+    }
     horizons.forEach(h => {
       const card = document.getElementById(`horizon-card-${h}`);
       const el = document.getElementById(`risk-${h}d`);
@@ -382,8 +466,16 @@ window.AIIDKIT = (() => {
   function renderTimeline(eventsWithScores) {
     const list = document.getElementById('timeline-list');
     if (!list) return;
-    if (!eventsWithScores?.length) {
-      list.innerHTML = '<li class="timeline-placeholder">No events to display.</li>';
+    const tlCtx = _getUnifiedTimelineContext();
+    const listEvents = tlCtx ? tlCtx.visibleEvents : (eventsWithScores || []);
+    if (!listEvents.length) {
+      list.innerHTML = '<li class="timeline-placeholder">No events up to this follow-up stage.</li>';
+      if (tlCtx && tlCtx.fullEvents.length) {
+        window.AIIDKIT_CHARTS?.drawRiskTimelineGraph?.(tlCtx.fullEvents, tlCtx.finalFullScore, state.selectedTask, {
+          cutoffFup: tlCtx.cutoffFup,
+          baselineScore: tlCtx.baselineScore,
+        });
+      }
       return;
     }
 
@@ -401,7 +493,7 @@ window.AIIDKIT = (() => {
       return `rgb(${Math.round(c0[0] + (c1[0] - c0[0]) * u)}, ${Math.round(c0[1] + (c1[1] - c0[1]) * u)}, ${Math.round(c0[2] + (c1[2] - c0[2]) * u)})`;
     }
 
-    const sorted = [...eventsWithScores].sort((a, b) => a.days_since_tpx - b.days_since_tpx);
+    const sorted = [...listEvents].sort((a, b) => a.days_since_tpx - b.days_since_tpx);
     list.innerHTML = '';
 
     const activeCohort = getActiveTaskCohort()?.horizons?.[state.selectedHorizon];
@@ -473,19 +565,26 @@ window.AIIDKIT = (() => {
       list.appendChild(li);
     });
 
-    const activePred = getActiveTaskPrediction();
-    window.AIIDKIT_CHARTS?.drawRiskTimelineGraph?.(sorted, activePred?.risk_score, state.selectedTask);
+    if (tlCtx && tlCtx.fullEvents.length) {
+      window.AIIDKIT_CHARTS?.drawRiskTimelineGraph?.(tlCtx.fullEvents, tlCtx.finalFullScore, state.selectedTask, {
+        cutoffFup: tlCtx.cutoffFup,
+        baselineScore: tlCtx.baselineScore,
+      });
+    } else {
+      const activePred = getActiveTaskPrediction();
+      window.AIIDKIT_CHARTS?.drawRiskTimelineGraph?.(sorted, activePred?.risk_score, state.selectedTask);
+    }
   }
 
   // ================================================================
-  // ANALYSE & FUP STAGE MANAGEMENT
+  // ANALYSE, SPECIALIST SWITCHING & FUP STAGE MANAGEMENT
   // ================================================================
 
   function clearPredictionResults() {
     state.bgFetchToken += 1;
-    state.prediction = null;
-    state.predictionsByFup = {};
-    state.trajectory = [];
+    state.predictionsByDomain = {};
+    state.trajectoriesByDomain = {};
+    state.renderedUmapDomain = null;
     state.fupSteps = [];
     state.chartsInitialized = false;
 
@@ -514,7 +613,6 @@ window.AIIDKIT = (() => {
       .slice()
       .sort((a, b) => a - b);
 
-    // Choose the smallest FUP landmark >= maxDay so no entered clinical events are truncated away!
     let bestFup = avail.find(f => f >= maxDay);
     if (bestFup === undefined) {
       bestFup = avail[avail.length - 1] ?? 0;
@@ -526,6 +624,9 @@ window.AIIDKIT = (() => {
 
   function _updateFupLabelsAndBadges() {
     const fup = state.selectedFup;
+    const dom = _getTaskDomain(state.selectedTask);
+    const domLabel = _getDomainLabel(dom);
+    const domPreds = state.predictionsByDomain[dom] || {};
     const stageText = fup === 0 ? 'Day 0 (Baseline)' : `Day ${fup}`;
     const shortStageText = `Day ${fup}`;
 
@@ -534,6 +635,16 @@ window.AIIDKIT = (() => {
 
     const badge2 = document.getElementById('assessment-fup-badge');
     if (badge2) badge2.textContent = shortStageText;
+
+    const specBadge = document.getElementById('assessment-specialist-badge');
+    if (specBadge) {
+      if (domLabel && state.config?.multi_domain_mode) {
+        specBadge.textContent = domLabel;
+        specBadge.classList.remove('hidden');
+      } else {
+        specBadge.classList.add('hidden');
+      }
+    }
 
     const panelTitle = document.getElementById('assessment-panel-title');
     if (panelTitle) {
@@ -550,10 +661,11 @@ window.AIIDKIT = (() => {
 
     const umapCaption = document.getElementById('umap-cohort-caption');
     if (umapCaption) {
+      const prefix = domLabel ? `${domLabel} manifold` : 'Reference cohort';
       if (fup === state.maxFup) {
-        umapCaption.textContent = `Reference cohort at Day ${fup} post-transplant (matched to patient timeline: Day ${state.patientMaxDay}) — proximity reflects clinical similarity.`;
+        umapCaption.textContent = `${prefix} at Day ${fup} post-transplant (matched to patient timeline: Day ${state.patientMaxDay}) — proximity reflects clinical similarity.`;
       } else {
-        umapCaption.textContent = `Historical stage view: Reference cohort & patient state at Day ${fup} post-transplant (full patient timeline reaches Day ${state.patientMaxDay}).`;
+        umapCaption.textContent = `Historical stage view: ${prefix} & patient state at Day ${fup} post-transplant (full patient timeline reaches Day ${state.patientMaxDay}).`;
       }
     }
 
@@ -568,15 +680,19 @@ window.AIIDKIT = (() => {
     document.querySelectorAll('.fup-tick-btn').forEach(btn => {
       const btnFup = parseInt(btn.dataset.fup, 10);
       btn.classList.toggle('active', btnFup === fup);
-      btn.classList.toggle('cached', Boolean(state.predictionsByFup[btnFup]));
+      btn.classList.toggle('cached', Boolean(domPreds[state.maxFup] && state.cohortsByDomain[dom]?.[btnFup]));
     });
   }
 
   function _updateFupBackgroundStatus() {
     const statusEl = document.getElementById('fup-bg-status');
     if (!statusEl) return;
+    const dom = _getTaskDomain(state.selectedTask);
+    const domPreds = state.predictionsByDomain[dom] || {};
+    const domCohorts = state.cohortsByDomain[dom] || {};
     const total = state.fupSteps.length;
-    const readyCount = state.fupSteps.filter(f => Boolean(state.predictionsByFup[f])).length;
+    const hasMainPred = Boolean(domPreds[state.maxFup]);
+    const readyCount = hasMainPred ? state.fupSteps.filter(f => Boolean(domCohorts[f])).length : 0;
 
     if (total <= 1) {
       statusEl.className = 'fup-bg-status ready';
@@ -591,7 +707,7 @@ window.AIIDKIT = (() => {
 
     document.querySelectorAll('.fup-tick-btn').forEach(btn => {
       const btnFup = parseInt(btn.dataset.fup, 10);
-      btn.classList.toggle('cached', Boolean(state.predictionsByFup[btnFup]));
+      btn.classList.toggle('cached', Boolean(hasMainPred && domCohorts[btnFup]));
     });
   }
 
@@ -599,6 +715,8 @@ window.AIIDKIT = (() => {
     const slider = document.getElementById('fup-slider');
     const ticksWrap = document.getElementById('fup-slider-ticks');
     const trajBtn = document.getElementById('fup-trajectory-toggle');
+    const dom = _getTaskDomain(state.selectedTask);
+    const domPreds = state.predictionsByDomain[dom] || {};
     const steps = state.fupSteps.length ? state.fupSteps : [state.selectedFup];
 
     if (slider) {
@@ -619,7 +737,7 @@ window.AIIDKIT = (() => {
       steps.forEach((f) => {
         const btn = document.createElement('button');
         btn.type = 'button';
-        btn.className = `fup-tick-btn${f === state.selectedFup ? ' active' : ''}${state.predictionsByFup[f] ? ' cached' : ''}`;
+        btn.className = `fup-tick-btn${f === state.selectedFup ? ' active' : ''}${domPreds[f] ? ' cached' : ''}`;
         btn.dataset.fup = String(f);
         btn.textContent = f === 0 ? '0d (Base)' : `${f}d`;
         btn.title = `Switch to Day ${f} post-transplant stage`;
@@ -632,20 +750,72 @@ window.AIIDKIT = (() => {
     _updateFupBackgroundStatus();
   }
 
-  async function _ensureTaskIGIfNeeded() {
+  async function _precomputeEarlierFupsInBackground(events, domainKey, taskKey, horizon, priorFups, maxFup, token) {
+    // Only pre-fetch lightweight reference cohort JSONs per FUP; patient trajectory & unified IG
+    // attributions across all FUP stages are already resolved by the single maxFup prediction!
+    for (const f of priorFups) {
+      if (state.bgFetchToken !== token) return;
+      try {
+        await fetchCohort(f, domainKey);
+        if (_getTaskDomain(state.selectedTask) === domainKey) {
+          _updateFupBackgroundStatus();
+        }
+      } catch (err) {
+        console.warn(`[AIIDKIT] Background cohort fetch for ${domainKey}@${f} failed:`, err);
+      }
+    }
+  }
+
+  async function _ensureDomainAndTaskPredictionIfNeeded() {
     const events = state.currentPatientRawEvents || window.AIIDKIT_FORM?.getFormEvents?.() || [];
-    if (!events.length) return;
-    const fupPred = state.predictionsByFup[state.selectedFup];
-    const tPred = fupPred?.tasks?.[state.selectedTask];
-    if (fupPred && tPred && tPred.ig_computed === false) {
+    if (!events.length || !state.chartsInitialized) return;
+
+    const dom = _getTaskDomain(state.selectedTask);
+    const currentToken = state.bgFetchToken;
+    if (!state.predictionsByDomain[dom]) state.predictionsByDomain[dom] = {};
+
+    const maxFupPred = state.predictionsByDomain[dom][state.maxFup];
+    if (!maxFupPred) {
+      const domLabel = _getDomainLabel(dom) || dom;
+      const loadToast = showToast(`Scoring patient on ${domLabel}…`, 'loading', 0);
+      try {
+        await fetchCohort(state.selectedFup, dom);
+        const res = await submitPrediction(
+          events, state.selectedHorizon, state.maxFup, state.selectedTask, state.maxFup, false
+        );
+        if (state.bgFetchToken !== currentToken) {
+          loadToast?.remove();
+          return;
+        }
+        state.predictionsByDomain[dom][state.maxFup] = res;
+        if (Array.isArray(res.trajectory)) {
+          state.trajectoriesByDomain[dom] = res.trajectory;
+        }
+        loadToast?.remove();
+        _updateFupBackgroundStatus();
+        applyActiveTaskAndHorizon(false);
+
+        const priorFups = state.fupSteps.filter(f => f !== state.selectedFup).sort((a, b) => b - a);
+        if (priorFups.length > 0) {
+          _precomputeEarlierFupsInBackground(
+            events, dom, state.selectedTask, state.selectedHorizon, priorFups, state.maxFup, currentToken
+          );
+        }
+      } catch (err) {
+        loadToast?.remove();
+        showToast(`Specialist prediction failed: ${err.message}`, 'error');
+      }
+      return;
+    }
+
+    const tPred = maxFupPred.tasks?.[state.selectedTask];
+    if (tPred && tPred.ig_computed === false) {
       try {
         const updated = await submitPrediction(
-          events, state.selectedHorizon, state.selectedFup, state.selectedTask, state.maxFup, true
+          events, state.selectedHorizon, state.maxFup, state.selectedTask, state.maxFup, true
         );
-        state.predictionsByFup[state.selectedFup] = updated;
-        if (state.selectedFup === state.maxFup) {
-          state.prediction = updated;
-        }
+        if (state.bgFetchToken !== currentToken) return;
+        state.predictionsByDomain[dom][state.maxFup] = updated;
         applyActiveTaskAndHorizon(true);
       } catch (err) {
         console.warn('[AIIDKIT] Lazy IG fetch error:', err);
@@ -659,21 +829,19 @@ window.AIIDKIT = (() => {
     state.selectedFup = targetFup;
     _updateFupLabelsAndBadges();
 
-    if (!state.cohortsByFup[targetFup]) {
-      try {
-        state.cohort = await fetchCohort(targetFup);
-      } catch (err) {
-        console.warn('[AIIDKIT] Could not fetch cohort for FUP', targetFup, err);
-      }
-    } else {
-      state.cohort = state.cohortsByFup[targetFup];
+    const dom = _getTaskDomain(state.selectedTask);
+    try {
+      await fetchCohort(targetFup, dom);
+    } catch (err) {
+      console.warn('[AIIDKIT] Could not fetch cohort for FUP', targetFup, err);
     }
 
     applyActiveTaskAndHorizon(true);
-    _ensureTaskIGIfNeeded();
+    _ensureDomainAndTaskPredictionIfNeeded();
   }
 
   function applyActiveTaskAndHorizon(smoothUmap = true) {
+    const dom = _getTaskDomain(state.selectedTask);
     const taskCohort = getActiveTaskCohort();
     const activeCohort = taskCohort?.horizons?.[state.selectedHorizon];
     const activePred = getActiveTaskPrediction();
@@ -693,17 +861,19 @@ window.AIIDKIT = (() => {
     }
 
     if (state.chartsInitialized && C && activeCohort) {
-      if (smoothUmap && typeof C.updateUMAPCohort === 'function') {
+      const sameManifold = smoothUmap && state.renderedUmapDomain === dom;
+      if (sameManifold && typeof C.updateUMAPCohort === 'function') {
         C.updateUMAPCohort(activeCohort, taskCohort.global_umap_bounds);
       } else {
         C.initUMAP(activeCohort, taskCohort.global_umap_bounds);
+        state.renderedUmapDomain = dom;
       }
       if (activePred) {
         C.updateUMAPWithPatient(
           activePred.umap_x,
           activePred.umap_y,
           activePred,
-          state.trajectory,
+          _getActiveTrajectory(),
           state.selectedFup,
           state.showTrajectory,
           (clickedFup) => setSelectedFup(clickedFup)
@@ -720,41 +890,29 @@ window.AIIDKIT = (() => {
     }
   }
 
-  function setSelectedTask(newTask) {
+  async function setSelectedTask(newTask) {
     if (!newTask || state.selectedTask === newTask) return;
+    const prevDom = _getTaskDomain(state.selectedTask);
+    const nextDom = _getTaskDomain(newTask);
     state.selectedTask = newTask;
+
     const sel1 = document.getElementById('task-select');
     if (sel1 && sel1.value !== newTask) sel1.value = newTask;
-    applyActiveTaskAndHorizon(true);
-    _ensureTaskIGIfNeeded();
-  }
 
-  async function _precomputeEarlierFupsInBackground(events, priorFups, maxFup, token) {
-    for (const f of priorFups) {
-      if (state.bgFetchToken !== token) return;
-      if (!state.cohortsByFup[f]) {
-        try {
-          await fetchCohort(f);
-        } catch (err) {
-          console.warn(`[AIIDKIT] Background cohort fetch for FUP ${f} failed:`, err);
-        }
-      }
+    const horizonChanged = _syncHorizonForTask(newTask);
+    if (horizonChanged || prevDom !== nextDom) {
+      renderHorizonCards();
     }
 
-    for (const f of priorFups) {
-      if (state.bgFetchToken !== token) return;
-      try {
-        const predF = await submitPrediction(events, state.selectedHorizon, f, state.selectedTask, maxFup, true);
-        if (state.bgFetchToken !== token) return;
-        state.predictionsByFup[f] = predF;
-        _updateFupBackgroundStatus();
-        if (state.selectedFup === f) {
-          applyActiveTaskAndHorizon(true);
-        }
-      } catch (err) {
-        console.warn(`[AIIDKIT] Background prediction for FUP ${f} failed:`, err);
-      }
+    try {
+      await fetchCohort(state.selectedFup, nextDom);
+    } catch (err) {
+      console.warn('[AIIDKIT] Cohort load failed when switching task:', err);
     }
+
+    _updateFupBackgroundStatus();
+    applyActiveTaskAndHorizon(prevDom === nextDom);
+    await _ensureDomainAndTaskPredictionIfNeeded();
   }
 
   async function handleAnalyse(events) {
@@ -765,6 +923,9 @@ window.AIIDKIT = (() => {
 
     state.currentPatientRawEvents = events;
     const { fup: autoFup, maxDay, fupSteps } = calculateAutoFup(events);
+    const activeDom = _getTaskDomain(state.selectedTask);
+    _syncHorizonForTask(state.selectedTask);
+
     state.bgFetchToken += 1;
     const currentToken = state.bgFetchToken;
 
@@ -772,21 +933,21 @@ window.AIIDKIT = (() => {
     state.patientMaxDay = maxDay;
     state.fupSteps = fupSteps;
     state.selectedFup = autoFup;
-    state.predictionsByFup = {};
-    state.trajectory = [];
+    state.predictionsByDomain = { [activeDom]: {} };
+    state.trajectoriesByDomain = {};
 
     const loadToast = showToast('Analysing patient sequence…', 'loading', 0);
 
     try {
-      state.cohort = await fetchCohort(autoFup);
+      await fetchCohort(autoFup, activeDom);
 
       const result = await submitPrediction(events, state.selectedHorizon, autoFup, state.selectedTask, autoFup, false);
       if (state.bgFetchToken !== currentToken) return;
 
-      state.prediction = result;
-      state.predictionsByFup[autoFup] = result;
-      state.trajectory = Array.isArray(result.trajectory) ? result.trajectory : [];
+      state.predictionsByDomain[activeDom][autoFup] = result;
+      state.trajectoriesByDomain[activeDom] = Array.isArray(result.trajectory) ? result.trajectory : [];
 
+      renderHorizonCards();
       renderFupSliderBar();
       showResults();
       applyActiveTaskAndHorizon(false);
@@ -801,7 +962,9 @@ window.AIIDKIT = (() => {
 
       const priorFups = fupSteps.filter(f => f < autoFup).sort((a, b) => b - a);
       if (priorFups.length > 0) {
-        _precomputeEarlierFupsInBackground(events, priorFups, autoFup, currentToken);
+        _precomputeEarlierFupsInBackground(
+          events, activeDom, state.selectedTask, state.selectedHorizon, priorFups, autoFup, currentToken
+        );
       }
     } catch (err) {
       loadToast?.remove();
@@ -884,7 +1047,7 @@ window.AIIDKIT = (() => {
           activePred.umap_x,
           activePred.umap_y,
           activePred,
-          state.trajectory,
+          _getActiveTrajectory(),
           state.selectedFup,
           state.showTrajectory,
           (clickedFup) => setSelectedFup(clickedFup)
@@ -906,7 +1069,6 @@ window.AIIDKIT = (() => {
     document.getElementById('umap-toggle-imminence')?.addEventListener('click', () =>
       window.AIIDKIT_CHARTS?.toggleUMAPColorMode?.('imminence'));
 
-    // Panel 2 Mode Toggle (List vs Risk Timeline — toggle #timeline-graph-outer cleanly!)
     const btnList   = document.getElementById('timeline-toggle-list');
     const btnGraph  = document.getElementById('timeline-toggle-graph');
     const wrapList  = document.getElementById('timeline-list-wrapper');
@@ -924,12 +1086,13 @@ window.AIIDKIT = (() => {
       btnList?.classList.remove('active');
       wrapGraph?.classList.remove('hidden');
       wrapList?.classList.add('hidden');
-      const activePred = getActiveTaskPrediction();
-      if (activePred && activePred.events_with_scores) {
+      const tlCtx = _getUnifiedTimelineContext();
+      if (tlCtx && tlCtx.fullEvents.length) {
         window.AIIDKIT_CHARTS?.drawRiskTimelineGraph?.(
-          activePred.events_with_scores,
-          activePred.risk_score,
-          state.selectedTask
+          tlCtx.fullEvents,
+          tlCtx.finalFullScore,
+          state.selectedTask,
+          { cutoffFup: tlCtx.cutoffFup, baselineScore: tlCtx.baselineScore }
         );
       }
     });
@@ -957,7 +1120,8 @@ window.AIIDKIT = (() => {
       _initTheme();
       state.config = await fetchConfig();
       state.selectedTask = state.config.task || 'infection_bacteria';
-      state.selectedHorizon = state.config.default_horizon || _getAvailableHorizons()[0] || 90;
+      state.selectedHorizon = state.config.default_horizon || _getAvailableHorizons(state.selectedTask)[0] || 90;
+      _syncHorizonForTask(state.selectedTask);
 
       if (Array.isArray(state.config.available_tasks) && state.config.available_tasks.length > 0) {
         const sel = document.getElementById('task-select');
@@ -989,7 +1153,7 @@ window.AIIDKIT = (() => {
       renderHorizonCards();
       state.selectedFup = state.config.default_fup || 30;
       window.AIIDKIT_FORM?.initForm?.(state.config.vocabulary);
-      state.cohort = await fetchCohort(state.selectedFup);
+      await fetchCohort(state.selectedFup, _getTaskDomain(state.selectedTask));
 
       _setupListeners();
       updateRiskScoreCards(null, null, state.selectedHorizon);

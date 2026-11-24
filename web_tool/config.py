@@ -22,6 +22,8 @@ if str(_ROOT) not in sys.path:
 
 from src.model.model_utils import resolve_best_checkpoint
 from src.tasks import (
+    ACUTE_HORIZONS,
+    LONG_TERM_HORIZONS,
     UNIFIED_HORIZONS,
     UNIFIED_TASKS,
     build_available_tasks_list,
@@ -29,23 +31,73 @@ from src.tasks import (
 )
 
 # =============================================================================
-# USER-EDITABLE PATHS
+# SPECIALIST MULTI-TASK DOMAIN SUITE (B_CAT_MT — 5 Specialist Models)
 # =============================================================================
 
-_UNIFIED_MODEL_CANDIDATES = [
-    _ROOT
-    / "results/transformer/random_split/e00-a15-v60_raw/finetuning/multitask_unified"
-    / "hrz(0030-0060-0090-0180-0360-0720-1800)_fut(all)_fuv(0000-0030-0060-0090-0120-0150-0180-0240-0300-0360-0540-0720-0900-1080-1440-1800-2700-3600)",
-    _ROOT
-    / "results/transformer/random_split/e00-a15-v60_raw/finetuning/multitask_bacteria"
-    / "hrz(0030-0060-0090)_fut(all)_fuv(0000-0030-0060-0090-0120-0150-0180-0240-0300-0360-0540-0720-0900-1080-1440-1800-2700-3600)",
+_DEFAULT_FINETUNING_ROOT = _ROOT / "results/transformer/random_split/e00-a15-v60_raw/finetuning"
+FINETUNING_ROOT: Path = (
+    Path(os.environ["AIIDKIT_FINETUNING_ROOT"])
+    if os.environ.get("AIIDKIT_FINETUNING_ROOT")
+    else _DEFAULT_FINETUNING_ROOT
+)
+
+SPECIALIST_DOMAIN_DEFS: list[dict] = [
+    {
+        "domain": "bacteria",
+        "label": "Bacterial Specialist",
+        "folder": "multitask_bacteria",
+        "tasks": [
+            "infection_bacteria",
+            "infection_grp_enterobacterales",
+            "infection_grp_gram_positive",
+            "infection_grp_gn_nonfermenters",
+            "infection_grp_clostridium",
+        ],
+        "horizons": list(ACUTE_HORIZONS),
+    },
+    {
+        "domain": "viruses",
+        "label": "Viral Specialist",
+        "folder": "multitask_viruses",
+        "tasks": [
+            "infection_virus",
+            "infection_grp_herpes_viruses",
+            "infection_grp_cmv",
+            "infection_grp_bkpyv",
+        ],
+        "horizons": list(ACUTE_HORIZONS),
+    },
+    {
+        "domain": "fungi",
+        "label": "Fungal Specialist",
+        "folder": "multitask_fungi",
+        "tasks": [
+            "infection_fungi",
+            "infection_grp_candida",
+        ],
+        "horizons": list(ACUTE_HORIZONS),
+    },
+    {
+        "domain": "graft_loss",
+        "label": "Graft Survival Specialist",
+        "folder": "graft_loss",
+        "tasks": ["graft_loss"],
+        "horizons": list(LONG_TERM_HORIZONS),
+    },
+    {
+        "domain": "death",
+        "label": "Mortality Specialist",
+        "folder": "death",
+        "tasks": ["death"],
+        "horizons": list(LONG_TERM_HORIZONS),
+    },
 ]
 
-_DEFAULT_MODEL_PATH = next((p for p in _UNIFIED_MODEL_CANDIDATES if p.exists()), _UNIFIED_MODEL_CANDIDATES[0])
+# Explicit single-model override only when AIIDKIT_MODEL_PATH is provided
 MODEL_PATH: Path | None = (
     Path(os.environ["AIIDKIT_MODEL_PATH"])
     if os.environ.get("AIIDKIT_MODEL_PATH")
-    else _DEFAULT_MODEL_PATH
+    else None
 )
 
 _DEFAULT_DATA_DIR = Path("/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.9/teav/random_split")
@@ -55,10 +107,51 @@ DATA_DIR: Path | None = (
     else _DEFAULT_DATA_DIR
 )
 
+# Portable embeddings-only server bundle (used inside Docker or when AIIDKIT_BUNDLE_DIR is set)
+_DOCKER_BUNDLE_CANDIDATES = [
+    Path(os.environ["AIIDKIT_BUNDLE_DIR"]) if os.environ.get("AIIDKIT_BUNDLE_DIR") else None,
+    Path("/data/bundle"),
+    Path(__file__).resolve().parent / "server_bundle",
+]
+BUNDLE_DIR: Path | None = next(
+    (p for p in _DOCKER_BUNDLE_CANDIDATES if p is not None and (p / "bundle_manifest.json").exists()),
+    Path(os.environ["AIIDKIT_BUNDLE_DIR"]) if os.environ.get("AIIDKIT_BUNDLE_DIR") else None,
+)
+PREFER_BUNDLE: bool = os.environ.get("AIIDKIT_PREFER_BUNDLE", "").lower() in ("1", "true", "yes") or bool(
+    os.environ.get("AIIDKIT_BUNDLE_DIR") or Path("/data/bundle/bundle_manifest.json").exists()
+)
+
 USE_GPU: bool = os.environ.get("AIIDKIT_USE_GPU", "true").lower() not in ("0", "false", "no")
+IG_STEPS: int | None = int(os.environ["AIIDKIT_IG_STEPS"]) if os.environ.get("AIIDKIT_IG_STEPS") else None
+
+
+def _default_max_models_in_ram() -> int:
+    if os.environ.get("AIIDKIT_MAX_MODELS_IN_RAM"):
+        return max(1, int(os.environ["AIIDKIT_MAX_MODELS_IN_RAM"]))
+    try:
+        mem_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        if mem_bytes >= 14 * (1024 ** 3):
+            return 5
+    except Exception:
+        pass
+    return 5 if USE_GPU else 2
+
+
+MAX_MODELS_IN_RAM: int = _default_max_models_in_ram()
 
 VOCAB_PATH: Path | None = None
 BIN_INTERVALS_PATH: Path | None = None
+
+# Runtime derived-UMAP cache directory (writable tmpfs inside read-only Docker containers)
+RUNTIME_CACHE_DIR: Path = Path(
+    os.environ.get("AIIDKIT_RUNTIME_CACHE_DIR", str(Path(__file__).resolve().parent / ".cache"))
+)
+
+# Optional HTTP Basic Auth (RFC 7617) & Reverse-Proxy settings
+BASIC_AUTH_USER: str = os.environ.get("AIIDKIT_BASIC_AUTH_USER", "aiidkit")
+BASIC_AUTH_PASS: str = os.environ.get("AIIDKIT_BASIC_AUTH_PASS", "")
+BASIC_AUTH_REALM: str = os.environ.get("AIIDKIT_BASIC_AUTH_REALM", "AIIDKIT Clinical Decision Support")
+TRUST_PROXY: bool = os.environ.get("AIIDKIT_TRUST_PROXY", "true").lower() not in ("0", "false", "no")
 
 
 # =============================================================================
@@ -91,8 +184,45 @@ def _discover_run_metadata(model_path: Path | None) -> dict | None:
     return None
 
 
+def _resolve_latest_domain_checkpoint(finetuning_root: Path, folder_name: str) -> Path | None:
+    folder = finetuning_root / folder_name
+    if not folder.exists():
+        return None
+    run_dirs = sorted(
+        (p for p in folder.glob("hrz(*)*") if p.is_dir()),
+        key=lambda p: p.stat().st_mtime_ns,
+        reverse=True,
+    )
+    for rd in run_dirs:
+        ckpt = resolve_best_checkpoint(rd)
+        if ckpt is not None and (ckpt / "model.safetensors").exists():
+            return ckpt
+    ckpt = resolve_best_checkpoint(folder)
+    return ckpt if (ckpt is not None and (ckpt / "model.safetensors").exists()) else None
+
+
+def discover_specialist_checkpoints(finetuning_root: Path | None = None) -> dict[str, dict]:
+    """Discover all trained specialist checkpoints under `finetuning_root`."""
+    ft_root = finetuning_root or FINETUNING_ROOT
+    discovered: dict[str, dict] = {}
+    for d_def in SPECIALIST_DOMAIN_DEFS:
+        ckpt = _resolve_latest_domain_checkpoint(ft_root, d_def["folder"])
+        if ckpt is not None:
+            run_meta = _discover_run_metadata(ckpt) or {
+                "tasks": d_def["tasks"],
+                "horizons": d_def["horizons"],
+            }
+            discovered[d_def["domain"]] = {
+                "domain": d_def["domain"],
+                "label": d_def["label"],
+                "model_path": ckpt,
+                "run_metadata": run_meta,
+            }
+    return discovered
+
+
 def get_resolved_paths() -> dict:
-    """Called once at server startup. Returns resolved paths and `use_mock` flag."""
+    """Called once at server startup. Returns resolved single/multi-domain paths and `use_mock` flag."""
     force_demo = (
         os.environ.get("AIIDKIT_DEMO_MODE", "").lower() in ("1", "true", "yes")
         or "--demo" in sys.argv
@@ -103,6 +233,8 @@ def get_resolved_paths() -> dict:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
         return {
             "use_mock":      True,
+            "bundle_dir":    None,
+            "domains":       {},
             "model_path":    None,
             "run_metadata":  None,
             "data_dir":      None,
@@ -112,21 +244,91 @@ def get_resolved_paths() -> dict:
             "use_gpu":       False,
         }
 
-    model = _resolve(MODEL_PATH, "MODEL_PATH")
-    if model is not None and not (model / "model.safetensors").exists():
-        try:
+    # Priority 1: Explicit single-model override via AIIDKIT_MODEL_PATH
+    if MODEL_PATH is not None:
+        model = _resolve(MODEL_PATH, "MODEL_PATH")
+        if model is not None and not (model / "model.safetensors").exists():
             model = resolve_best_checkpoint(model)
-        except FileNotFoundError:
-            warnings.warn(f"[AIIDKIT] No valid checkpoint inside {model}; falling back to demo mode.")
-            model = None
+        run_meta = _discover_run_metadata(model)
+        data = _resolve(DATA_DIR, "DATA_DIR")
+        vocab = _resolve(VOCAB_PATH, "VOCAB_PATH") if VOCAB_PATH is not None else None
+        bins = _resolve(BIN_INTERVALS_PATH, "BIN_INTERVALS_PATH") if BIN_INTERVALS_PATH is not None else None
+        if data is not None and (vocab is None or bins is None):
+            try:
+                from src.data.patient_dataset import resolve_processed_cache_dir
+                m_dir = resolve_processed_cache_dir(data) / "pretraining_metadata"
+                if vocab is None and (m_dir / "vocab.pkl").exists():
+                    vocab = m_dir / "vocab.pkl"
+                if bins is None and (m_dir / "bin_intervals.pkl").exists():
+                    bins = m_dir / "bin_intervals.pkl"
+            except Exception:
+                pass
+        domains = (
+            {"default": {"domain": "default", "label": "Active Model", "model_path": model, "run_metadata": run_meta}}
+            if model is not None
+            else {}
+        )
+        return {
+            "use_mock":      model is None,
+            "bundle_dir":    None,
+            "domains":       domains,
+            "model_path":    model,
+            "run_metadata":  run_meta,
+            "data_dir":      data,
+            "test_dir":      (data / f"fup_{DEFAULT_FUP:04d}" / "test") if data is not None else None,
+            "vocab_path":    vocab,
+            "bin_intervals": bins,
+            "use_gpu":       USE_GPU,
+        }
 
-    run_meta = _discover_run_metadata(model)
-    data = _resolve(DATA_DIR, "DATA_DIR")
+    # Priority 2: De-identified Server Bundle (Multi-Domain v2 or Single-Domain v1)
+    bundle = BUNDLE_DIR if (BUNDLE_DIR is not None and (BUNDLE_DIR / "bundle_manifest.json").exists()) else None
+    data = None if (bundle is not None and PREFER_BUNDLE) else _resolve(DATA_DIR, "DATA_DIR")
 
-    cache_dir = Path(__file__).resolve().parent / ".cache"
-    has_cached_embeddings = cache_dir.exists() and any(cache_dir.glob("cohort_umap_*.pkl"))
-    use_mock = model is None or (data is None and not has_cached_embeddings)
+    if bundle is not None:
+        manifest = json.loads((bundle / "bundle_manifest.json").read_text(encoding="utf-8"))
+        bundle_domains: dict[str, dict] = {}
+        if isinstance(manifest.get("domains"), dict) and manifest["domains"]:
+            for d_key, d_info in manifest["domains"].items():
+                b_mod = bundle / "domains" / d_key / "model"
+                if (b_mod / "model.safetensors").exists():
+                    bundle_domains[d_key] = {
+                        "domain": d_key,
+                        "label": d_info.get("label", d_key.replace("_", " ").title()),
+                        "model_path": b_mod,
+                        "run_metadata": _discover_run_metadata(b_mod),
+                        "platt_path": bundle / "domains" / d_key / "platt_params.json",
+                        "embeddings_path": bundle / "domains" / d_key / "cohort_embeddings.npz",
+                        "domain_fingerprint": d_info.get("domain_fingerprint", manifest.get("bundle_fingerprint", "v2")),
+                    }
+        elif (bundle / "model" / "model.safetensors").exists():
+            b_mod = bundle / "model"
+            bundle_domains["default"] = {
+                "domain": "default",
+                "label": "Unified Model",
+                "model_path": b_mod,
+                "run_metadata": _discover_run_metadata(b_mod),
+                "platt_path": bundle / "metadata" / "platt_params.json",
+                "embeddings_path": bundle / "embeddings" / "cohort_embeddings.npz",
+                "domain_fingerprint": manifest.get("bundle_fingerprint", "v1"),
+            }
+        if bundle_domains:
+            first_dom = next(iter(bundle_domains.values()))
+            return {
+                "use_mock":      False,
+                "bundle_dir":    bundle,
+                "domains":       bundle_domains,
+                "model_path":    first_dom["model_path"],
+                "run_metadata":  first_dom["run_metadata"],
+                "data_dir":      None,
+                "test_dir":      None,
+                "vocab_path":    bundle / "metadata" / "vocab.json",
+                "bin_intervals": bundle / "metadata" / "bin_intervals.json",
+                "use_gpu":       USE_GPU,
+            }
 
+    # Priority 3: Direct HPC Multi-Domain discovery from results/ + DATA_DIR
+    discovered = discover_specialist_checkpoints(FINETUNING_ROOT)
     vocab = _resolve(VOCAB_PATH, "VOCAB_PATH") if VOCAB_PATH is not None else None
     bins = _resolve(BIN_INTERVALS_PATH, "BIN_INTERVALS_PATH") if BIN_INTERVALS_PATH is not None else None
     if data is not None and (vocab is None or bins is None):
@@ -143,19 +345,15 @@ def get_resolved_paths() -> dict:
             if bins is None and (meta / "bin_intervals.pkl").exists():
                 bins = _resolve(meta / "bin_intervals.pkl", "bin_intervals.pkl")
 
-    test_dir = None
-    if data is not None:
-        candidate = data / f"fup_{DEFAULT_FUP:04d}" / "test"
-        if not candidate.exists():
-            candidate = data / "fup_0090" / "test"
-        test_dir = _resolve(candidate, "test split")
-
+    first_dom = next(iter(discovered.values()), None)
     return {
-        "use_mock":      use_mock,
-        "model_path":    model,
-        "run_metadata":  run_meta,
+        "use_mock":      (not discovered) or (data is None),
+        "bundle_dir":    None,
+        "domains":       discovered,
+        "model_path":    first_dom["model_path"] if first_dom else None,
+        "run_metadata":  first_dom["run_metadata"] if first_dom else None,
         "data_dir":      data,
-        "test_dir":      test_dir,
+        "test_dir":      (data / f"fup_{DEFAULT_FUP:04d}" / "test") if data is not None else None,
         "vocab_path":    vocab,
         "bin_intervals": bins,
         "use_gpu":       USE_GPU,
@@ -163,27 +361,36 @@ def get_resolved_paths() -> dict:
 
 
 # =============================================================================
-# TASKS & HORIZONS — Unified 13-Task × 7-Horizon Setup (auto-synced to checkpoint)
+# TASKS & HORIZONS — 5-Domain Specialist Suite (13 Tasks, Domain-Matched Horizons)
 # =============================================================================
 
-_STARTUP_META = _discover_run_metadata(_DEFAULT_MODEL_PATH if _DEFAULT_MODEL_PATH.exists() else None)
-_ACTIVE_TASK_KEYS = (
-    list(_STARTUP_META["tasks"])
-    if (_STARTUP_META and isinstance(_STARTUP_META.get("tasks"), list) and _STARTUP_META["tasks"])
-    else list(UNIFIED_TASKS)
-)
-_ACTIVE_HORIZONS = (
-    sorted(int(h) for h in _STARTUP_META["horizons"])
-    if (_STARTUP_META and isinstance(_STARTUP_META.get("horizons"), list) and _STARTUP_META["horizons"])
-    else list(UNIFIED_HORIZONS)
-)
+TASK_TO_DOMAIN: dict[str, str] = {
+    t: d["domain"] for d in SPECIALIST_DOMAIN_DEFS for t in d["tasks"]
+}
+DOMAIN_LABELS: dict[str, str] = {
+    d["domain"]: d["label"] for d in SPECIALIST_DOMAIN_DEFS
+}
+TASK_HORIZONS: dict[str, list[int]] = {
+    t: list(d["horizons"]) for d in SPECIALIST_DOMAIN_DEFS for t in d["tasks"]
+}
 
-TASK: str = _ACTIVE_TASK_KEYS[0] if "infection_bacteria" not in _ACTIVE_TASK_KEYS else "infection_bacteria"
-AVAILABLE_TASKS: list[dict[str, str]] = build_available_tasks_list(_ACTIVE_TASK_KEYS)
+_ACTIVE_TASK_KEYS: list[str] = [t for d in SPECIALIST_DOMAIN_DEFS for t in d["tasks"]]
+_ACTIVE_HORIZONS: list[int] = sorted({h for d in SPECIALIST_DOMAIN_DEFS for h in d["horizons"]})
+
+TASK: str = "infection_bacteria"
+AVAILABLE_TASKS: list[dict] = [
+    {
+        **item,
+        "domain": TASK_TO_DOMAIN.get(item["key"], "bacteria"),
+        "domain_label": DOMAIN_LABELS.get(TASK_TO_DOMAIN.get(item["key"], "bacteria"), "Specialist Model"),
+        "horizons": TASK_HORIZONS.get(item["key"], list(ACUTE_HORIZONS)),
+    }
+    for item in build_available_tasks_list(_ACTIVE_TASK_KEYS)
+]
 AVAILABLE_HORIZONS: list[int] = _ACTIVE_HORIZONS
-DEFAULT_HORIZON: int = 90 if 90 in AVAILABLE_HORIZONS else AVAILABLE_HORIZONS[min(2, len(AVAILABLE_HORIZONS) - 1)]
-HORIZON_LABELS: dict[int, str] = build_horizon_labels_map(AVAILABLE_HORIZONS, style="long")
-HORIZON_SHORT_LABELS: dict[int, str] = build_horizon_labels_map(AVAILABLE_HORIZONS, style="short")
+DEFAULT_HORIZON: int = 90
+HORIZON_LABELS: dict[int, str] = build_horizon_labels_map(sorted(set(UNIFIED_HORIZONS) | set(_ACTIVE_HORIZONS)), style="long")
+HORIZON_SHORT_LABELS: dict[int, str] = build_horizon_labels_map(sorted(set(UNIFIED_HORIZONS) | set(_ACTIVE_HORIZONS)), style="short")
 
 DEFAULT_FUP: int = 30
 PRECOMPUTED_FUPS: list[int] = [0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 360]

@@ -189,3 +189,5 @@ scratch/metadata_exports
 configs/run_configs
 scoping_review/data
 scoping_review/results
+web_tool/server_bundle/
+web_tool/.env

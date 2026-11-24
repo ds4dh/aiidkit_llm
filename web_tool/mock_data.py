@@ -430,13 +430,16 @@ def generate_cohort_data(fup: int = 90, seed: int = 42) -> dict:
 
     tasks_data = {}
     available_tasks = getattr(CONFIG, "AVAILABLE_TASKS", [{"key": CONFIG.TASK, "label": CONFIG.TASK}])
+    task_horizons_cfg = getattr(CONFIG, "TASK_HORIZONS", {})
     for t_info in available_tasks:
         t_key = t_info["key"]
+        t_hrzs = [str(h) for h in task_horizons_cfg.get(t_key, horizons) if str(h) in horizons_data]
+        filtered_horizons = {hk: horizons_data[hk] for hk in (t_hrzs or list(horizons_data.keys()))}
         scale = float(get_task_meta(t_key).get("mock_scale", 0.80))
         if abs(scale - 1.0) < 1e-6:
-            tasks_data[t_key] = {"horizons": horizons_data}
+            tasks_data[t_key] = {"horizons": filtered_horizons}
         else:
-            t_horizons = copy.deepcopy(horizons_data)
+            t_horizons = copy.deepcopy(filtered_horizons)
             for h_obj in t_horizons.values():
                 for p in h_obj["patients"]:
                     p["risk_score"] = round(float(np.clip(p["risk_score"] * scale, 0.01, 0.99)), 4)
@@ -551,20 +554,22 @@ def mock_predict(
     cohort_tasks = cohort.get("tasks", {})
     tasks_predictions = {}
 
+    task_horizons_cfg = getattr(CONFIG, "TASK_HORIZONS", {})
     for t_info in available_tasks:
         t_key = t_info["key"]
         t_label = t_info["label"]
+        t_horizons = list(task_horizons_cfg.get(t_key, horizons))
         scale = float(get_task_meta(t_key).get("mock_scale", 0.80))
         b30 = float(np.clip(base_risk_30d_main * scale, 0.02, 0.94))
 
-        risk_scores = {f"{h}d": _apply_horizon_multiplier(b30, h) for h in horizons}
+        risk_scores = {f"{h}d": _apply_horizon_multiplier(b30, h) for h in t_horizons}
         calibrated_risks = {}
         for hk, hv in risk_scores.items():
             lv = np.log(np.clip(hv, 1e-4, 1.0 - 1e-4) / (1.0 - np.clip(hv, 1e-4, 1.0 - 1e-4)))
             calibrated_risks[hk] = round(float(np.clip(expit(lv - 1.35), 0.005, 0.96)), 4)
 
         t_cohort = cohort_tasks.get(t_key, cohort)
-        first_cohort_pts = t_cohort["horizons"][str(horizons[0])]["patients"]
+        first_cohort_pts = t_cohort["horizons"][str(t_horizons[0])]["patients"]
         if first_cohort_pts:
             umap_pts = np.array([[p["umap_x"], p["umap_y"]] for p in first_cohort_pts])
             dists = np.sum((umap_pts - np.array([umap_x, umap_y])) ** 2, axis=1)
@@ -573,7 +578,7 @@ def mock_predict(
             top_idx = np.array([], dtype=int)
 
         by_horizon = {}
-        for h in horizons:
+        for h in t_horizons:
             selected_risk = risk_scores[f"{h}d"]
             selected_calibrated_risk = calibrated_risks[f"{h}d"]
             best_cluster = min(CLUSTER_PROFILES, key=lambda p: abs(p["base_risk"] * scale - selected_risk))
@@ -594,7 +599,7 @@ def mock_predict(
                 task_key=t_key,
                 task_label=t_label,
                 selected_horizon=h,
-                horizons=horizons,
+                horizons=t_horizons,
                 risk_scores=risk_scores,
                 calibrated_risks=calibrated_risks,
                 cluster_name=cluster_name,
@@ -625,7 +630,7 @@ def mock_predict(
                 "ig_computed":        True,
             }
 
-        sel_h_str = str(horizon if horizon in horizons else horizons[0])
+        sel_h_str = str(horizon if horizon in t_horizons else t_horizons[0])
         tasks_predictions[t_key] = {
             **by_horizon[sel_h_str],
             "fup": active_fup,
@@ -642,9 +647,10 @@ def mock_predict(
         t_scores = {}
         for t_info in available_tasks:
             t_k = t_info["key"]
+            t_hrzs = list(task_horizons_cfg.get(t_k, horizons))
             sc = float(get_task_meta(t_k).get("mock_scale", 0.80))
             b30 = float(np.clip(r30_f * sc, 0.02, 0.94))
-            rs = {f"{h}d": _apply_horizon_multiplier(b30, h) for h in horizons}
+            rs = {f"{h}d": _apply_horizon_multiplier(b30, h) for h in t_hrzs}
             cs = {
                 hk: round(float(np.clip(expit(np.log(hv / (1.0 - hv)) - 1.35), 0.005, 0.96)), 4)
                 for hk, hv in rs.items()

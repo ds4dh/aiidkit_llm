@@ -17,8 +17,8 @@
   <!-- D3.js v7 -->
   <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
 
-  <link rel="stylesheet" href="/static/css/style.css?v=6.0" />
-  <link rel="icon" type="image/png" href="/static/favicon.png" />
+  <link rel="stylesheet" href="static/css/style.css?v=6.1" />
+  <link rel="icon" type="image/png" href="static/favicon.png" />
 </head>
 <body>
 
@@ -43,7 +43,7 @@
 <header class="app-header">
   <div class="header-inner">
     <div id="header-brand" class="header-brand" title="Return to welcome screen" role="button" tabindex="0">
-      <img class="brand-logo" src="/static/logo_graphics.png" alt="AIIDKIT Logo" />
+      <img class="brand-logo" src="static/logo_graphics.png" alt="AIIDKIT Logo" />
       <div class="brand-text">
         <span class="brand-title"><span class="logo-accent-blue">AIID</span><span class="logo-accent-teal">KIT</span></span>
         <span class="brand-subtitle">Clinical Decision Support · Unified Post-Transplant Risk</span>
@@ -76,7 +76,7 @@
         <div class="empty-kicker">Clinical Decision Support</div>
 
         <div class="empty-logo-container">
-          <img class="empty-icon" src="/static/logo_graphics.png" alt="AIIDKIT Logo" />
+          <img class="empty-icon" src="static/logo_graphics.png" alt="AIIDKIT Logo" />
           <div class="empty-text-brand">
             <span class="empty-brand-title"><span class="logo-accent-blue">AIID</span><span class="logo-accent-teal">KIT</span></span>
             <span class="empty-brand-tagline">Artificial Intelligence for<br>Improved Infectious<br>Diseases Outcomes</span>
@@ -172,6 +172,7 @@
             <h3 id="assessment-panel-title" class="panel-title">Infection risk assessment</h3>
             <span class="panel-help-btn" tabindex="0" data-tooltip="Displays the patient's relative risk score (0–100) and Platt-calibrated probability across every prediction horizon supported by the active model.">?</span>
             <span id="assessment-task-badge" class="fup-stage-pill fup-stage-pill-subtle" title="Currently selected target outcome">All Bacteria (General)</span>
+            <span id="assessment-specialist-badge" class="fup-stage-pill fup-stage-pill-subtle hidden" title="Active domain-specialist multi-task model">Bacterial Specialist</span>
             <span id="assessment-fup-badge" class="fup-stage-pill fup-stage-pill-subtle" title="Post-transplant stage currently selected on the follow-up slider">Day 60</span>
             <span id="risk-badge" class="risk-badge badge-low" style="margin-left: auto;">Low risk</span>
           </div>
@@ -375,9 +376,9 @@
 <!-- ================================================================
      SCRIPTS
 ================================================================ -->
-<script src="/static/js/patient_form.js?v=6.0"></script>
-<script src="/static/js/charts.js?v=6.0"></script>
-<script src="/static/js/main.js?v=6.0"></script>
+<script src="static/js/patient_form.js?v=7.2"></script>
+<script src="static/js/charts.js?v=7.2"></script>
+<script src="static/js/main.js?v=7.2"></script>
 <script>
   document.addEventListener('DOMContentLoaded', () => {
     window.AIIDKIT.init();

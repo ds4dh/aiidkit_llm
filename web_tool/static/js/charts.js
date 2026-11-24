@@ -58,6 +58,7 @@ window.AIIDKIT_CHARTS = (() => {
   let _umapPatientG = null;
   let _umapColorMode = 'cluster';
   let _umapData = [];
+  let _umapPrevCoords = new Map();
   let _histChart = null;
 
   function _getThemeColors() {
@@ -123,6 +124,8 @@ window.AIIDKIT_CHARTS = (() => {
           if (d.true_label === 1) {
             summaryLine += `<br><span style="font-weight: 500; font-size: 0.65rem; opacity: 0.85;">(within prediction horizon)</span>`;
           }
+        } else if (d.true_label === -100) {
+          summaryLine = 'De-identified reference embedding';
         } else {
           summaryLine = 'No event observed';
         }
@@ -173,6 +176,18 @@ window.AIIDKIT_CHARTS = (() => {
     const bounds = _lastGlobalBounds || cohortData.global_umap_bounds;
     const xs = _umapData.map(d => d.umap_x);
     const ys = _umapData.map(d => d.umap_y);
+    if (_lastPatientCoords && Number.isFinite(_lastPatientCoords.umapX) && Number.isFinite(_lastPatientCoords.umapY)) {
+      xs.push(_lastPatientCoords.umapX);
+      ys.push(_lastPatientCoords.umapY);
+    }
+    if (Array.isArray(_lastTrajectory)) {
+      _lastTrajectory.forEach(pt => {
+        if (Number.isFinite(pt?.umap_x) && Number.isFinite(pt?.umap_y)) {
+          xs.push(pt.umap_x);
+          ys.push(pt.umap_y);
+        }
+      });
+    }
     const minX = bounds?.min_x != null ? Math.min(bounds.min_x, d3.min(xs) ?? bounds.min_x) : d3.min(xs);
     const maxX = bounds?.max_x != null ? Math.max(bounds.max_x, d3.max(xs) ?? bounds.max_x) : d3.max(xs);
     const minY = bounds?.min_y != null ? Math.min(bounds.min_y, d3.min(ys) ?? bounds.min_y) : d3.min(ys);
@@ -251,6 +266,11 @@ window.AIIDKIT_CHARTS = (() => {
       .attr('stroke', d => d.true_label === 1 ? (isLight ? '#475569' : '#ffffff') : 'none')
       .attr('stroke-width', d => d.true_label === 1 ? 1.8 : 0);
 
+    _umapPrevCoords.clear();
+    _umapData.forEach(d => {
+      _umapPrevCoords.set(d.id, { x: _umapCurScaleX(d.umap_x), y: _umapCurScaleY(d.umap_y) });
+    });
+
     _bindUMAPDotEvents(circles, container, tip);
 
     _umapPatientG = _umapG.append('g').attr('clip-path', 'url(#umap-clip)');
@@ -281,23 +301,39 @@ window.AIIDKIT_CHARTS = (() => {
     const isLight = document.documentElement.getAttribute('data-theme') === 'light';
     const strokeCol = isLight ? '#475569' : '#ffffff';
 
+    // Interrupt any in-flight slider transitions and snapshot exact live DOM (cx, cy) positions
+    // so rapid slider scrubbing always animates smoothly from each patient's current position!
+    ptG.selectAll('circle.umap-pt').interrupt().each(function (d) {
+      if (d && d.id) {
+        const curX = parseFloat(this.getAttribute('cx'));
+        const curY = parseFloat(this.getAttribute('cy'));
+        if (Number.isFinite(curX) && Number.isFinite(curY)) {
+          _umapPrevCoords.set(d.id, { x: curX, y: curY });
+        }
+      }
+    });
+
+    const sortedPts = [..._umapData].sort((a, b) => (a.true_label || 0) - (b.true_label || 0));
     const joined = ptG.selectAll('circle.umap-pt')
-      .data([..._umapData].sort((a, b) => (a.true_label || 0) - (b.true_label || 0)), d => d.id)
+      .data(sortedPts, d => d.id)
       .join(
         enter => enter.append('circle')
           .attr('class', 'umap-pt')
-          .attr('cx', d => sx(d.umap_x))
-          .attr('cy', d => sy(d.umap_y))
-          .attr('r', 0)
+          .attr('cx', d => _umapPrevCoords.get(d.id)?.x ?? sx(d.umap_x))
+          .attr('cy', d => _umapPrevCoords.get(d.id)?.y ?? sy(d.umap_y))
+          .attr('r', d => _umapPrevCoords.has(d.id) ? (d.true_label === 1 ? _umapEventR : _umapDotR) : 0)
           .attr('fill', d => _computeDotFill(d, _umapColorMode))
-          .attr('opacity', 0),
+          .attr('opacity', d => _umapPrevCoords.has(d.id) ? 0.65 : 0),
         update => update,
-        exit => exit.transition().duration(250).attr('r', 0).attr('opacity', 0).remove()
+        exit => exit
+          .classed('umap-pt', false)
+          .classed('umap-pt-exiting', true)
+          .transition().duration(200).attr('r', 0).attr('opacity', 0).remove()
       );
 
     _bindUMAPDotEvents(joined, container, tip);
 
-    joined.transition().duration(380).ease(d3.easeCubicOut)
+    joined.transition().duration(320).ease(d3.easeCubicOut)
       .attr('cx', d => sx(d.umap_x))
       .attr('cy', d => sy(d.umap_y))
       .attr('r', d => d.true_label === 1 ? _umapEventR : _umapDotR)
@@ -305,6 +341,10 @@ window.AIIDKIT_CHARTS = (() => {
       .attr('opacity', d => d.true_label === 1 ? 1.0 : 0.65)
       .attr('stroke', d => d.true_label === 1 ? strokeCol : 'none')
       .attr('stroke-width', d => d.true_label === 1 ? 1.8 : 0);
+
+    sortedPts.forEach(d => {
+      _umapPrevCoords.set(d.id, { x: sx(d.umap_x), y: sy(d.umap_y) });
+    });
 
     _drawUMAPLegend(_umapColorMode);
   }
@@ -354,14 +394,16 @@ window.AIIDKIT_CHARTS = (() => {
         { label: 'Low risk', color: '#4F8EF7' },
       ];
     } else if (mode === 'imminence') {
+      const hasGroundTruth = _umapData && _umapData.some(d => d.days_to_event != null);
       colorItems = [
-        { label: 'Close', color: '#FF4757' },
-        { label: 'Distant/No', color: '#7C8DB5' },
+        { label: hasGroundTruth ? 'Close' : 'High urgency', color: '#FF4757' },
+        { label: hasGroundTruth ? 'Distant/No' : 'Low urgency', color: '#7C8DB5' },
       ];
     }
 
+    const hasObservedEvents = _umapData && _umapData.some(d => d.true_label === 1);
     const hasTraj = _showTrajectory && Array.isArray(_lastTrajectory) && _lastTrajectory.length > 1;
-    const numRows = colorItems.length + 2 + (hasTraj ? 1 : 0);
+    const numRows = colorItems.length + (hasObservedEvents ? 1 : 0) + 1 + (hasTraj ? 1 : 0);
     const legHeight = numRows * rowH + 8;
 
     const lg = svg.append('g')
@@ -392,21 +434,26 @@ window.AIIDKIT_CHARTS = (() => {
       _legText(g, e.label);
     });
 
-    const evRow = lg.append('g').attr('transform', `translate(0,${colorItems.length * rowH})`);
-    evRow.append('circle')
-      .attr('cx', symX).attr('cy', cy).attr('r', legDotR)
-      .attr('fill', '#7C8DB5').attr('opacity', 0.65)
-      .attr('stroke', strokeColor).attr('stroke-width', 1.8);
-    _legText(evRow, 'Event observed');
+    let nextRowIdx = colorItems.length;
+    if (hasObservedEvents) {
+      const evRow = lg.append('g').attr('transform', `translate(0,${nextRowIdx * rowH})`);
+      evRow.append('circle')
+        .attr('cx', symX).attr('cy', cy).attr('r', legDotR)
+        .attr('fill', '#7C8DB5').attr('opacity', 0.65)
+        .attr('stroke', strokeColor).attr('stroke-width', 1.8);
+      _legText(evRow, 'Event observed');
+      nextRowIdx += 1;
+    }
 
-    const stRow = lg.append('g').attr('transform', `translate(0,${(colorItems.length + 1) * rowH})`);
+    const stRow = lg.append('g').attr('transform', `translate(0,${nextRowIdx * rowH})`);
     stRow.append('path')
       .attr('d', _starPath(symX, cy, legStarOuter, legStarInner, 5))
       .attr('fill', '#FFD700').attr('stroke', 'none');
     _legText(stRow, 'Active stage');
+    nextRowIdx += 1;
 
     if (hasTraj) {
-      const trRow = lg.append('g').attr('transform', `translate(0,${(colorItems.length + 2) * rowH})`);
+      const trRow = lg.append('g').attr('transform', `translate(0,${nextRowIdx * rowH})`);
       trRow.append('line')
         .attr('x1', symX - legStarOuter).attr('x2', symX + legStarOuter)
         .attr('y1', cy).attr('y2', cy)
@@ -911,7 +958,11 @@ window.AIIDKIT_CHARTS = (() => {
           card.className = 'cluster-profile-card';
           card.dataset.clusterId = id;
           card.style.setProperty('--card-color', prof.color);
-          const evRate = prof.event_rate != null ? `${(prof.event_rate * 100).toFixed(0)}%` : '—';
+          const ratePct = prof.event_rate != null ? prof.event_rate * 100 : null;
+          const evRate = ratePct == null
+            ? '—'
+            : (ratePct > 0 && ratePct < 10 ? `${ratePct.toFixed(1)}%` : `${ratePct.toFixed(0)}%`);
+          const rateLabel = _escHtml(prof.rate_label || 'Event Rate');
 
           card.innerHTML = `
             <div class="cluster-profile-header">
@@ -924,7 +975,7 @@ window.AIIDKIT_CHARTS = (() => {
                 <span class="active-patient-badge">Active Patient</span>
               </div>
               <div class="cluster-metric-item">
-                <span class="metric-label">Event Rate</span>
+                <span class="metric-label">${rateLabel}</span>
                 <span class="event-rate-pill" style="background: ${prof.color}1f; color: ${prof.color}; border: 1px solid ${prof.color}33;">${evRate}</span>
               </div>
             </div>
@@ -994,10 +1045,10 @@ window.AIIDKIT_CHARTS = (() => {
   }
 
   // ================================================================
-  // RISK TIMELINE GRAPH (MODE 2)
+  // RISK TIMELINE GRAPH (MODE 2 — Unified Invariant Staircase + Slider Cutoff)
   // ================================================================
 
-  function drawRiskTimelineGraph(eventsWithScores, finalScore, taskKey = 'infection_bacteria') {
+  function drawRiskTimelineGraph(eventsWithScores, finalScore, taskKey = 'infection_bacteria', opts = {}) {
     const container = document.getElementById('timeline-graph-svg');
     if (!container) return;
 
@@ -1035,8 +1086,10 @@ window.AIIDKIT_CHARTS = (() => {
       return;
     }
 
-    // Target Final Risk Score (e.g. 51 for 51/100) shown in Risk Assessment panel
-    const endScore = Math.round((finalScore || 0.5) * 100);
+    const cutoffFup = Number.isFinite(opts?.cutoffFup) ? opts.cutoffFup : Infinity;
+
+    // Target Full-Timeline Final Risk Score (0-100)
+    const endScore = Math.max(1, Math.min(99, Math.round((finalScore ?? 0.5) * 100)));
 
     const STATIC_ENTITIES = new Set([
       'Patient info', 'Donor info', 'Mismatch info', 'Transplant info',
@@ -1049,43 +1102,63 @@ window.AIIDKIT_CHARTS = (() => {
 
     const postBaselineEvents = eventsWithScores.filter(ev => !isStaticEvent(ev));
 
-    // Sum of raw attribution deltas
-    let totalRawDeltaSum = 0;
-    postBaselineEvents.forEach(ev => { totalRawDeltaSum += (ev.score || 0) * 100; });
-
-    // Determine realistic baseline risk R0 (0-100 scale)
+    // Anchor Baseline Risk R0 to the model's true Day-0 trajectory score when available
     let baseRisk;
-    const rawBaseline = Math.round(endScore - totalRawDeltaSum);
-
-    if (rawBaseline >= 10 && rawBaseline <= 85) {
-      baseRisk = rawBaseline;
+    if (Number.isFinite(opts?.baselineScore)) {
+      baseRisk = Math.max(2, Math.min(98, Math.round(opts.baselineScore * 100)));
     } else {
-      baseRisk = endScore >= 50
-        ? Math.max(15, Math.min(45, Math.round(endScore * 0.4)))
-        : Math.max(10, Math.min(35, Math.round(endScore * 0.6 + 5)));
+      let rawSum = 0;
+      postBaselineEvents.forEach(ev => { rawSum += (ev.score || 0) * 100; });
+      const rawBase = Math.round(endScore - rawSum);
+      baseRisk = (rawBase >= 10 && rawBase <= 85)
+        ? rawBase
+        : (endScore >= 50
+          ? Math.max(15, Math.min(45, Math.round(endScore * 0.45)))
+          : Math.max(10, Math.min(35, Math.round(endScore * 0.65 + 4))));
     }
 
-    // Required total delta sum across post-baseline timeline to hit endScore
+    // Strictly sign-preserving positive/negative decomposition (zero sign flips or cancellation blow-ups!)
+    let posRawSum = 0;
+    let negRawSum = 0;
+    postBaselineEvents.forEach(ev => {
+      const sc = (ev.score || 0) * 100;
+      if (sc > 0) posRawSum += sc;
+      else if (sc < 0) negRawSum += Math.abs(sc);
+    });
+
+    if (postBaselineEvents.length > 0 && posRawSum > 1e-5 && negRawSum <= 1e-5 && endScore < baseRisk) {
+      baseRisk = Math.max(2, endScore - Math.max(4, Math.min(30, Math.round(posRawSum))));
+    } else if (postBaselineEvents.length > 0 && negRawSum > 1e-5 && posRawSum <= 1e-5 && endScore > baseRisk) {
+      baseRisk = Math.min(98, endScore + Math.max(4, Math.min(30, Math.round(negRawSum))));
+    }
+
     const reqTotalDelta = endScore - baseRisk;
+    let posMult = 1.0;
+    let negMult = 1.0;
+    if (posRawSum > 1e-5 && negRawSum > 1e-5) {
+      const totalSwing = Math.max(Math.abs(reqTotalDelta) + 10, Math.min(68, (posRawSum + negRawSum) * 1.35));
+      const wPos = 0.5 * (totalSwing + reqTotalDelta);
+      const wNeg = 0.5 * (totalSwing - reqTotalDelta);
+      posMult = wPos / posRawSum;
+      negMult = wNeg / negRawSum;
+    } else if (posRawSum > 1e-5) {
+      posMult = Math.max(2, reqTotalDelta) / posRawSum;
+    } else if (negRawSum > 1e-5) {
+      negMult = Math.max(2, -reqTotalDelta) / negRawSum;
+    }
 
-    // Normalization / Scaling factor kScale
-    const kScale = Math.abs(totalRawDeltaSum) > 1e-4
-      ? (reqTotalDelta / totalRawDeltaSum)
-      : 1.0;
-
-    // Attach normalized/scaled scores to all events
     const eventsWithScaledScores = eventsWithScores.map(ev => {
       const isPost = !isStaticEvent(ev);
       const rawSc = (ev.score || 0) * 100;
-      const scaledSc = isPost ? rawSc * kScale : rawSc;
+      const scaledSc = !isPost ? rawSc : (rawSc >= 0 ? rawSc * posMult : rawSc * negMult);
       return {
         ...ev,
         scaled_score: scaledSc / 100,
-        scaled_delta: scaledSc
+        scaled_delta: scaledSc,
       };
     });
 
-    // Group events chronologically by days_since_tpx
+    // Group ALL events chronologically by days_since_tpx on the invariant full timeline
     const daysMap = new Map();
     eventsWithScaledScores.forEach(ev => {
       const d = isStaticEvent(ev) ? 0 : ev.days_since_tpx;
@@ -1096,14 +1169,13 @@ window.AIIDKIT_CHARTS = (() => {
     const sortedDays = Array.from(daysMap.keys()).sort((a, b) => a - b);
     const postDays = sortedDays.filter(d => d > 0);
 
-    // Construct timeline points with guaranteed convergence to endScore
+    // Construct full invariant timelineData across [startDay .. maxDay]
     const timelineData = [];
     let currentRisk = baseRisk;
 
-    const minDay = sortedDays[0];
+    const minDay = sortedDays[0] ?? 0;
     const startDay = minDay <= 0 ? minDay - 6 : -6;
 
-    // Baseline point (day 0)
     timelineData.push({
       day: startDay,
       riskBefore: baseRisk,
@@ -1122,7 +1194,6 @@ window.AIIDKIT_CHARTS = (() => {
       const riskBefore = currentRisk;
       let riskAfter;
       if (dayIdx === postDays.length - 1) {
-        // Guarantee EXACT convergence to endScore on final timeline point!
         riskAfter = endScore;
       } else {
         runningAccumulator += dayDelta;
@@ -1150,8 +1221,8 @@ window.AIIDKIT_CHARTS = (() => {
       });
     });
 
-    // Proportional Linear X-Scale based on Calendar Days — Twice as dense (8px per day)
-    const maxDay = sortedDays[sortedDays.length - 1];
+    // Fixed X-Scale across the patient's FULL timeline so scrubbing the slider never rescales X!
+    const maxDay = Math.max(sortedDays[sortedDays.length - 1] ?? 0, 0);
     const daySpan = Math.max(30, maxDay - startDay);
     const containerW = container.clientWidth || 550;
     const containerH = 340;
@@ -1286,9 +1357,10 @@ window.AIIDKIT_CHARTS = (() => {
       }
     });
 
-    // Build Staircase Path Points
+    // Build Visible Staircase Path Points up to cutoffFup (curve stays 100% invariant; future steps disappear!)
+    const visibleTimeline = timelineData.filter(d => d.isBaseline || d.day <= cutoffFup);
     const stepPoints = [];
-    timelineData.forEach((d, i) => {
+    visibleTimeline.forEach((d, i) => {
       if (i === 0) {
         stepPoints.push({ x: xScale(d.day), y: yScale(d.riskBefore) });
       } else {
@@ -1296,14 +1368,40 @@ window.AIIDKIT_CHARTS = (() => {
         stepPoints.push({ x: xScale(d.day), y: yScale(d.riskAfter) });
       }
     });
+    const lastVisible = visibleTimeline[visibleTimeline.length - 1];
+    const cutoffClampedDay = Number.isFinite(cutoffFup) ? Math.min(maxDay, Math.max(startDay, cutoffFup)) : maxDay;
+    if (lastVisible && cutoffClampedDay > lastVisible.day) {
+      stepPoints.push({ x: xScale(cutoffClampedDay), y: yScale(lastVisible.riskAfter) });
+    }
 
     // Dedicated SVG layer groups for proper z-ordering:
-    // Area -> Staircase Line -> Stems -> Callout Badges -> Interactive Dots (on top!)
+    // Area -> Staircase Line -> Stage Cutoff Marker -> Stems -> Callout Badges -> Interactive Dots (on top!)
     const gArea = g.append('g').attr('class', 'timeline-area-layer');
     const gLines = g.append('g').attr('class', 'timeline-line-layer');
+    const gCutoff = g.append('g').attr('class', 'timeline-cutoff-layer');
     const gCalloutStems = g.append('g').attr('class', 'timeline-stems-layer');
     const gCalloutBadges = g.append('g').attr('class', 'timeline-badges-layer');
     const gNodes = g.append('g').attr('class', 'timeline-nodes-layer');
+
+    // Subtle vertical stage marker when slider is scrubbed earlier than full timeline maxDay
+    if (Number.isFinite(cutoffFup) && cutoffFup < maxDay) {
+      const cutX = xScale(Math.max(0, cutoffClampedDay));
+      gCutoff.append('line')
+        .attr('x1', cutX).attr('x2', cutX)
+        .attr('y1', -8).attr('y2', iH)
+        .attr('stroke', isLight ? '#D97706' : '#FBBF24')
+        .attr('stroke-width', 1.6)
+        .attr('stroke-dasharray', '4,3')
+        .attr('opacity', 0.85);
+      gCutoff.append('text')
+        .attr('x', Math.min(iW - 4, Math.max(28, cutX)))
+        .attr('y', -13)
+        .attr('text-anchor', 'middle')
+        .attr('fill', isLight ? '#B45309' : '#FBBF24')
+        .attr('font-size', '0.62rem')
+        .attr('font-weight', '700')
+        .text(`Stage: Day ${cutoffFup}`);
+    }
 
     // Gradient Area Fill under Staircase
     const areaDef = svg.append('defs').append('linearGradient')
@@ -1495,8 +1593,9 @@ window.AIIDKIT_CHARTS = (() => {
       c.x = Math.max(c.boxW / 2 + 4, Math.min(iW - c.boxW / 2 - 4, c.x));
     });
 
-    // Render resolved callout badges and leader stems
+    // Render resolved callout badges and leader stems strictly up to cutoffFup (positions remain 100% fixed!)
     calloutCandidates.forEach(c => {
+      if (c.d.day > cutoffFup) return;
       const annoG = gCalloutBadges.append('g')
         .attr('transform', `translate(${c.x}, ${c.y})`)
         .style('pointer-events', 'none');
@@ -1534,8 +1633,9 @@ window.AIIDKIT_CHARTS = (() => {
         .attr('opacity', 0.75);
     });
 
-    // Render Day Node Circle Groups (rendered on top layer gNodes!)
+    // Render Day Node Circle Groups strictly up to cutoffFup (rendered on top layer gNodes!)
     timelineData.forEach((d, idx) => {
+      if (!d.isBaseline && d.day > cutoffFup) return;
       const cx = xScale(d.day);
       const cy = yScale(d.riskBefore);
       const absDelta = Math.abs(d.delta);
