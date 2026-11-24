@@ -23,7 +23,6 @@ try:
 except ImportError:
     from optuna.storages import JournalFileStorage as _JournalFileBackend
 from src.utils import apply_config_overrides
-from src.model.model_utils import resolve_best_checkpoint
 from src.model.patient_embedder import PatientEmbeddingModelFactory
 from scripts.script_utils import format_pretrain_run_id, get_value_embedding_tag
 
@@ -34,34 +33,34 @@ class FatalWorkerError(BaseException):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Two-stage Optuna hyperparameter optimization for t-EAV Transformer (Stage 1: pretrain, Stage 2: finetune)."
+        description="Optuna hyperparameter optimization for supervised fine-tuning from the fixed pre-trained t-EAV Transformer backbone."
     )
     parser.add_argument(
         "--stage",
         type=str,
-        choices=["pretrain", "finetune"],
-        default="pretrain",
-        help="Optimization stage: 'pretrain' (self-supervised pre-training) or 'finetune' (supervised multi-task fine-tuning from Stage-1 checkpoint).",
+        choices=["finetune"],
+        default="finetune",
+        help="Optimization stage (locked to 'finetune'; pre-training uses fixed canonical config).",
     )
     parser.add_argument("--config", "-c", type=str, default="configs/discriminative_training.yaml")
     parser.add_argument("--split", type=str, default=None, help="Override data_split_type (default: from config).")
     parser.add_argument(
         "--tasks",
         type=str,
-        default="multitask_bacteria,multitask_viruses,multitask_fungi,death,graft_loss",
-        help="Comma-separated task key(s) for fine-tuning stage (default: canonical 5-run B_CAT_MT setup).",
+        default="multitask_bacteria",
+        help="Comma-separated task key(s) for fine-tuning optimization (default: multitask_bacteria).",
     )
     parser.add_argument(
         "--pretrained-dir",
         type=str,
         default=None,
-        help="For --stage finetune: path to pretraining folder containing checkpoint-* (default: auto-resolved from Stage-1 best_pretrain_config.json or baseline pretraining).",
+        help="Path to pretraining folder containing checkpoint-* (default: canonical e00-a15-v60_<raw|bin>/pretraining).",
     )
     parser.add_argument(
         "--export-run-id",
         type=str,
-        default="optuna_best",
-        help="Canonical run_id under results/<family>/<split>/<run_id>_<raw|bin> where the winning checkpoint/predictions are linked (default: optuna_best).",
+        default="optuna_ft",
+        help="Canonical finetune_run_id under results/<family>/<split>/<run_id>_<raw|bin> where the winning checkpoint/predictions are linked (default: optuna_ft).",
     )
     parser.add_argument(
         "--target-trials",
@@ -108,7 +107,7 @@ def parse_args():
 
 cli_args = parse_args()
 DEBUG = cli_args.debug
-STAGE = cli_args.stage
+STAGE = "finetune"
 CONFIG_PATH = cli_args.config
 with open(CONFIG_PATH, "r") as f:
     CLI_CFG = yaml.safe_load(f)
@@ -125,17 +124,13 @@ IS_CAUSAL = PatientEmbeddingModelFactory._is_causal_backbone(
     architecture_type=CLI_CFG["model"].get("architecture_type"),
 )
 
-# Isolate Optuna directory per model family (results/transformer vs results/generative_transformer)
-OPTUNA_DIR = BASE_RESULTS_DIR / f"optuna_{STAGE}" / f"{SPLIT_TYPE}_{VAL_TAG}"
+# Isolate Optuna fine-tuning study per model family, split, value embedding tag, and task group
+SAFE_TASK_TAG = TASKS_ARG.replace(",", "-")
+OPTUNA_DIR = BASE_RESULTS_DIR / "optuna_finetune" / f"{SPLIT_TYPE}_{VAL_TAG}" / SAFE_TASK_TAG
 DEFAULT_TOTAL_TRIALS = int(CLI_CFG["optuna"]["num_trials"] if not DEBUG else CLI_CFG["optuna"]["num_trials_debug"])
 TARGET_TRIALS = cli_args.target_trials if cli_args.target_trials is not None else DEFAULT_TOTAL_TRIALS
 N_TRIALS = cli_args.n_trials  # None = run until TARGET_TRIALS reached globally; 0 = finalize only
-
-STUDY_NAME = f"{CLI_CFG['optuna']['study_name']}_{STAGE}_{SPLIT_TYPE}_{VAL_TAG}"
-if STAGE == "finetune":
-    safe_task_tag = TASKS_ARG.replace(",", "-")
-    STUDY_NAME = f"{STUDY_NAME}_{safe_task_tag}"
-    OPTUNA_DIR = OPTUNA_DIR / safe_task_tag
+STUDY_NAME = f"{CLI_CFG['optuna']['study_name']}_finetune_{SPLIT_TYPE}_{VAL_TAG}_{SAFE_TASK_TAG}"
 
 BEST_MODEL_LOCK = threading.Lock()
 BEST_MODEL_INFO = {
@@ -147,7 +142,7 @@ BEST_MODEL_INFO = {
 }
 FAILURE_STATE = {"consecutive": 0}
 
-if cli_args.init_only or (cli_args.n_trials == 0 and STAGE == "pretrain"):
+if cli_args.init_only:
     GPU_IDS = ["0"]
 else:
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
@@ -187,7 +182,7 @@ def _resolve_scratch_trial_root() -> Path | None:
             if cand.exists() and os.access(cand, os.W_OK):
                 resolved = str(cand.resolve())
                 if not resolved.startswith(home_resolved):
-                    root = cand / f"optuna_{BASE_RESULTS_DIR.name}_{STAGE}_{SPLIT_TYPE}_{os.getpid()}"
+                    root = cand / f"optuna_{BASE_RESULTS_DIR.name}_finetune_{SPLIT_TYPE}_{os.getpid()}"
                     root.mkdir(parents=True, exist_ok=True)
                     return root
         except OSError:
@@ -265,7 +260,6 @@ def load_or_create_study_once(log_file: str, study_name: str, sampler: TPESample
             time.sleep(0.1)
 
     try:
-        # Re-open storage to sync any study created while we waited for the lock
         storage = JournalStorage(_JournalFileBackend(log_file))
         try:
             study = optuna.load_study(study_name=study_name, storage=storage, sampler=sampler)
@@ -278,27 +272,21 @@ def load_or_create_study_once(log_file: str, study_name: str, sampler: TPESample
                 load_if_exists=False,
                 sampler=sampler,
             )
-            # Enqueue the canonical baseline configuration as Trial #0 on a fresh pretraining study
-            # so TPE starts with an exact apples-to-apples anchor point!
-            if STAGE == "pretrain":
-                base_anchor = {
-                    "mask_ent": 0.00,
-                    "mask_att": 0.15,
-                    "mask_val": 0.60,
-                    "lr_pre": 1.0e-4,
-                    "weight_decay_pre": 1.0e-2,
-                    "lr_scheduler_pre": "cosine",
-                    "warmup_base_pre": 100,
-                    "grad_accum_pre": 4,
-                    "dropout_embedding": 0.00,
-                    "dropout_attention": 0.10,
-                }
-                if not IS_CAUSAL:
-                    base_anchor.update({
-                        "local_attention": 128,
-                        "dropout_mlp": 0.10,
-                    })
-                study.enqueue_trial(base_anchor)
+            # Enqueue the canonical YAML fine-tuning defaults as Trial #0 so TPE starts
+            # with an exact apples-to-apples baseline anchor on e00-a15-v60_raw!
+            base_anchor = {
+                "lr_fine": 4.0e-5,
+                "weight_decay_fine": 1.0e-2,
+                "warmup_base_fine": 50,
+                "grad_accum_fine": 4,
+                "undersampling_ratio": 15.0,
+                "dropout_embedding": 0.00,
+                "dropout_attention": 0.10,
+                "dropout_classifier": 0.10,
+            }
+            if not IS_CAUSAL:
+                base_anchor["dropout_mlp"] = 0.10
+            study.enqueue_trial(base_anchor)
             return study, storage
     finally:
         if acquired:
@@ -324,35 +312,19 @@ def get_run_id(masking_rules: dict) -> str:
     return format_pretrain_run_id(CLI_CFG, masking_rules)
 
 
-def resolve_source_pretrained_dir() -> tuple[Path, dict | None]:
-    """Locate the pretrained checkpoint directory (and optional Stage-1 metadata) to seed Stage 2 trials."""
+def resolve_source_pretrained_dir() -> Path:
+    """Locate the canonical fixed pre-trained checkpoint directory (e.g. e00-a15-v60_raw/pretraining)."""
     if cli_args.pretrained_dir:
         p = Path(cli_args.pretrained_dir)
         if p.exists():
-            return p, None
+            return p
         raise FileNotFoundError(f"Specified --pretrained-dir does not exist: {p}")
 
-    # Check family-isolated Stage-1 config first, then legacy shared location
-    for stage1_meta in (
-        BASE_RESULTS_DIR / "optuna_pretrain" / f"{SPLIT_TYPE}_{VAL_TAG}" / "best_pretrain_config.json",
-        BASE_RESULTS_DIR.parent / "optuna_pretrain" / f"{SPLIT_TYPE}_{VAL_TAG}" / "best_pretrain_config.json",
-    ):
-        if stage1_meta.exists():
-            with open(stage1_meta, "r") as f:
-                meta = json.load(f)
-            best_pt = meta.get("best_pretraining_dir")
-            if best_pt and Path(best_pt).exists():
-                return Path(best_pt), meta
-
-    # Fallback to canonical optuna_best or default pretraining directory
-    for cand_pt in (
-        BASE_RESULTS_DIR / SPLIT_TYPE / EXPORT_RUN_ID / "pretraining",
-        BASE_RESULTS_DIR / SPLIT_TYPE / get_run_id(CLI_CFG["data_collator"]["mlm_masking_rules"]) / "pretraining",
-    ):
-        if cand_pt.exists():
-            return cand_pt, None
+    canonical_pt = BASE_RESULTS_DIR / SPLIT_TYPE / get_run_id(CLI_CFG["data_collator"]["mlm_masking_rules"]) / "pretraining"
+    if canonical_pt.exists():
+        return canonical_pt
     raise FileNotFoundError(
-        f"Could not find a pretrained directory under {BASE_RESULTS_DIR / SPLIT_TYPE}. Run Stage-1 pretraining first or pass --pretrained-dir."
+        f"Canonical pretraining directory not found at {canonical_pt}. Run pre-training first or pass --pretrained-dir."
     )
 
 
@@ -402,34 +374,6 @@ def run_subprocess(
             except OSError:
                 pass
         raise RuntimeError(f"Script {script_path} failed with exit code {result.returncode}.")
-
-
-def evaluate_pretrain_trial(pretrain_dir: Path) -> float:
-    """
-    Read standardized validation metrics from `pretraining_results.json`
-    (evaluated on the fixed reference mask e00-a15-v60 with seed 1234).
-    """
-    res_file = pretrain_dir / "pretraining_results.json"
-    if res_file.exists():
-        with open(res_file, "r") as f:
-            data = json.load(f)
-        acc = float(data.get("ref_eval_mlm_accuracy", 0.0))
-        sil = float(data.get("ref_eval_silhouette_score", -1.0))
-        bonus = 0.02 * max(0.0, sil) if sil > 0 else 0.0
-        return acc + bonus
-
-    try:
-        best_ckpt = resolve_best_checkpoint(pretrain_dir)
-    except Exception:
-        best_ckpt = None
-    if best_ckpt is not None:
-        ts_path = best_ckpt / "trainer_state.json"
-        if ts_path.exists():
-            with open(ts_path, "r") as f:
-                ts = json.load(f)
-            if ts.get("best_metric") is not None:
-                return float(ts["best_metric"])
-    return 0.0
 
 
 def evaluate_finetune_trial(run_path: Path) -> float:
@@ -529,147 +473,8 @@ def _reset_consecutive_failures():
         FAILURE_STATE["consecutive"] = 0
 
 
-def objective_pretrain(trial: optuna.Trial) -> float:
-    """Stage 1: Optimize self-supervised pre-training hyperparameters with matched sample budgets."""
-    gpu_id = GPU_QUEUE.get()
-    persistent_trial_dir = OPTUNA_DIR / f"trial_{trial.number:03d}"
-    work_trial_dir = (SCRATCH_TRIAL_ROOT / f"trial_{trial.number:03d}") if SCRATCH_TRIAL_ROOT else persistent_trial_dir
-    try:
-        trial_env = os.environ.copy()
-        trial_env["CUDA_VISIBLE_DEVICES"] = gpu_id
-
-        # 1. Masking probabilities (cap entity masking at 0.10 for causal next-event decoder)
-        max_ent = 0.10 if IS_CAUSAL else 0.20
-        p_entity = trial.suggest_float("mask_ent", 0.00, max_ent, step=0.05)
-        p_attr = trial.suggest_float("mask_att", 0.05, 0.35, step=0.05)
-        p_value = trial.suggest_float("mask_val", 0.15, 0.60, step=0.05)
-        masking_rules = {"entity_id": p_entity, "attribute_id": p_attr, "value_id": p_value}
-
-        # 2. Optimization & schedule hyperparameters (normalize step cadence by effective batch size!)
-        lr_pre = trial.suggest_float("lr_pre", 5e-5, 8e-4, log=True)
-        weight_decay_pre = trial.suggest_float("weight_decay_pre", 1e-4, 1e-1, log=True)
-        lr_scheduler_pre = trial.suggest_categorical("lr_scheduler_pre", ["cosine", "constant_with_warmup"])
-        warmup_base_pre = trial.suggest_int("warmup_base_pre", 50, 250, step=50)
-        grad_accum_pre = trial.suggest_categorical("grad_accum_pre", [2, 4, 8])
-
-        base_ga = int(CLI_CFG["pretrainer"].get("gradient_accumulation_steps", 4))
-        base_eval_steps = int(CLI_CFG["pretrainer"].get("eval_steps", 100))
-        base_max_steps = int(CLI_CFG["pretrainer"].get("max_steps", 5000))
-        step_scale = base_ga / float(grad_accum_pre)
-        scaled_eval_steps = max(25, int(round(base_eval_steps * step_scale))) if not DEBUG else 20
-        scaled_warmup_steps = max(10, int(round(warmup_base_pre * step_scale))) if not DEBUG else 5
-        scaled_max_steps = max(50, int(round(base_max_steps * step_scale))) if not DEBUG else 40
-
-        # 3. Backbone capacity, receptive field & regularization
-        dropout_emb = trial.suggest_float("dropout_embedding", 0.0, 0.25, step=0.05)
-        dropout_att = trial.suggest_float("dropout_attention", 0.0, 0.25, step=0.05)
-        cfg_model_args: dict = {
-            "tie_word_embeddings": False,
-            "dropout_embedding": dropout_emb,
-            "dropout_attention": dropout_att,
-        }
-        if not IS_CAUSAL:
-            loc_attn = trial.suggest_categorical("local_attention", [64, 128, 256])
-            dropout_mlp = trial.suggest_float("dropout_mlp", 0.0, 0.25, step=0.05)
-            cfg_model_args.update({
-                "local_attention": loc_attn,
-                "dropout_mlp": dropout_mlp,
-            })
-
-        portable_overrides = {
-            "run_id": cli_args.export_run_id,
-            "data_collator": {
-                "mlm_masking_rules": masking_rules,
-                "use_numerical_embedding": (VAL_TAG == "raw"),
-            },
-            "pretrainer": {
-                "learning_rate": lr_pre,
-                "weight_decay": weight_decay_pre,
-                "lr_scheduler_type": lr_scheduler_pre,
-                "warmup_steps": scaled_warmup_steps,
-                "gradient_accumulation_steps": grad_accum_pre,
-                "eval_steps": scaled_eval_steps,
-                "save_steps": scaled_eval_steps,
-                "max_steps": scaled_max_steps,
-            },
-            "model": {
-                "config_args": cfg_model_args,
-                "embedding_layer_config": {"use_numerical_embedding": (VAL_TAG == "raw")},
-            },
-        }
-        work_overrides = {
-            **portable_overrides,
-            "result_dir": str(work_trial_dir),
-            "data_split_type": SPLIT_TYPE,
-            "do_clustering": False,
-            "pretrainer": {
-                **portable_overrides["pretrainer"],
-                "seed": 1234 + trial.number,
-            },
-        }
-        work_overrides.pop("run_id", None)
-        persistent_overrides = {**work_overrides, "result_dir": str(persistent_trial_dir)}
-
-        arch_str = f"W={cfg_model_args['local_attention']}, " if not IS_CAUSAL else ""
-        print(
-            f"\n[Pretrain Trial {trial.number}] GPU {gpu_id}: {arch_str}"
-            f"mask=({p_entity:.2f},{p_attr:.2f},{p_value:.2f}), lr={lr_pre:.2e} ({lr_scheduler_pre}), "
-            f"wd={weight_decay_pre:.2e}, ga={grad_accum_pre} (eval={scaled_eval_steps}, max={scaled_max_steps}), "
-            f"drop=({dropout_emb:.2f},{dropout_att:.2f}"
-            + (f",{cfg_model_args['dropout_mlp']:.2f})" if not IS_CAUSAL else ")")
-        )
-        try:
-            run_subprocess(
-                "scripts/train_mlm.py",
-                work_overrides,
-                env=trial_env,
-                error_log_path=persistent_trial_dir / "trial_error.log",
-            )
-        except RuntimeError as e:
-            print(f"[Pretrain Trial {trial.number}] Failed: {e}")
-            _record_trial_failure_and_raise(e)
-
-        _reset_consecutive_failures()
-        run_id = get_run_id(masking_rules)
-        work_run_path = work_trial_dir / SPLIT_TYPE / run_id
-        persistent_run_path = persistent_trial_dir / SPLIT_TYPE / run_id
-        score = evaluate_pretrain_trial(work_run_path / "pretraining")
-        print(f"[Pretrain Trial {trial.number}] GPU {gpu_id} -> Standardized Ref MLM Score = {score:.4f}")
-
-        is_new_best = False
-        path_to_delete = None
-        with BEST_MODEL_LOCK:
-            study_best = -float("inf")
-            try:
-                study_best = float(trial.study.best_value)
-            except Exception:
-                pass
-            threshold_best = max(BEST_MODEL_INFO["score"], study_best)
-            if score > threshold_best:
-                is_new_best = True
-                BEST_MODEL_INFO["score"] = score
-                BEST_MODEL_INFO["path"] = persistent_run_path
-                BEST_MODEL_INFO["params"] = trial.params
-                BEST_MODEL_INFO["overrides"] = persistent_overrides
-                BEST_MODEL_INFO["portable_overrides"] = portable_overrides
-            elif SCRATCH_TRIAL_ROOT is None:
-                path_to_delete = persistent_run_path
-
-            _sync_lightweight_artifacts(work_run_path, persistent_run_path, copy_checkpoints=is_new_best)
-            if path_to_delete:
-                cleanup_checkpoints(path_to_delete)
-
-        trial.set_user_attr("run_path", str(persistent_run_path))
-        trial.set_user_attr("portable_overrides", portable_overrides)
-        return score
-    finally:
-        if SCRATCH_TRIAL_ROOT is not None and work_trial_dir.exists():
-            shutil.rmtree(work_trial_dir, ignore_errors=True)
-        GPU_QUEUE.put(gpu_id)
-
-
 def objective_finetune(trial: optuna.Trial) -> float:
-    """Stage 2: Optimize multi-task fine-tuning hyperparameters from the fixed Stage-1 pretrained checkpoint."""
+    """Optimize multi-task fine-tuning hyperparameters from the fixed canonical pretrained checkpoint."""
     gpu_id = GPU_QUEUE.get()
     persistent_trial_dir = OPTUNA_DIR / f"trial_{trial.number:03d}"
     work_trial_dir = (SCRATCH_TRIAL_ROOT / f"trial_{trial.number:03d}") if SCRATCH_TRIAL_ROOT else persistent_trial_dir
@@ -677,7 +482,7 @@ def objective_finetune(trial: optuna.Trial) -> float:
         trial_env = os.environ.copy()
         trial_env["CUDA_VISIBLE_DEVICES"] = gpu_id
 
-        source_pt_dir, _ = resolve_source_pretrained_dir()
+        source_pt_dir = resolve_source_pretrained_dir()
         default_rule = CLI_CFG["data_collator"]["mlm_masking_rules"]
         run_id = get_run_id(default_rule)
 
@@ -688,11 +493,14 @@ def objective_finetune(trial: optuna.Trial) -> float:
             if not pt_link.exists() and not pt_link.is_symlink():
                 os.symlink(source_pt_dir.resolve(), pt_link, target_is_directory=True)
 
-        # 1. Optimization hyperparameters (normalize step cadence by effective batch size!)
+        # 1. Optimization & class-balancing hyperparameters (normalize step cadence by effective batch size!)
         lr_fine = trial.suggest_float("lr_fine", 1e-5, 2e-4, log=True)
         weight_decay_fine = trial.suggest_float("weight_decay_fine", 1e-4, 1e-1, log=True)
-        warmup_base_fine = trial.suggest_int("warmup_base_fine", 20, 140, step=20)
+        warmup_base_fine = trial.suggest_int("warmup_base_fine", 20, 140, step=10)
         grad_accum_fine = trial.suggest_categorical("grad_accum_fine", [2, 4, 8])
+        # Per-FUP negative:positive cap (3:1 strong .. 30:1 light, plus 0.0 -> None = full natural distribution)
+        undersamp_choice = trial.suggest_categorical("undersampling_ratio", [3.0, 5.0, 10.0, 15.0, 30.0, 0.0])
+        eff_undersampling_ratio = float(undersamp_choice) if undersamp_choice > 0.0 else None
 
         base_ga = int(CLI_CFG["finetuner"].get("gradient_accumulation_steps", 4))
         base_eval_steps = int(CLI_CFG["finetuner"].get("eval_steps", 50))
@@ -715,10 +523,13 @@ def objective_finetune(trial: optuna.Trial) -> float:
             cfg_dropouts["dropout_mlp"] = trial.suggest_float("dropout_mlp", 0.0, 0.25, step=0.05)
 
         # 3. Unweighted BCE ("ce") for calibrated probabilities + hierarchical random-effects head aggregation
+        # Note: portable_overrides sets `finetune_run_id` (NOT `run_id`) so `train_classification.py`
+        # always loads pretraining from canonical `e00-a15-v60_<raw|bin>/pretraining` across all splits!
         loss_name = "ce"
         es_mean = CLI_CFG.get("early_stopping_mean", "random_effects")
         portable_overrides = {
-            "run_id": cli_args.export_run_id,
+            "finetune_run_id": cli_args.export_run_id,
+            "target_undersampling_ratio": eff_undersampling_ratio,
             "early_stopping_mean": es_mean,
             "data_collator": {"use_numerical_embedding": (VAL_TAG == "raw")},
             "finetuner": {
@@ -746,13 +557,14 @@ def objective_finetune(trial: optuna.Trial) -> float:
                 "seed": 1234 + trial.number,
             },
         }
-        work_overrides.pop("run_id", None)
+        work_overrides.pop("finetune_run_id", None)
         persistent_overrides = {**work_overrides, "result_dir": str(persistent_trial_dir)}
 
         print(
             f"\n[Finetune Trial {trial.number}] GPU {gpu_id} ({TASKS_ARG}): "
-            f"lr={lr_fine:.2e}, wd={weight_decay_fine:.2e}, ga={grad_accum_fine} (eval_steps={scaled_eval_steps}), "
-            f"drop={cfg_dropouts}"
+            f"lr={lr_fine:.2e}, wd={weight_decay_fine:.2e}, warmup={scaled_warmup_steps}, "
+            f"ga={grad_accum_fine}, bal_ratio={eff_undersampling_ratio or 'none'} "
+            f"(eval_steps={scaled_eval_steps}), drop={cfg_dropouts}"
         )
         try:
             run_subprocess(
@@ -808,6 +620,7 @@ def objective_finetune(trial: optuna.Trial) -> float:
 def main():
     OPTUNA_DIR.mkdir(parents=True, exist_ok=True)
     log_file = str(OPTUNA_DIR / f"{STUDY_NAME}_journal.log")
+    source_pt_dir = resolve_source_pretrained_dir()
 
     if cli_args.compact_journal or cli_args.n_trials == 0:
         compact_journal_duplicate_studies(log_file)
@@ -842,16 +655,16 @@ def main():
 
     n_complete_before = len(study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,)))
     print("=" * 70)
-    print(f"Starting Optuna Stage='{STAGE}' | Model='{BASE_RESULTS_DIR.name}' ({'causal' if IS_CAUSAL else 'encoder'})")
+    print(f"Starting Fine-Tuning Optuna | Model='{BASE_RESULTS_DIR.name}' ({'causal' if IS_CAUSAL else 'encoder'})")
+    print(f"Pretrained Trunk: {source_pt_dir}")
     print(
-        f"Split='{SPLIT_TYPE}' | ValTag='{VAL_TAG}' | WorkerCap={N_TRIALS} | "
+        f"Split='{SPLIT_TYPE}' | ValTag='{VAL_TAG}' | Tasks='{TASKS_ARG}' | WorkerCap={N_TRIALS} | "
         f"GlobalTarget={TARGET_TRIALS} (currently {n_complete_before} COMPLETE) | GPUs={NUM_GPUS} ({GPU_IDS})"
     )
     print(f"Scratch Trial Dir: {SCRATCH_TRIAL_ROOT if SCRATCH_TRIAL_ROOT else 'Disabled (using OPTUNA_DIR)'}")
     print(f"Journal Storage: {log_file}")
     print("=" * 70)
 
-    obj_fn = objective_pretrain if STAGE == "pretrain" else objective_finetune
     should_run = (N_TRIALS is None or N_TRIALS > 0) and (TARGET_TRIALS <= 0 or n_complete_before < TARGET_TRIALS)
     if should_run:
         callbacks = []
@@ -859,7 +672,7 @@ def main():
             callbacks.append(MaxTrialsCallback(TARGET_TRIALS, states=(TrialState.COMPLETE,)))
         try:
             study.optimize(
-                obj_fn,
+                objective_finetune,
                 n_trials=N_TRIALS,
                 n_jobs=NUM_GPUS,
                 callbacks=callbacks,
@@ -871,7 +684,6 @@ def main():
     elif N_TRIALS != 0 and TARGET_TRIALS > 0 and n_complete_before >= TARGET_TRIALS:
         print(f"[Skip] Study already reached {n_complete_before}/{TARGET_TRIALS} COMPLETE trials.")
 
-    # Refresh global winner from shared JournalStorage (handles resumed or multi-job workers cleanly)
     completed_trials = study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,))
     if not completed_trials:
         raise RuntimeError(f"No COMPLETE trials found in study '{STUDY_NAME}' ({log_file}).")
@@ -883,7 +695,7 @@ def main():
 
     print("\n" + "=" * 70)
     print(
-        f"Optimization summary for stage='{STAGE}' "
+        f"Fine-Tuning Optuna Summary for '{TASKS_ARG}' "
         f"({len(completed_trials)} COMPLETE trials | Global Best Trial #{best_trial.number})"
     )
     print("=" * 70)
@@ -904,12 +716,8 @@ def main():
 
     canonical_base = BASE_RESULTS_DIR / SPLIT_TYPE / EXPORT_RUN_ID
 
-    if STAGE == "pretrain" and best_run_path is not None and (best_run_path / "pretraining").exists():
-        _sync_symlink_or_dir(best_run_path / "pretraining", canonical_base / "pretraining")
-        print(f"Linked winning pretraining directory -> {canonical_base / 'pretraining'}")
-
-    # For Stage 2 (finetune), run full-FUP validation/test scoring + plots ONCE on the winning checkpoint
-    if STAGE == "finetune" and best_run_path is not None and best_overrides is not None:
+    # Run full-FUP validation/test scoring + plots ONCE on the winning checkpoint
+    if best_run_path is not None and best_overrides is not None:
         ft_root = best_run_path / "finetuning"
         has_ckpts = bool(list(ft_root.rglob("checkpoint-*"))) if ft_root.exists() else False
         req_tasks = [t.strip() for t in TASKS_ARG.split(",") if t.strip()]
@@ -932,8 +740,8 @@ def main():
                 )
             except RuntimeError as e:
                 print(f"[Warning] Post-Optuna --eval-only pass failed: {e}")
+
         # Link canonical pretraining + per-task finetuning directories for downstream analysis scripts
-        source_pt_dir, _ = resolve_source_pretrained_dir()
         _sync_symlink_or_dir(source_pt_dir, canonical_base / "pretraining")
         if (best_run_path / "finetuning").exists():
             for task_dir in sorted((best_run_path / "finetuning").iterdir()):
@@ -942,26 +750,22 @@ def main():
             print(f"Linked winning finetuning task(s) -> {canonical_base / 'finetuning'}")
 
     summary = {
-        "stage": STAGE,
+        "stage": "finetune",
         "model_family": BASE_RESULTS_DIR.name,
         "is_causal": IS_CAUSAL,
         "split": SPLIT_TYPE,
         "val_tag": VAL_TAG,
+        "pretrained_dir": str(source_pt_dir),
         "export_run_id": EXPORT_RUN_ID,
-        "tasks": TASKS_ARG if STAGE == "finetune" else "mlm",
+        "tasks": TASKS_ARG,
         "n_complete_trials": len(completed_trials),
         "best_value": float(study.best_value),
         "best_trial_number": int(best_trial.number),
         "best_params": best_trial.params,
         "portable_overrides": best_portable,
         "best_run_path": str(best_run_path) if best_run_path else None,
-        "best_pretraining_dir": (
-            str(best_run_path / "pretraining")
-            if (STAGE == "pretrain" and best_run_path)
-            else None
-        ),
     }
-    best_config_path = OPTUNA_DIR / f"best_{STAGE}_config.json"
+    best_config_path = OPTUNA_DIR / "best_finetune_config.json"
     with open(best_config_path, "w") as f:
         json.dump(summary, f, indent=4)
     print(f"Saved best configuration summary to: {best_config_path}")

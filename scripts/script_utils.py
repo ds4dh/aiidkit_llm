@@ -193,7 +193,10 @@ def save_predictions_table(
                            else probs_cal.reshape(-1))
                 row["prob_cal"] = np.asarray(cal_col)[valid].astype(np.float32)
             for col, arr in extras.items():
-                row[col] = arr[valid]
+                if arr.ndim == 2 and task_keys and arr.shape[1] == len(task_keys):
+                    row[col] = arr[valid, c // n_h]
+                elif arr.ndim == 1:
+                    row[col] = arr[valid]
             frames.append(pd.DataFrame(row))
 
     if not frames:

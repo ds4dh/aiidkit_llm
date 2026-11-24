@@ -171,11 +171,11 @@ prediction_tasks:                 # Individual bacterial tasks + domain-grouped 
     fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600]
     horizons: [[30, 60, 90, 180, 360, 720, 1800]]
 
-# Arguments for optuna run (perform both pretraining and finetuning for different hyper-parameters)
+# Arguments for Optuna fine-tuning hyperparameter optimization (from fixed pre-trained backbone)
 optuna:
   num_trials: 50
   num_trials_debug: 2
-  study_name: pretraining_finetuning_hp_optimization
+  study_name: finetuning_hp_optimization
 
 # Arguments for HF's trainer for the pre-training phase
 do_clustering: false  # skip mid-training UMAP/HDBSCAN clustering; only run final clustering in downstream analysis

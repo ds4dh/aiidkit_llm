@@ -7,6 +7,7 @@ data_split_type: random_split  # random_split, center_split, temporal_split
 result_dir: results/survival_transformer  # base directory name for all results
 pretrain_result_dir: results/transformer  # where the MLM pretraining checkpoint lives
 data_collator:
+  use_numerical_embedding: true
   eav_mappings:
     entity_id: entity
     attribute_id: attribute
@@ -22,31 +23,44 @@ data_collator:
     attribute_id: 0.15
     value_id: 0.60
 
+finetune_run_id: optuna_ft
 train_data_augment: all
-target_undersampling_ratio: null
+target_undersampling_ratio: 15.0  # Horvitz-Thompson IPW per-FUP undersampling (keeps 100% of <=90d events, unbiased population hazard)
 undersampling_balancing_label: status
 drop_unlabeled: true
-early_stopping_metric: cindex
+early_stopping_metric: roc_auc
+early_stopping_mean: random_effects
 prediction_tasks:
-  infection_bacteria:   {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90, 180, 360, 720, 1800]}
-  grp_enterobacterales: {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90, 180, 360, 720, 1800]}
-  grp_gram_positive:    {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90, 180, 360, 720, 1800]}
-  grp_gn_nonfermenters: {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90, 180, 360, 720, 1800]}
-  grp_clostridium:      {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90, 180, 360, 720, 1800]}
-  infection_virus:      {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90, 180, 360, 720, 1800]}
-  grp_herpes_viruses:   {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90, 180, 360, 720, 1800]}
-  grp_cmv:              {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90, 180, 360, 720, 1800]}
-  grp_bkpyv:            {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90, 180, 360, 720, 1800]}
-  infection_fungi:      {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90, 180, 360, 720, 1800]}
-  grp_candida:          {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90, 180, 360, 720, 1800]}
-  death:                {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90, 180, 360, 720, 1800]}
-  graft_loss:           {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90, 180, 360, 720, 1800]}
+  # Domain-grouped 5-head multi-task Cox survival (1-to-1 architectural match with TFOM `multitask_bacteria`)
+  multitask_bacteria:
+    tasks: [
+      infection_bacteria,
+      infection_grp_enterobacterales,
+      infection_grp_gram_positive,
+      infection_grp_gn_nonfermenters,
+      infection_grp_clostridium,
+    ]
+    fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600]
+    horizons: [30, 60, 90]
+  infection_bacteria:   {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90]}
+  grp_enterobacterales: {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90]}
+  grp_gram_positive:    {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90]}
+  grp_gn_nonfermenters: {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90]}
+  grp_clostridium:      {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90]}
+  infection_virus:      {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90]}
+  grp_herpes_viruses:   {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90]}
+  grp_cmv:              {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90]}
+  grp_bkpyv:            {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90]}
+  infection_fungi:      {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90]}
+  grp_candida:          {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [30, 60, 90]}
+  death:                {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [360, 720, 1800]}
+  graft_loss:           {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [360, 720, 1800]}
 
 finetuner:
   seed: 1234
   ft_subdir: "finetuning"
   logging_steps: 10
-  warmup_steps: 100
+  warmup_steps: 60
   num_train_epochs: 10
   max_steps: 10000
   eval_strategy: steps
@@ -54,28 +68,30 @@ finetuner:
   eval_steps: 50
   save_steps: 50
   save_total_limit: 1
-  eval_accumulation_steps: 100
-  gradient_accumulation_steps: 4
-  per_device_train_batch_size: 48
-  per_device_eval_batch_size: 96
+  eval_accumulation_steps: 250
+  gradient_accumulation_steps: 4  # 24 x 4 = 96 effective batch size (exact match with TFOM Trial #55)
+  per_device_train_batch_size: 24
+  per_device_eval_batch_size: 64
   dataloader_num_workers: 4
-  learning_rate: 2.0e-5
-  weight_decay: 0.01
+  learning_rate: 6.125251584185026e-5
+  weight_decay: 0.09213804385528418
   max_grad_norm: 1.0
   adam_beta1: 0.9
-  adam_beta2: 0.98
+  adam_beta2: 0.99
   adam_epsilon: 1.0e-6
-  loss_name: cox
+  loss_name: surv_ehr
   loss_args:
-    reduction: events
-    max_risk: 30.0
+    max_time: 360.0
+    tail_weight: 0.25
+    cif_weight: 0.5
+    smooth_weight: 0.005
   bf16: true
   report_to: none
   remove_unused_columns: false
   load_best_model_at_end: true
   metric_for_best_model: eval_all_early_stopping_metric
   greater_is_better: true
-  early_stopping_patience: 5
+  early_stopping_patience: 7
 
 use_lora: false
 lora_config:
@@ -100,7 +116,7 @@ model:
     sep_token_id: 3
     dropout_embedding: 0.0
     dropout_attention: 0.1
-    dropout_mlp: 0.1
+    dropout_mlp: 0.05
     dropout_classifier: 0.1
   model_args:
     dtype: bfloat16

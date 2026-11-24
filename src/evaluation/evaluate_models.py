@@ -1039,191 +1039,403 @@ class DiscriminativeEmbeddingEvaluatorForClassification(BaseEmbeddingEvaluatorFo
 
 class DiscriminativeEmbeddingEvaluatorForSurvival(DiscriminativeEmbeddingEvaluatorForClassification):
     """
-    Evaluator for the survival fine-tuning task (Cox proportional hazards).
+    Evaluator for single-task and multi-task survival fine-tuning (Cox PH).
 
-    The model outputs a single log-hazard-ratio per patient. This evaluator:
-        - computes Harrell's C-index on (time, status) labels,
-        - estimates a Breslow baseline survival on the evaluation cohort to
-          convert risk scores into predicted survival probabilities S(h|x)
-          at the configured reporting horizons,
-        - binarizes survival labels at those horizons to report AUROC / AP /
-          IPCW-Brier, directly comparable with the binary classifiers,
-        - exposes (labels=[B,K], probs=[B,K]) arrays so the final test pass
-          saves the same JSON/NPZ structure as the classification pipeline.
+    For K >= 1 survival tasks (`logits` shape `[N, K]`, `labels` shape `[N, 2*K]`):
+      - computes FUP-stratified Harrell's C-index per task,
+      - estimates per-FUP Breslow baseline hazards on validation (shrunk via
+        empirical-Bayes pseudo-events toward validation clinical-window / global
+        Breslow hazards so sparse late FUPs never collapse to flat 0.0) and
+        freezes them on the test split (zero test-set leakage),
+      - binarizes survival labels at each reporting horizon to compute AUROC,
+        PR-AUC, and IPCW-Brier, and aggregates early-stopping scores via
+        DerSimonian-Laird `random_effects` pooling across all K*H heads,
+      - exposes row-aligned `labels=[N, K*H]` and `probs=[N, K*H]` arrays matching
+        `save_predictions_table`.
     """
+
+    _CLINICAL_WINDOW_BOUNDS = (
+        (0, 30),
+        (31, 180),
+        (181, 360),
+        (361, 1080),
+        (1081, 100000),
+    )
 
     def __init__(
         self,
         horizons: list[int],
-        early_stopping_metric: str = "cindex",
+        task_keys: list[str] | None = None,
+        eval_fups: np.ndarray | None = None,
+        early_stopping_metric: str = "roc_auc",
+        early_stopping_mean: str = "random_effects",
+        eb_prior_events: float = 5.0,
+        time_grid: list[float] | None = None,
         **kwargs,
     ):
-        kwargs["do_clustering"] = False  # keep evaluation lightweight
-        super().__init__(early_stopping_metric=early_stopping_metric, **kwargs)
+        kwargs["do_clustering"] = False
+        super().__init__(
+            early_stopping_metric=early_stopping_metric,
+            early_stopping_mean=early_stopping_mean,
+            **kwargs,
+        )
         self.horizons = sorted(int(h) for h in horizons)
+        self.task_keys = list(task_keys) if task_keys else None
+        self.eval_fups = np.asarray(eval_fups, dtype=np.int64) if eval_fups is not None else None
+        self.eb_prior_events = float(eb_prior_events)
+        self.time_grid = [float(x) for x in time_grid] if time_grid is not None else None
         self.current_prefix = "eval"
         self.saved_labels_and_probs = None
-        # When True, scoring passes reuse the Breslow baseline previously
-        # fitted on the matching VALIDATION segment instead of refitting on
-        # the scored cohort (used for the final test pass so that absolute
-        # probabilities never depend on test-set outcomes).
         self.freeze_baseline_for_test = False
         self.fitted_baselines: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self.fitted_h0_grids: dict[tuple[str, int], np.ndarray] = {}
+        self.validation_window_h0: dict[tuple[int, int], np.ndarray] = {}
+        self.validation_global_h0: dict[int, np.ndarray] = {}
 
-    def _baseline_for_cohort(
+    @classmethod
+    def _window_idx(cls, fup_val: int) -> int:
+        for idx, (lo, hi) in enumerate(cls._CLINICAL_WINDOW_BOUNDS):
+            if lo <= fup_val <= hi:
+                return idx
+        return len(cls._CLINICAL_WINDOW_BOUNDS) - 1
+
+    @staticmethod
+    def _eval_h0_at_horizons(event_times: np.ndarray, baseline_hazard: np.ndarray, horizons: list[int]) -> np.ndarray:
+        hz = np.asarray(horizons, dtype=np.float64)
+        if len(event_times) == 0 or len(baseline_hazard) == 0:
+            return np.zeros(len(hz), dtype=np.float64)
+        idx = np.searchsorted(event_times, hz, side="right") - 1
+        vals = np.where(idx >= 0, baseline_hazard[np.clip(idx, 0, None)], 0.0)
+        return np.where(hz < event_times[0], 0.0, vals).astype(np.float64)
+
+    def fit_validation_priors_from_mega(
+        self,
+        mega_logits: np.ndarray,
+        mega_labels: np.ndarray,
+        mega_fups: np.ndarray,
+    ) -> None:
+        """Fit validation clinical-window and global Breslow cumulative hazards per head (Cox mode only)."""
+        if self.time_grid is not None:
+            return
+        from src.evaluation.survival_metrics import breslow_baseline
+
+        logits_2d = mega_logits.reshape(mega_logits.shape[0], -1).astype(np.float64)
+        labels_2d = mega_labels.reshape(mega_labels.shape[0], -1)
+        fups_1d = np.asarray(mega_fups, dtype=np.int64)
+        num_heads = logits_2d.shape[1]
+        self.validation_window_h0.clear()
+        self.validation_global_h0.clear()
+
+        win_ids = np.array([self._window_idx(int(f)) for f in fups_1d], dtype=np.int64)
+        for k in range(num_heads):
+            t_all = labels_2d[:, 2 * k].astype(np.float64)
+            s_all = labels_2d[:, 2 * k + 1].astype(np.int64)
+            r_all = logits_2d[:, k]
+            valid = (t_all != -100) & (s_all != -100) & (t_all >= 0)
+            if valid.sum() > 0:
+                et_g, bh_g = breslow_baseline(t_all[valid], s_all[valid], r_all[valid])
+                h0_g = np.maximum(self._eval_h0_at_horizons(et_g, bh_g, self.horizons), 1e-8)
+            else:
+                h0_g = np.full(len(self.horizons), 1e-6, dtype=np.float64)
+            self.validation_global_h0[k] = h0_g
+
+            for w_idx in range(len(self._CLINICAL_WINDOW_BOUNDS)):
+                m_w = valid & (win_ids == w_idx)
+                if m_w.sum() > 0 and (s_all[m_w] == 1).any():
+                    et_w, bh_w = breslow_baseline(t_all[m_w], s_all[m_w], r_all[m_w])
+                    h0_w = self._eval_h0_at_horizons(et_w, bh_w, self.horizons)
+                    n_ev_w = np.array([np.sum((t_all[m_w] <= h) & (s_all[m_w] == 1)) for h in self.horizons], dtype=np.float64)
+                    # Shrink sparse windows gently toward global validation hazard so prior is always > 0
+                    h0_w_smooth = (n_ev_w * h0_w + 2.0 * h0_g) / (n_ev_w + 2.0)
+                    self.validation_window_h0[(k, w_idx)] = np.maximum(h0_w_smooth, 1e-8)
+                else:
+                    self.validation_window_h0[(k, w_idx)] = h0_g.copy()
+
+    def _lookup_frozen_h0_grid(self, prefix: str, head_idx: int) -> np.ndarray | None:
+        import re
+
+        counterpart = prefix.replace("test", "validation", 1)
+        if (counterpart, head_idx) in self.fitted_h0_grids:
+            return self.fitted_h0_grids[(counterpart, head_idx)]
+        m = re.search(r"fup_(\d+)", prefix)
+        if m:
+            target = int(m.group(1))
+            cands = [
+                (abs(int(mm.group(1)) - target), key[0])
+                for key in self.fitted_h0_grids
+                if key[1] == head_idx and key[0].startswith("validation") and (mm := re.search(r"fup_(\d+)", key[0]))
+            ]
+            if cands:
+                cands.sort()
+                return self.fitted_h0_grids[(cands[0][1], head_idx)]
+            w_idx = self._window_idx(target)
+            if (head_idx, w_idx) in self.validation_window_h0:
+                return self.validation_window_h0[(head_idx, w_idx)]
+        return self.validation_global_h0.get(head_idx)
+
+    def _smoothed_h0_for_slice(
         self,
         times: np.ndarray,
         statuses: np.ndarray,
         risk: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Return (event_times, cumulative_baseline_hazard) for this scoring pass.
-
-        Baselines are stratified per scoring cohort (one pass per FUP segment),
-        so each landmark keeps its own event clock (early FUPs have their own
-        high early hazard, late FUPs theirs). For the final test pass
-        (freeze_baseline_for_test=True) the baseline fitted on the matching
-        validation segment is reused: the probability scale then depends only
-        on validation data, exactly like the downstream Platt calibration and
-        the recall-target thresholds.
-        """
+        head_idx: int,
+        fup_val: int | None,
+        cache_prefix: str | None = None,
+        prior_h0_override: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return `(h0_grid_at_horizons, raw_event_times, raw_baseline_hazard)`."""
         from src.evaluation.survival_metrics import breslow_baseline
 
-        if self.freeze_baseline_for_test:
-            frozen = self._lookup_frozen_baseline(self.current_prefix)
-            if frozen is not None:
-                return frozen
-        event_times, baseline_hazard = breslow_baseline(times, statuses, risk)
-        self.fitted_baselines[self.current_prefix] = (event_times, baseline_hazard)
-        return event_times, baseline_hazard
+        if self.freeze_baseline_for_test and cache_prefix is not None:
+            frozen_grid = self._lookup_frozen_h0_grid(cache_prefix, head_idx)
+            frozen_raw = self.fitted_baselines.get(f"{cache_prefix.replace('test', 'validation', 1)}__h{head_idx}")
+            if frozen_grid is not None:
+                et_raw, bh_raw = frozen_raw if frozen_raw is not None else (np.empty(0), np.empty(0))
+                return frozen_grid, et_raw, bh_raw
 
-    def _lookup_frozen_baseline(self, prefix: str):
-        """Find the validation baseline for a test scoring pass.
+        et, bh = breslow_baseline(times, statuses, risk)
+        raw_grid = self._eval_h0_at_horizons(et, bh, self.horizons)
 
-        Prefixes look like 'test_fup_0030' / 'validation_fup_0030' / 'test_all'.
-        Preference: exact validation counterpart -> nearest FUP segment
-        (handles test-only FUPs) -> the validation 'all' mega pass -> None
-        (falls back to fitting on the scored cohort).
-        """
-        import re
+        prior_grid = prior_h0_override
+        if prior_grid is None and fup_val is not None:
+            w_idx = self._window_idx(int(fup_val))
+            prior_grid = self.validation_window_h0.get((head_idx, w_idx), self.validation_global_h0.get(head_idx))
 
-        candidates = {k: v for k, v in self.fitted_baselines.items() if k.startswith("validation")}
-        if not candidates:
-            return None
-        counterpart = prefix.replace("test", "validation", 1)
-        if counterpart in candidates:
-            return candidates[counterpart]
-        m = re.search(r"fup_(\d+)", prefix)
-        if m:
-            target = int(m.group(1))
-            scored = sorted(
-                (abs(int(mm.group(1)) - target), k)
-                for k in candidates
-                if (mm := re.search(r"fup_(\d+)", k))
-            )
-            if scored:
-                return candidates[scored[0][1]]
-        return candidates.get("validation_all")
+        if prior_grid is not None and self.eb_prior_events > 0.0:
+            n_ev_h = np.array([np.sum((times <= h) & (statuses == 1)) for h in self.horizons], dtype=np.float64)
+            m = self.eb_prior_events
+            h0_grid = (n_ev_h * raw_grid + m * prior_grid) / (n_ev_h + m)
+        else:
+            h0_grid = raw_grid
+
+        if cache_prefix is not None:
+            self.fitted_h0_grids[(cache_prefix, head_idx)] = h0_grid
+            self.fitted_baselines[f"{cache_prefix}__h{head_idx}"] = (et, bh)
+            if head_idx == 0:
+                self.fitted_baselines[cache_prefix] = (et, bh)
+        return h0_grid, et, bh
 
     def __call__(self, eval_preds: EvalPrediction) -> dict[str, float]:
+        import re
         from src.data.survival_labels import binarize_survival_labels
         from src.evaluation.survival_metrics import (
-            breslow_baseline, survival_matrix_from_baseline,
-            ipcw_brier_scores, concordance_index,
+            breslow_baseline, ipcw_brier_scores, concordance_index,
+        )
+        from src.model.survival_utils import evaluate_pc_hazard_curves
+
+        logits, labels, _ = self.prepare_predictions(eval_preds)
+        self.last_logits = logits
+
+        logits_2d = logits.reshape(logits.shape[0], -1).astype(np.float64)
+        if labels.ndim == 1 or labels.shape[1] < 2:
+            raise ValueError("Survival labels must contain at least (time, status) columns")
+        is_pc_hazard = self.time_grid is not None and len(self.time_grid) >= 2
+        num_int = (len(self.time_grid) - 1) if is_pc_hazard else 1
+        num_heads = logits_2d.shape[1] // num_int
+        if labels.shape[1] == 2 * num_heads + 1:
+            labels = labels[:, : 2 * num_heads]
+        self.last_raw_labels = labels
+        if labels.shape[1] != 2 * num_heads:
+            raise ValueError(f"Expected labels shape [N, {2 * num_heads}] for {num_heads} heads, got {labels.shape}")
+
+        n_rows = logits_2d.shape[0]
+        n_h = len(self.horizons)
+        is_multitask = bool(self.task_keys and len(self.task_keys) > 1) or (num_heads > 1)
+        head_names = list(self.task_keys) if (self.task_keys and len(self.task_keys) == num_heads) else [f"task{k}" for k in range(num_heads)]
+
+        fup_match = re.search(r"fup_(\d+)", self.current_prefix or "")
+        single_fup_val = int(fup_match.group(1)) if fup_match else None
+        use_eval_fups = (
+            single_fup_val is None
+            and self.eval_fups is not None
+            and len(self.eval_fups) == n_rows
         )
 
-        # Unpack model outputs: risk = log hazard ratio
-        logits, labels, embeddings = self.prepare_predictions(eval_preds)
-        self.last_logits = logits
-        self.last_raw_labels = labels
-        risk = logits.reshape(logits.shape[0], -1)[:, 0].astype(np.float64)
-        if labels.ndim == 1 or labels.shape[1] < 2:
-            raise ValueError("Survival labels must contain (time, status) columns")
-        times = labels[:, 0].astype(np.float64)
-        statuses = labels[:, 1].astype(np.int64)
-        valid = (times != -100) & (statuses != -100)
-        times, statuses, risk = times[valid], statuses[valid], risk[valid]
+        pc_surv, pc_probs, pc_rmst_risks, pc_medians = (None, None, None, None)
+        if is_pc_hazard:
+            pc_surv, pc_probs, pc_rmst_risks, pc_medians = evaluate_pc_hazard_curves(
+                logits_2d=logits_2d,
+                num_heads=num_heads,
+                time_grid=self.time_grid,
+                horizons=self.horizons,
+            )
+
+        all_bin_labels = np.full((n_rows, num_heads * n_h), -100, dtype=np.int64)
+        all_risk_probs = np.zeros((n_rows, num_heads * n_h), dtype=np.float64)
+        all_times = np.full((n_rows, num_heads), -100.0, dtype=np.float64)
+        all_statuses = np.full((n_rows, num_heads), -100, dtype=np.int64)
+        all_risks = pc_rmst_risks.copy() if pc_rmst_risks is not None else logits_2d.copy()
+        all_medians = np.full((n_rows, num_heads), np.nan, dtype=np.float64)
 
         metrics: dict[str, float] = {}
-        if len(times) == 0 or np.unique(statuses).size == 0:
-            metrics["cindex"] = 0.0
-            metrics["early_stopping_metric"] = 0.0
-            return metrics
+        cindex_vals = []
+        re_names, re_means, re_stds, re_pos = [], [], [], []
 
-        # 1) Concordance (discrimination, horizon-free)
-        cindex = concordance_index(times, statuses, risk)
-        metrics["cindex"] = 0.0 if np.isnan(cindex) else float(cindex)
+        for k in range(num_heads):
+            t_col = labels[:, 2 * k].astype(np.float64)
+            s_col = labels[:, 2 * k + 1].astype(np.int64)
+            r_col = all_risks[:, k]
+            all_times[:, k] = t_col
+            all_statuses[:, k] = s_col
 
-        # 2) Baseline survival -> S(h|x) at reporting horizons (per-FUP
-        #    stratified; frozen to the validation-fitted baseline on test)
-        event_times, baseline_hazard = self._baseline_for_cohort(times, statuses, risk)
-        surv = survival_matrix_from_baseline(event_times, baseline_hazard, risk, self.horizons)
-        risk_probs = np.clip(1.0 - surv, 0.0, 1.0)  # P(event within horizon h)
+            valid = (t_col != -100) & (s_col != -100) & (t_col >= 0)
+            t_name = head_names[k]
+            sfx = f"_label_{t_name}" if is_multitask else ""
 
-        # 2b) Predicted median time to event per patient: smallest t with
-        #     S(t|x) <= 0.5, i.e. H0(t) >= ln(2)/exp(r); NaN if never reached
-        #     within the observed baseline follow-up window.
-        if len(event_times) > 0 and len(baseline_hazard) > 0:
-            target_h0 = np.log(2.0) / np.exp(np.clip(risk, -30, 30))
-            med_idx = np.searchsorted(baseline_hazard, target_h0, side="left")
-            median_times = np.where(
-                med_idx < len(event_times),
-                event_times[np.clip(med_idx, 0, len(event_times) - 1)],
-                np.nan,
-            )
-        else:
-            median_times = np.full(len(risk), np.nan)
+            if valid.sum() == 0 or np.unique(s_col[valid]).size == 0:
+                metrics[f"cindex{sfx}"] = 0.0
+                continue
 
-        # 3) Horizon-wise binary metrics (comparable with binary classifiers)
-        binary_labels = np.stack(
-            [binarize_survival_labels(times, statuses, h) for h in self.horizons], axis=1
-        )
-        briers = ipcw_brier_scores(times, statuses, surv, self.horizons)
-        for k, h in enumerate(self.horizons):
-            y_true = binary_labels[:, k]
-            y_prob = risk_probs[:, k]
-            mask = y_true != -100
-            h_str = f"{h:04d}d"
-            if mask.sum() > 0 and len(np.unique(y_true[mask])) >= 2:
-                metrics[f"roc_auc_{h_str}"] = float(roc_auc_score(y_true[mask], y_prob[mask]))
-                metrics[f"pr_auc_{h_str}"] = float(average_precision_score(y_true[mask], y_prob[mask]))
+            # For piecewise-continuous non-proportional hazards, evaluate concordance up to tau_M
+            if is_pc_hazard:
+                cap_t = float(self.time_grid[-1])
+                t_ci = np.minimum(t_col[valid], cap_t)
+                s_ci = np.where(t_col[valid] <= cap_t, s_col[valid], 0)
             else:
-                metrics[f"roc_auc_{h_str}"] = -1.0
-                metrics[f"pr_auc_{h_str}"] = -1.0
-            metrics[f"ipcw_brier_{h_str}"] = float(briers[k])
+                t_ci, s_ci = t_col[valid], s_col[valid]
+            strata_v = self.eval_fups[valid] if use_eval_fups else None
+            ci = concordance_index(t_ci, s_ci, r_col[valid], strata=strata_v)
+            ci_val = 0.0 if np.isnan(ci) else float(ci)
+            metrics[f"cindex{sfx}"] = ci_val
+            cindex_vals.append(ci_val)
 
-        # 4) Early-stopping metric
+            if is_pc_hazard:
+                surv_valid = pc_surv[valid, k, :]
+                probs_valid = pc_probs[valid, k, :]
+                med_valid = pc_medians[valid, k]
+            else:
+                surv_valid = np.ones((int(valid.sum()), n_h), dtype=np.float64)
+                med_valid = np.full(int(valid.sum()), np.nan, dtype=np.float64)
+                if use_eval_fups:
+                    t_v, s_v, r_v, f_v = t_col[valid], s_col[valid], r_col[valid], self.eval_fups[valid]
+                    et_g, bh_g = breslow_baseline(t_v, s_v, r_v)
+                    h0_g = np.maximum(self._eval_h0_at_horizons(et_g, bh_g, self.horizons), 1e-8)
+                    win_v = np.array([self._window_idx(int(f)) for f in f_v], dtype=np.int64)
+                    win_priors = {}
+                    for w_i in np.unique(win_v):
+                        mw = win_v == w_i
+                        if (s_v[mw] == 1).any():
+                            et_w, bh_w = breslow_baseline(t_v[mw], s_v[mw], r_v[mw])
+                            hw = self._eval_h0_at_horizons(et_w, bh_w, self.horizons)
+                            nw = np.array([np.sum((t_v[mw] <= h) & (s_v[mw] == 1)) for h in self.horizons], dtype=np.float64)
+                            win_priors[int(w_i)] = np.maximum((nw * hw + 2.0 * h0_g) / (nw + 2.0), 1e-8)
+                        else:
+                            win_priors[int(w_i)] = h0_g
+                    for f_val in np.unique(f_v):
+                        mf = f_v == f_val
+                        h0_f, _, _ = self._smoothed_h0_for_slice(
+                            t_v[mf], s_v[mf], r_v[mf],
+                            head_idx=k, fup_val=int(f_val), cache_prefix=None,
+                            prior_h0_override=win_priors[self._window_idx(int(f_val))],
+                        )
+                        surv_valid[mf] = np.exp(-np.outer(np.exp(np.clip(r_v[mf], -30.0, 30.0)), h0_f))
+                else:
+                    h0_grid, et_raw, bh_raw = self._smoothed_h0_for_slice(
+                        t_col[valid], s_col[valid], r_col[valid],
+                        head_idx=k, fup_val=single_fup_val, cache_prefix=self.current_prefix,
+                    )
+                    surv_valid = np.exp(-np.outer(np.exp(np.clip(r_col[valid], -30.0, 30.0)), h0_grid))
+                    if len(et_raw) > 0 and len(bh_raw) > 0:
+                        target_h0 = np.log(2.0) / np.exp(np.clip(r_col[valid], -30.0, 30.0))
+                        med_idx = np.searchsorted(bh_raw, target_h0, side="left")
+                        med_valid = np.where(
+                            med_idx < len(et_raw),
+                            et_raw[np.clip(med_idx, 0, len(et_raw) - 1)],
+                            np.nan,
+                        )
+                probs_valid = np.clip(1.0 - surv_valid, 0.0, 1.0)
+
+            bin_valid = np.stack([binarize_survival_labels(t_col[valid], s_col[valid], h) for h in self.horizons], axis=1)
+            briers = ipcw_brier_scores(t_col[valid], s_col[valid], surv_valid, self.horizons)
+
+            col_slice = slice(k * n_h, (k + 1) * n_h)
+            all_bin_labels[valid, col_slice] = bin_valid
+            all_risk_probs[valid, col_slice] = probs_valid
+            all_medians[valid, k] = med_valid
+
+            for j, h in enumerate(self.horizons):
+                y_true = bin_valid[:, j]
+                y_prob = probs_valid[:, j]
+                mask = y_true != -100
+                h_str = f"{h:04d}d"
+                head_tag = f"label_{t_name}_{h_str}" if is_multitask else h_str
+                n_pos_jh = int(np.sum(y_true[mask] == 1)) if mask.sum() > 0 else 0
+                if is_multitask:
+                    metrics[f"n_pos_{head_tag}"] = n_pos_jh
+                if mask.sum() > 0 and len(np.unique(y_true[mask])) >= 2:
+                    roc_jh = float(roc_auc_score(y_true[mask], y_prob[mask]))
+                    pr_jh = float(average_precision_score(y_true[mask], y_prob[mask]))
+                    metrics[f"roc_auc_{head_tag}"] = roc_jh
+                    metrics[f"pr_auc_{head_tag}"] = pr_jh
+                    if self.early_stopping_metric in ("roc_auc", "pr_auc"):
+                        val_jh = roc_jh if self.early_stopping_metric == "roc_auc" else pr_jh
+                        re_names.append(head_tag)
+                        re_means.append(val_jh)
+                        re_stds.append(float(0.5 / np.sqrt(max(1.0, float(n_pos_jh)))))
+                        re_pos.append(n_pos_jh)
+                else:
+                    metrics[f"roc_auc_{head_tag}"] = -1.0
+                    metrics[f"pr_auc_{head_tag}"] = -1.0
+                metrics[f"ipcw_brier_{head_tag}"] = float(briers[j])
+
+        if is_multitask:
+            metrics["cindex"] = float(np.mean(cindex_vals)) if cindex_vals else 0.0
+        elif "cindex" not in metrics:
+            metrics["cindex"] = 0.0
+
         if self.early_stopping_metric == "cindex":
-            metrics["early_stopping_metric"] = metrics["cindex"]
+            metrics["early_stopping_metric"] = float(metrics.get("cindex", 0.0))
+        elif re_means:
+            kind = (self.early_stopping_mean or "mean").lower()
+            if kind in ("random_effects", "precision_capped"):
+                tau2 = 0.03 ** 2
+                task_buckets: dict[str, list[tuple[float, float]]] = {}
+                for nm, mv, sv in zip(re_names, re_means, re_stds):
+                    tb = nm[:-6] if (len(nm) > 6 and nm[-1] == "d" and nm[-5:-1].isdigit() and nm[-6] == "_") else nm
+                    task_buckets.setdefault(tb, []).append((mv, sv))
+                t_scores, t_weights = [], []
+                for items in task_buckets.values():
+                    ms = np.array([x[0] for x in items], dtype=np.float64)
+                    ses = np.array([x[1] for x in items], dtype=np.float64)
+                    ws = 1.0 / (tau2 + ses ** 2)
+                    w_sum = float(np.sum(ws))
+                    tm = float(np.sum(ws * ms) / w_sum)
+                    tv = float(np.sum((ws ** 2) * (ses ** 2)) / (w_sum ** 2))
+                    t_scores.append(tm)
+                    t_weights.append(1.0 / (tau2 + tv))
+                metrics["early_stopping_metric"] = float(
+                    np.average(np.array(t_scores, dtype=np.float64), weights=np.array(t_weights, dtype=np.float64))
+                )
+            elif kind in ("log_support", "support_weighted"):
+                w = np.log1p(np.maximum(1, np.array(re_pos, dtype=np.float64)))
+                metrics["early_stopping_metric"] = float(np.average(np.array(re_means, dtype=np.float64), weights=w))
+            else:
+                metrics["early_stopping_metric"] = float(np.mean(re_means))
         else:
-            vals = [
-                metrics[f"{self.early_stopping_metric}_{h:04d}d"]
-                for h in self.horizons
-                if metrics.get(f"{self.early_stopping_metric}_{h:04d}d", -1.0) > 0.0
-            ]
-            metrics["early_stopping_metric"] = float(np.mean(vals)) if vals else 0.0
+            metrics["early_stopping_metric"] = 0.0
 
-        # 5) Expose arrays for the final test pass (the tidy predictions CSV
-        #    keeps: horizon-binarized labels, predicted event probabilities,
-        #    and the raw survival ground truth / model outputs per row)
         self.saved_labels_and_probs = {
-            "labels": binary_labels,
-            "probs": risk_probs,
-            "times": times,
-            "statuses": statuses,
-            "risks": risk,
-            "median_times": median_times,
+            "labels": all_bin_labels,
+            "probs": all_risk_probs,
+            "times": all_times[:, 0] if num_heads == 1 else all_times,
+            "statuses": all_statuses[:, 0] if num_heads == 1 else all_statuses,
+            "risks": all_risks[:, 0] if num_heads == 1 else all_risks,
+            "median_times": all_medians[:, 0] if num_heads == 1 else all_medians,
             "horizons": np.asarray(self.horizons),
         }
 
-        # 6) WandB plots: KM curves by risk tertile
-        if wandb.run is not None:
-            try:
-                wandb.log(
-                    {f"{self.current_prefix}/km_risk_tertiles": self._plot_km_tertiles(times, statuses, risk)},
-                    commit=False,
-                )
-            except Exception as e:
-                print(f"Survival KM plot logging error: {e}")
+        if wandb.run is not None and num_heads == 1:
+            valid0 = (all_times[:, 0] != -100) & (all_statuses[:, 0] != -100)
+            if valid0.sum() > 0:
+                try:
+                    wandb.log(
+                        {f"{self.current_prefix}/km_risk_tertiles": self._plot_km_tertiles(
+                            all_times[valid0, 0], all_statuses[valid0, 0], all_risks[valid0, 0]
+                        )},
+                        commit=False,
+                    )
+                except Exception as e:
+                    print(f"Survival KM plot logging error: {e}")
 
         return metrics
 

@@ -12,7 +12,7 @@ import torch
 import wandb
 import yaml
 from transformers import Trainer, TrainingArguments, EarlyStoppingCallback
-from src.utils import apply_config_overrides, load_optuna_json_overrides
+from src.utils import apply_config_overrides
 from src.data.patient_dataset import load_hf_data_and_metadata
 from src.model.model_utils import GradientClippingGuard
 from src.model.patient_embedder import PatientEmbeddingModelFactory
@@ -31,8 +31,6 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Pre-train patient sequence model via Masked Language Modeling.")
     parser.add_argument("--config", "-c", type=str, default="configs/discriminative_training.yaml")
     parser.add_argument("--silent", "-s", action="store_true", help="Disable wandb logging.")
-    parser.add_argument("--optuna-json", "-J", action="append", default=[],
-                        help="Path(s) to best_pretrain_config.json written by train_optuna.py (applies portable_overrides before --overrides).")
     parser.add_argument("--overrides", "-o", action="append", default=[], help="Overrides config (JSON string or key=value).")
     return parser.parse_args()
 
@@ -44,7 +42,6 @@ def main():
     cli_args = parse_args()
     with open(cli_args.config, 'r') as f:
         cfg = yaml.safe_load(f)
-    cfg = load_optuna_json_overrides(cfg, cli_args.optuna_json)
     cfg = apply_config_overrides(cfg, cli_args.overrides)
 
     # Load whole patient dataset (all sequences) for masked language modelling

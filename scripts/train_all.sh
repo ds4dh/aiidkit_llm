@@ -76,16 +76,16 @@ mkdir -p "$LOG_DIR"
 # ==============================================================================
 GPU_PARTITION=${GPU_PARTITION:-"shared-gpu"}
 CPU_PARTITION=${CPU_PARTITION:-"shared-cpu"}
-GPU_SPEC=${GPU_SPEC:-"nvidia_geforce_rtx_3090:1"}
+GPU_SPEC=${GPU_SPEC:-"nvidia_a100-pcie-40gb:1"}
 GPU_CONSTRAINT=${GPU_CONSTRAINT:-""}
-SLURM_CPUS=${SLURM_CPUS:-16}
-SLURM_MEM_GPU=${SLURM_MEM_GPU:-"64G"}
+SLURM_CPUS_GPU=${SLURM_CPUS_GPU:-${SLURM_CPUS:-8}}
+SLURM_CPUS_CPU=${SLURM_CPUS_CPU:-${SLURM_CPUS:-16}}
+SLURM_MEM_GPU=${SLURM_MEM_GPU:-"32G"}
 SLURM_MEM_CPU=${SLURM_MEM_CPU:-"64G"}
 
 # Reasonable walltimes per stage (based on empirical Baobab runtimes + safety margin; shared-gpu max is 12h)
 TIME_PREWARM=${TIME_PREWARM:-"00-02:00:00"}       # CPU dataset cache prewarming (~3-8m cold, ~2s warm on 16 CPU cores)
-TIME_OPTUNA_PT=${TIME_OPTUNA_PT:-"00-11:30:00"}   # Optuna Stage-1 pre-train worker (4 trials x ~75-95m on RTX 3090)
-TIME_OPTUNA_FT=${TIME_OPTUNA_FT:-"00-11:30:00"}   # Optuna Stage-2 fine-tune worker (5 trials x ~60-80m on RTX 3090)
+TIME_OPTUNA_FT=${TIME_OPTUNA_FT:-"00-11:30:00"}   # Optuna fine-tune worker (~40-90m/trial on RTX 3090 / A100)
 TIME_MLM=${TIME_MLM:-"00-06:00:00"}               # Pre-training (~1-2h per split)
 TIME_CLASSIC_ML=${TIME_CLASSIC_ML:-"00-06:00:00"} # Classic ML (~12-90m per task on 16 CPU cores)
 TIME_FINETUNE=${TIME_FINETUNE:-"00-06:00:00"}     # Binary fine-tuning (~1.5-2.5h for multitask_all on RTX 3090)
@@ -118,26 +118,25 @@ SURVIVAL_FT_CONFIG=${SURVIVAL_FT_CONFIG:-"configs/survival_training.yaml"}      
 SURV_COMP_CONFIG=${SURV_COMP_CONFIG:-"configs/survival_training.yaml"}            # Step 6: Cross-family survival comparison
 ANALYSIS_CONFIG=${ANALYSIS_CONFIG:-"$DEFAULT_TF_CONFIG"}                          # Steps 7 & 8: Interpretability + Stratification
 
-# Optional Optuna HPO JSONs & canonical run-id override for final multi-split training
-OPTUNA_PRETRAIN_JSON=${OPTUNA_PRETRAIN_JSON:-""}
+# Optional Optuna fine-tuning HPO JSON & canonical run-id override for final multi-split training
 OPTUNA_FINETUNE_JSON=${OPTUNA_FINETUNE_JSON:-""}
+OPTUNA_PRETRAINED_DIR=${OPTUNA_PRETRAINED_DIR:-""}
 RUN_ID_OVERRIDE=${RUN_ID_OVERRIDE:-""}
 TRAIN_DATA_AUGMENT=${TRAIN_DATA_AUGMENT:-""}
+EXTRA_MLM_OVERRIDES=${EXTRA_MLM_OVERRIDES:-"{}"}
+EXTRA_FT_OVERRIDES=${EXTRA_FT_OVERRIDES:-"{}"}
 
-# Optuna Stage-0 settings (disabled by default; enable for parallel multi-GPU HPO)
-RUN_STEP_0_OPTUNA_PRETRAIN=${RUN_STEP_0_OPTUNA_PRETRAIN:-false}
+# Optuna fine-tuning HPO settings (disabled by default; enable with RUN_STEP_0_OPTUNA_FINETUNE=true)
+# Pre-training uses fixed canonical config (e00-a15-v60_raw); Optuna optimizes fine-tuning only.
 RUN_STEP_0_OPTUNA_FINETUNE=${RUN_STEP_0_OPTUNA_FINETUNE:-false}
 OPTUNA_SPLIT=${OPTUNA_SPLIT:-"random_split"}
 OPTUNA_WORKERS=${OPTUNA_WORKERS:-12}
-OPTUNA_PT_TOTAL_TRIALS=${OPTUNA_PT_TOTAL_TRIALS:-50}
 OPTUNA_FT_TOTAL_TRIALS=${OPTUNA_FT_TOTAL_TRIALS:-50}
-DEFAULT_PT_WORKER_CAP=$(( (OPTUNA_PT_TOTAL_TRIALS + OPTUNA_WORKERS - 1) / OPTUNA_WORKERS + 2 ))
 DEFAULT_FT_WORKER_CAP=$(( (OPTUNA_FT_TOTAL_TRIALS + OPTUNA_WORKERS - 1) / OPTUNA_WORKERS + 2 ))
-OPTUNA_PT_TRIALS_PER_WORKER=${OPTUNA_PT_TRIALS_PER_WORKER:-$DEFAULT_PT_WORKER_CAP}
 OPTUNA_FT_TRIALS_PER_WORKER=${OPTUNA_FT_TRIALS_PER_WORKER:-$DEFAULT_FT_WORKER_CAP}
 OPTUNA_REAP_RUNNING=${OPTUNA_REAP_RUNNING:-false}
-OPTUNA_TASKS=${OPTUNA_TASKS:-"multitask_bacteria,multitask_viruses,multitask_fungi,death,graft_loss"}
-OPTUNA_EXPORT_RUN_ID=${OPTUNA_EXPORT_RUN_ID:-"optuna_best"}
+OPTUNA_TASKS=${OPTUNA_TASKS:-"multitask_bacteria"}
+OPTUNA_EXPORT_RUN_ID=${OPTUNA_EXPORT_RUN_ID:-"optuna_ft"}
 
 # ==============================================================================
 # STEP EXECUTION TOGGLES (env-overridable)
@@ -154,6 +153,8 @@ RUN_STEP_8_STRATIFICATION=${RUN_STEP_8_STRATIFICATION:-true}                    
 
 if [ -z "${RUN_SPLITS+x}" ]; then
     RUN_SPLITS=("random_split" "temporal_split" "center_split")
+elif [[ "$(declare -p RUN_SPLITS 2>/dev/null)" != "declare -a"* ]]; then
+    read -r -a RUN_SPLITS <<< "${RUN_SPLITS//,/ }"
 fi
 
 # ==============================================================================
@@ -246,7 +247,7 @@ ANALYSIS_PROPOSED_MODEL=${ANALYSIS_PROPOSED_MODEL:-"${DEFAULT_MODEL_PREFIX}_${DE
 ANALYSIS_CONTENDER_MODELS=${ANALYSIS_CONTENDER_MODELS:-"logistic_regression random_forest xgboost"}
 if [ -n "${RUN_ID_OVERRIDE}" ]; then
     DEFAULT_ANALYSIS_RUN_ID="${RUN_ID_OVERRIDE}_${DEFAULT_VAL_TAG}"
-elif [ "$RUN_STEP_0_OPTUNA_PRETRAIN" = true ] || [ "$RUN_STEP_0_OPTUNA_FINETUNE" = true ]; then
+elif [ "$RUN_STEP_0_OPTUNA_FINETUNE" = true ] || [ -n "${OPTUNA_FINETUNE_JSON:-}" ]; then
     DEFAULT_ANALYSIS_RUN_ID="${OPTUNA_EXPORT_RUN_ID}_${DEFAULT_VAL_TAG}"
 else
     DEFAULT_ANALYSIS_RUN_ID="e00-a15-v60_${DEFAULT_VAL_TAG}"
@@ -381,38 +382,11 @@ case "${JOB_STAGE}" in
                 --data-dir "${TEAV_DATA_DIR}" \
                 --splits "${JOB_SPLIT}"
         ;;
-    optuna_pt_worker)
-        OPTUNA_TASKS_COMMA="${OPTUNA_TASKS_COLON//:/,}"
-        EXTRA_OPT_FLAGS=()
-        [ "${DEBUG_MODE}" = "true" ] && EXTRA_OPT_FLAGS+=(--debug)
-        apptainer exec --nv --bind "$BIND_MOUNTS" "$TARGET_SIF" \
-            /opt/venv/bin/python scripts/train_optuna.py \
-                --stage pretrain \
-                -c "${MLM_CONFIG}" \
-                --split "${JOB_SPLIT}" \
-                --target-trials "${OPTUNA_PT_TOTAL_TRIALS}" \
-                --n-trials "${OPTUNA_PT_TRIALS_PER_WORKER}" \
-                --export-run-id "${OPTUNA_EXPORT_RUN_ID}" \
-                --skip-final-eval \
-                --overrides "${MLM_OVERRIDES}" \
-                "${EXTRA_OPT_FLAGS[@]}"
-        ;;
-    optuna_pt_finalize)
-        EXTRA_FIN_FLAGS=(--compact-journal --reap-running)
-        apptainer exec --bind "$BIND_MOUNTS" "$TARGET_SIF" \
-            /opt/venv/bin/python scripts/train_optuna.py \
-                --stage pretrain \
-                -c "${MLM_CONFIG}" \
-                --split "${JOB_SPLIT}" \
-                --n-trials 0 \
-                --export-run-id "${OPTUNA_EXPORT_RUN_ID}" \
-                --overrides "${MLM_OVERRIDES}" \
-                "${EXTRA_FIN_FLAGS[@]}"
-        ;;
     optuna_ft_worker)
         OPTUNA_TASKS_COMMA="${OPTUNA_TASKS_COLON//:/,}"
         EXTRA_OPT_FLAGS=()
         [ "${DEBUG_MODE}" = "true" ] && EXTRA_OPT_FLAGS+=(--debug)
+        [ -n "${OPTUNA_PRETRAINED_DIR:-}" ] && EXTRA_OPT_FLAGS+=(--pretrained-dir "${OPTUNA_PRETRAINED_DIR}")
         apptainer exec --nv --bind "$BIND_MOUNTS" "$TARGET_SIF" \
             /opt/venv/bin/python scripts/train_optuna.py \
                 --stage finetune \
@@ -424,12 +398,13 @@ case "${JOB_STAGE}" in
                 --export-run-id "${OPTUNA_EXPORT_RUN_ID}" \
                 --skip-final-eval \
                 --overrides "${FT_OVERRIDES}" \
+                --overrides "${EXTRA_FT_OVERRIDES}" \
                 "${EXTRA_OPT_FLAGS[@]}"
         ;;
     optuna_ft_finalize)
         OPTUNA_TASKS_COMMA="${OPTUNA_TASKS_COLON//:/,}"
-        EXTRA_FIN_FLAGS=(--compact-journal)
-        [ "${OPTUNA_REAP_RUNNING}" = "true" ] && EXTRA_FIN_FLAGS+=(--reap-running)
+        EXTRA_FIN_FLAGS=(--compact-journal --reap-running)
+        [ -n "${OPTUNA_PRETRAINED_DIR:-}" ] && EXTRA_FIN_FLAGS+=(--pretrained-dir "${OPTUNA_PRETRAINED_DIR}")
         apptainer exec --nv --bind "$BIND_MOUNTS" "$TARGET_SIF" \
             /opt/venv/bin/python scripts/train_optuna.py \
                 --stage finetune \
@@ -439,11 +414,11 @@ case "${JOB_STAGE}" in
                 --n-trials 0 \
                 --export-run-id "${OPTUNA_EXPORT_RUN_ID}" \
                 --overrides "${FT_OVERRIDES}" \
+                --overrides "${EXTRA_FT_OVERRIDES}" \
                 "${EXTRA_FIN_FLAGS[@]}"
         ;;
     mlm)
         EXTRA_MLM_ARGS=()
-        [ -n "${OPTUNA_PRETRAIN_JSON:-}" ] && EXTRA_MLM_ARGS+=(--optuna-json "${OPTUNA_PRETRAIN_JSON}")
         [ -n "${RUN_ID_OVERRIDE:-}" ] && EXTRA_MLM_ARGS+=(--overrides "{\"run_id\": \"${RUN_ID_OVERRIDE}\"}")
         apptainer exec --nv --bind "$BIND_MOUNTS" "$TARGET_SIF" \
             /opt/venv/bin/python scripts/train_mlm.py \
@@ -451,6 +426,7 @@ case "${JOB_STAGE}" in
                 -s \
                 "${EXTRA_MLM_ARGS[@]}" \
                 --overrides "${MLM_OVERRIDES}" \
+                --overrides "${EXTRA_MLM_OVERRIDES}" \
                 --overrides "{\"data_split_type\": \"${JOB_SPLIT}\"}" \
                 --overrides "${DEBUG_MLM_OVERRIDES}"
         ;;
@@ -470,7 +446,6 @@ case "${JOB_STAGE}" in
         ;;
     finetune)
         EXTRA_FT_ARGS=()
-        [ -n "${OPTUNA_PRETRAIN_JSON:-}" ] && EXTRA_FT_ARGS+=(--optuna-json "${OPTUNA_PRETRAIN_JSON}")
         [ -n "${OPTUNA_FINETUNE_JSON:-}" ] && EXTRA_FT_ARGS+=(--optuna-json "${OPTUNA_FINETUNE_JSON}")
         [ -n "${RUN_ID_OVERRIDE:-}" ] && EXTRA_FT_ARGS+=(--overrides "{\"run_id\": \"${RUN_ID_OVERRIDE}\"}")
         [ -n "${TRAIN_DATA_AUGMENT:-}" ] && EXTRA_FT_ARGS+=(--overrides "{\"train_data_augment\": \"${TRAIN_DATA_AUGMENT}\"}")
@@ -481,6 +456,7 @@ case "${JOB_STAGE}" in
                 --tasks "${JOB_TASK}" \
                 "${EXTRA_FT_ARGS[@]}" \
                 --overrides "${FT_OVERRIDES}" \
+                --overrides "${EXTRA_FT_OVERRIDES}" \
                 --overrides "{\"data_split_type\": \"${JOB_SPLIT}\"}" \
                 --overrides "${DEBUG_FT_OVERRIDES}"
         ;;
@@ -531,6 +507,7 @@ case "${JOB_STAGE}" in
         apptainer exec --bind "$BIND_MOUNTS" "$TARGET_SIF" \
             /opt/venv/bin/python scripts/generate_summary_report.py \
                 --results-dir "${RESULTS_DIR}" \
+                --run-id "${ANALYSIS_RUN_ID}" \
                 --splits "${SPLIT_ARR[@]}"
         ;;
     survival_comp)
@@ -619,12 +596,17 @@ submit_slurm_job() {
     local log_file="${LOG_DIR}/${log_stem}.log"
     local slurm_out="${LOG_DIR}/slurm_${log_stem}_%j.out"
 
+    local job_cpus="${SLURM_CPUS_CPU}"
+    if [ "$use_gpu" = "true" ]; then
+        job_cpus="${SLURM_CPUS_GPU}"
+    fi
+
     local sbatch_args=(
         --parsable
         --job-name="${job_name}"
         --partition="${partition}"
         --nodes=1
-        -c "${SLURM_CPUS}"
+        -c "${job_cpus}"
         --mem="${mem}"
         --time="${walltime}"
         --output="${slurm_out}"
@@ -645,11 +627,11 @@ submit_slurm_job() {
     # Pass stage parameters via environment variables (avoid commas inside --export values)
     export PROJECT_DIR SHARED_DATA_DIR SOURCE_SIF RESULTS_DIR TEAV_DATA_DIR
     export MLM_CONFIG CLASSIC_ML_CONFIG FT_CONFIG SURVIVAL_FT_CONFIG SURV_COMP_CONFIG ANALYSIS_CONFIG
-    export MLM_OVERRIDES FT_OVERRIDES SURV_FT_OVERRIDES ML_OVERRIDES SURV_COMP_OVERRIDES
+    export MLM_OVERRIDES FT_OVERRIDES SURV_FT_OVERRIDES ML_OVERRIDES SURV_COMP_OVERRIDES EXTRA_MLM_OVERRIDES EXTRA_FT_OVERRIDES
     export DEBUG_MLM_OVERRIDES DEBUG_FT_OVERRIDES DEBUG_SURV_FT_OVERRIDES DEBUG_ML_OVERRIDES DEBUG_SURV_COMP_OVERRIDES
     export ANALYSIS_PROPOSED_MODEL STRATIFICATION_PROPOSED_MODEL ANALYSIS_RUN_ID COMPARISON_THRESHOLD_MODE COMPARISON_TARGET_RECALL COMPARISON_WORKERS STRATIFICATION_HORIZON
-    export OPTUNA_PRETRAIN_JSON OPTUNA_FINETUNE_JSON RUN_ID_OVERRIDE TRAIN_DATA_AUGMENT DEBUG_MODE
-    export OPTUNA_PT_TOTAL_TRIALS OPTUNA_FT_TOTAL_TRIALS OPTUNA_PT_TRIALS_PER_WORKER OPTUNA_FT_TRIALS_PER_WORKER OPTUNA_EXPORT_RUN_ID OPTUNA_REAP_RUNNING
+    export OPTUNA_FINETUNE_JSON OPTUNA_PRETRAINED_DIR RUN_ID_OVERRIDE TRAIN_DATA_AUGMENT DEBUG_MODE
+    export OPTUNA_FT_TOTAL_TRIALS OPTUNA_FT_TRIALS_PER_WORKER OPTUNA_EXPORT_RUN_ID OPTUNA_REAP_RUNNING
     export OPTUNA_TASKS_COLON="${OPTUNA_TASKS//,/:}"
     export CLASSIC_ML_MODELS_COLON="${CLASSIC_ML_MODELS//,/:}"
     export CLASSIC_ML_FIXED_HP
@@ -682,8 +664,8 @@ echo "==========================================================================
 echo "AIIDKIT Slurm Pipeline Orchestrator"
 echo "  Logs directory : ${LOG_DIR}"
 echo "  Splits         : ${RUN_SPLITS[*]}"
-echo "  GPU Partition  : ${GPU_PARTITION} (${GPU_SPEC}, ${SLURM_CPUS} CPUs, ${SLURM_MEM_GPU})"
-echo "  CPU Partition  : ${CPU_PARTITION} (${SLURM_CPUS} CPUs, ${SLURM_MEM_CPU})"
+echo "  GPU Partition  : ${GPU_PARTITION} (${GPU_SPEC}, ${SLURM_CPUS_GPU} CPUs, ${SLURM_MEM_GPU})"
+echo "  CPU Partition  : ${CPU_PARTITION} (${SLURM_CPUS_CPU} CPUs, ${SLURM_MEM_CPU})"
 echo "  Proposed Model : ${ANALYSIS_PROPOSED_MODEL} vs [${ANALYSIS_CONTENDER_MODELS}]"
 echo "  Step Toggles   : MLM=${RUN_STEP_1_MLM} | ClassicML=${RUN_STEP_4_CLASSIC_ML} | BinaryFT=${RUN_STEP_3_FINETUNING} | SurvivalFT=${RUN_STEP_2_SURVIVAL_FT}"
 echo "  Analysis       : Comparison=${RUN_STEP_5_COMPARISON} | SurvivalComp=${RUN_STEP_6_SURVIVAL_COMP} | Interpret=${RUN_STEP_7_INTERPRET} | Strat=${RUN_STEP_8_STRATIFICATION} (horizon=${STRATIFICATION_HORIZON}d)"
@@ -697,7 +679,6 @@ declare -A CML_JOBS_BY_SPLIT=()
 ALL_FT_JOBS=()
 ALL_SURV_JOBS=()
 ALL_CML_JOBS=()
-OPTUNA_PT_FINAL_JOB=""
 OPTUNA_FT_FINAL_JOB=""
 
 # ==============================================================================
@@ -705,7 +686,7 @@ OPTUNA_FT_FINAL_JOB=""
 #                 jobs (Optuna, MLM, Fine-Tuning, Survival) spend 0s building caches
 # ==============================================================================
 NEED_TF_CACHE=false
-if [ "$RUN_STEP_0_OPTUNA_PRETRAIN" = true ] || [ "$RUN_STEP_0_OPTUNA_FINETUNE" = true ] || \
+if [ "$RUN_STEP_0_OPTUNA_FINETUNE" = true ] || \
    [ "$RUN_STEP_1_MLM" = true ] || [ "$RUN_STEP_3_FINETUNING" = true ] || [ "$RUN_STEP_2_SURVIVAL_FT" = true ]; then
     NEED_TF_CACHE=true
 fi
@@ -713,7 +694,7 @@ fi
 if [ "$RUN_STEP_0_PREWARM" = true ] && [ "$NEED_TF_CACHE" = true ]; then
     declare -A _PREWARM_SEEN=()
     PREWARM_SPLITS=()
-    if [ "$RUN_STEP_0_OPTUNA_PRETRAIN" = true ] || [ "$RUN_STEP_0_OPTUNA_FINETUNE" = true ]; then
+    if [ "$RUN_STEP_0_OPTUNA_FINETUNE" = true ]; then
         PREWARM_SPLITS+=("$OPTUNA_SPLIT")
         _PREWARM_SEEN["$OPTUNA_SPLIT"]=1
     fi
@@ -746,103 +727,19 @@ else
 fi
 
 # ==============================================================================
-# STEP 0 (Optional): Two-Stage Parallel Optuna HPO on OPTUNA_SPLIT
-#   Stage 0a: OPTUNA_WORKERS parallel GPU workers -> 1 afterok finalizer
-#   Stage 0b: OPTUNA_WORKERS parallel GPU workers (afterok:0a) -> 1 afterok finalizer
+# STEP 0 (Optional): Parallel Fine-Tuning Optuna HPO on OPTUNA_SPLIT
+#   Seeds from canonical pre-trained backbone (e00-a15-v60_raw/pretraining)
+#   or Step-1a MLM if RUN_STEP_1_MLM=true on OPTUNA_SPLIT.
 # ==============================================================================
-if [ "$RUN_STEP_0_OPTUNA_PRETRAIN" = true ]; then
-    sp=$(short_split "$OPTUNA_SPLIT")
-    opt_pt_dep=""
-    [ -n "${PREWARM_JOB_BY_SPLIT[$OPTUNA_SPLIT]:-}" ] && opt_pt_dep="afterok:${PREWARM_JOB_BY_SPLIT[$OPTUNA_SPLIT]}"
-    echo -e "\n>>> [Step 0a] Submitting Optuna Pre-Training (global target=${OPTUNA_PT_TOTAL_TRIALS} trials across ${OPTUNA_WORKERS} workers, cap=${OPTUNA_PT_TRIALS_PER_WORKER}/worker) on ${OPTUNA_SPLIT}..."
-    opt_pt_workers=()
-    for ((w=1; w<=OPTUNA_WORKERS; w++)); do
-        submit_slurm_job \
-            "opt-pt-${sp}-w${w}" \
-            "$GPU_PARTITION" \
-            "$TIME_OPTUNA_PT" \
-            "$SLURM_MEM_GPU" \
-            "true" \
-            "$opt_pt_dep" \
-            "optuna_pt_worker" \
-            "$OPTUNA_SPLIT" \
-            "w${w}" \
-            "step0a_optuna_pt_${OPTUNA_SPLIT}_w${w}"
-        opt_pt_workers+=("$LAST_JOB_ID")
-    done
-    submit_slurm_job \
-        "opt-pt-${sp}-fin" \
-        "$CPU_PARTITION" \
-        "00-01:30:00" \
-        "16G" \
-        "false" \
-        "afterany:$(join_by_colon "${opt_pt_workers[@]}")" \
-        "optuna_pt_finalize" \
-        "$OPTUNA_SPLIT" \
-        "finalize" \
-        "step0a_optuna_pt_${OPTUNA_SPLIT}_finalize"
-    OPTUNA_PT_FINAL_JOB="$LAST_JOB_ID"
-    if [ -z "${OPTUNA_PRETRAIN_JSON:-}" ]; then
-        OPTUNA_PRETRAIN_JSON="${RESULTS_DIR}/${DEFAULT_FAMILY_DIR}/optuna_pretrain/${OPTUNA_SPLIT}_${DEFAULT_VAL_TAG}/best_pretrain_config.json"
-    fi
-fi
-
-if [ "$RUN_STEP_0_OPTUNA_FINETUNE" = true ]; then
-    sp=$(short_split "$OPTUNA_SPLIT")
-    opt_ft_deps=()
-    [ -n "${PREWARM_JOB_BY_SPLIT[$OPTUNA_SPLIT]:-}" ] && opt_ft_deps+=("${PREWARM_JOB_BY_SPLIT[$OPTUNA_SPLIT]}")
-    [ -n "$OPTUNA_PT_FINAL_JOB" ] && opt_ft_deps+=("${OPTUNA_PT_FINAL_JOB}")
-    dep=""
-    [ ${#opt_ft_deps[@]} -gt 0 ] && dep="afterok:$(join_by_colon "${opt_ft_deps[@]}")"
-    echo -e "\n>>> [Step 0b] Submitting Optuna Fine-Tuning (global target=${OPTUNA_FT_TOTAL_TRIALS} trials across ${OPTUNA_WORKERS} workers, cap=${OPTUNA_FT_TRIALS_PER_WORKER}/worker; tasks=${OPTUNA_TASKS}) on ${OPTUNA_SPLIT}..."
-    opt_ft_workers=()
-    for ((w=1; w<=OPTUNA_WORKERS; w++)); do
-        submit_slurm_job \
-            "opt-ft-${sp}-w${w}" \
-            "$GPU_PARTITION" \
-            "$TIME_OPTUNA_FT" \
-            "$SLURM_MEM_GPU" \
-            "true" \
-            "$dep" \
-            "optuna_ft_worker" \
-            "$OPTUNA_SPLIT" \
-            "w${w}" \
-            "step0b_optuna_ft_${OPTUNA_SPLIT}_w${w}"
-        opt_ft_workers+=("$LAST_JOB_ID")
-    done
-    submit_slurm_job \
-        "opt-ft-${sp}-fin" \
-        "$GPU_PARTITION" \
-        "00-02:30:00" \
-        "$SLURM_MEM_GPU" \
-        "true" \
-        "afterok:$(join_by_colon "${opt_ft_workers[@]}")" \
-        "optuna_ft_finalize" \
-        "$OPTUNA_SPLIT" \
-        "finalize" \
-        "step0b_optuna_ft_${OPTUNA_SPLIT}_finalize"
-    OPTUNA_FT_FINAL_JOB="$LAST_JOB_ID"
-    if [ -z "${OPTUNA_FINETUNE_JSON:-}" ]; then
-        SAFE_OPT_TASK_TAG="${OPTUNA_TASKS//,/-}"
-        OPTUNA_FINETUNE_JSON="${RESULTS_DIR}/${DEFAULT_FAMILY_DIR}/optuna_finetune/${OPTUNA_SPLIT}_${DEFAULT_VAL_TAG}/${SAFE_OPT_TASK_TAG}/best_finetune_config.json"
-    fi
-fi
-
 # ==============================================================================
 # STEP 1a: MLM Pre-Training (1 GPU job per split, launched in parallel)
 # ==============================================================================
 if [ "$RUN_STEP_1_MLM" = true ]; then
     echo -e "\n>>> [Step 1a] Submitting MLM Pre-Training jobs across ${#RUN_SPLITS[@]} split(s) in parallel..."
     for split in "${RUN_SPLITS[@]}"; do
-        if [ "$RUN_STEP_0_OPTUNA_PRETRAIN" = true ] && [ "$split" = "$OPTUNA_SPLIT" ] && [ -n "${OPTUNA_PT_FINAL_JOB:-}" ]; then
-            MLM_JOB_BY_SPLIT["$split"]="$OPTUNA_PT_FINAL_JOB"
-            echo "  -> Reusing Stage-0a Optuna winning pre-training on ${split} (JobID=${OPTUNA_PT_FINAL_JOB})"
-            continue
-        fi
         sp=$(short_split "$split")
         mlm_deps=()
         [ -n "${PREWARM_JOB_BY_SPLIT[$split]:-}" ] && mlm_deps+=("${PREWARM_JOB_BY_SPLIT[$split]}")
-        [ -n "${OPTUNA_PT_FINAL_JOB:-}" ] && mlm_deps+=("${OPTUNA_PT_FINAL_JOB}")
         mlm_dep=""
         [ ${#mlm_deps[@]} -gt 0 ] && mlm_dep="afterok:$(join_by_colon "${mlm_deps[@]}")"
         submit_slurm_job \
@@ -865,6 +762,47 @@ else
             MLM_JOB_BY_SPLIT["$split"]="$EXTERNAL_MLM_JOB_ID"
         done
         echo "  -> Chaining downstream jobs to existing MLM JobID=${EXTERNAL_MLM_JOB_ID} (afterok:${EXTERNAL_MLM_JOB_ID})"
+    fi
+fi
+
+if [ "$RUN_STEP_0_OPTUNA_FINETUNE" = true ]; then
+    sp=$(short_split "$OPTUNA_SPLIT")
+    opt_ft_deps=()
+    [ -n "${PREWARM_JOB_BY_SPLIT[$OPTUNA_SPLIT]:-}" ] && opt_ft_deps+=("${PREWARM_JOB_BY_SPLIT[$OPTUNA_SPLIT]}")
+    [ -n "${MLM_JOB_BY_SPLIT[$OPTUNA_SPLIT]:-}" ] && opt_ft_deps+=("${MLM_JOB_BY_SPLIT[$OPTUNA_SPLIT]}")
+    dep=""
+    [ ${#opt_ft_deps[@]} -gt 0 ] && dep="afterok:$(join_by_colon "${opt_ft_deps[@]}")"
+    echo -e "\n>>> [Step 0-Optuna] Submitting Fine-Tuning Optuna (global target=${OPTUNA_FT_TOTAL_TRIALS} trials across ${OPTUNA_WORKERS} workers, cap=${OPTUNA_FT_TRIALS_PER_WORKER}/worker; tasks=${OPTUNA_TASKS}) on ${OPTUNA_SPLIT}..."
+    opt_ft_workers=()
+    for ((w=1; w<=OPTUNA_WORKERS; w++)); do
+        submit_slurm_job \
+            "opt-ft-${sp}-w${w}" \
+            "$GPU_PARTITION" \
+            "$TIME_OPTUNA_FT" \
+            "$SLURM_MEM_GPU" \
+            "true" \
+            "$dep" \
+            "optuna_ft_worker" \
+            "$OPTUNA_SPLIT" \
+            "w${w}" \
+            "step0_optuna_ft_${OPTUNA_SPLIT}_w${w}"
+        opt_ft_workers+=("$LAST_JOB_ID")
+    done
+    submit_slurm_job \
+        "opt-ft-${sp}-fin" \
+        "$GPU_PARTITION" \
+        "00-02:30:00" \
+        "$SLURM_MEM_GPU" \
+        "true" \
+        "afterany:$(join_by_colon "${opt_ft_workers[@]}")" \
+        "optuna_ft_finalize" \
+        "$OPTUNA_SPLIT" \
+        "finalize" \
+        "step0_optuna_ft_${OPTUNA_SPLIT}_finalize"
+    OPTUNA_FT_FINAL_JOB="$LAST_JOB_ID"
+    if [ -z "${OPTUNA_FINETUNE_JSON:-}" ]; then
+        SAFE_OPT_TASK_TAG="${OPTUNA_TASKS//,/-}"
+        OPTUNA_FINETUNE_JSON="${RESULTS_DIR}/${DEFAULT_FAMILY_DIR}/optuna_finetune/${OPTUNA_SPLIT}_${DEFAULT_VAL_TAG}/${SAFE_OPT_TASK_TAG}/best_finetune_config.json"
     fi
 fi
 
@@ -994,8 +932,9 @@ if [ "$RUN_STEP_5_COMPARISON" = true ]; then
     read -r -a COMP_TASK_LIST <<< "${COMPARISON_TASKS//,/ }"
     echo -e "\n>>> [Step 5] Submitting Parallel Model Comparison Analysis (${ANALYSIS_PROPOSED_MODEL} vs ${ANALYSIS_CONTENDER_MODELS}) across ${#COMP_TASK_LIST[@]} task(s)..."
     comp_deps=()
-    [ ${#ALL_FT_JOBS[@]} -gt 0 ]  && comp_deps+=("${ALL_FT_JOBS[@]}")
-    [ ${#ALL_CML_JOBS[@]} -gt 0 ] && comp_deps+=("${ALL_CML_JOBS[@]}")
+    [ ${#ALL_FT_JOBS[@]} -gt 0 ]   && comp_deps+=("${ALL_FT_JOBS[@]}")
+    [ ${#ALL_SURV_JOBS[@]} -gt 0 ] && comp_deps+=("${ALL_SURV_JOBS[@]}")
+    [ ${#ALL_CML_JOBS[@]} -gt 0 ]  && comp_deps+=("${ALL_CML_JOBS[@]}")
     dep=""
     if [ ${#comp_deps[@]} -gt 0 ]; then
         dep="afterok:$(join_by_colon "${comp_deps[@]}")"

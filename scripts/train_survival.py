@@ -5,6 +5,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import argparse
 import gc
 import json
+import shutil
 import numpy as np
 import torch
 import wandb
@@ -20,7 +21,11 @@ from src.data.survival_labels import (
 from src.model.model_utils import resolve_best_checkpoint
 from src.model.patient_embedder import PatientEmbeddingModelFactory
 from src.model.patient_embedder import PatientDataCollatorForSurvival
-from src.model.survival_utils import make_survival_loss_func
+from src.model.survival_utils import (
+    build_survival_time_grid,
+    compute_empirical_log_hazard_priors,
+    make_survival_loss_func,
+)
 from src.evaluation.evaluate_models import (
     DiscriminativeEmbeddingEvaluatorForSurvival as CustomEvaluator,
 )
@@ -31,86 +36,109 @@ from scripts.script_utils import (
     scan_all_fups,
     save_predictions_table, extract_horizons_from_path,
     format_pretrain_run_id, get_value_embedding_tag,
+    resolve_run_id_with_val_tag,
 )
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Fine-tune a patient transformer with a survival (Cox) objective."
+        description="Fine-tune a patient transformer with a single-task or multi-task survival (Cox) objective."
     )
     parser.add_argument("--config", "-c", type=str, default="configs/survival_training.yaml")
     parser.add_argument("--reset_weights", "-r", action="store_true", help="Whether to reset model weights before fine-tuning.")
+    parser.add_argument("--eval-only", "--eval_only", dest="eval_only", action="store_true",
+                        help="Skip training, load existing fine-tuned checkpoint from output_dir, and run full test_survival_model.")
     parser.add_argument("--silent", "-s", action="store_true", help="Disable wandb logging.")
     parser.add_argument("--optuna-json", "-J", action="append", default=[],
                         help="Path(s) to best_{pretrain,finetune}_config.json written by train_optuna.py.")
     parser.add_argument("--overrides", "-o", action="append", default=[], help="Overrides config (JSON string or key=value).")
-    parser.add_argument("--tasks", "-t", type=str, default="", help="Comma-separated prediction_tasks keys to run.")
+    parser.add_argument("--tasks", "-t", nargs="*", default=[], help="Comma-separated prediction_tasks keys to run.")
     return parser.parse_args()
 
 
 def main():
     """
-    Fine-tune survival models for the prediction tasks in the yaml config file.
-
-    Instead of binary labels per horizon (train_classification.py), each patient
-    provides a (time, status) pair measured from the fup observation point, and
-    the model is trained with the Cox partial likelihood on a single log
-    hazard-ratio output. Configured `horizons` are only used for reporting
-    (predicted risk S(h), AUROC/AP/IPCW-Brier at h), keeping results directly
-    comparable with the binary classification pipeline.
+    Fine-tune single-task or multi-task Cox PH survival models for `prediction_tasks`.
     """
     cli_args = parse_args()
     with open(cli_args.config, 'r') as f:
         cfg = yaml.safe_load(f)
+    base_loss_name = cfg.get("finetuner", {}).get("loss_name", "surv_ehr")
     cfg = load_optuna_json_overrides(cfg, cli_args.optuna_json)
+    if cli_args.optuna_json:
+        # Preserve survival-specific loss if a binary Optuna JSON was supplied
+        if str(cfg.get("finetuner", {}).get("loss_name", "")).lower() not in ("surv_ehr", "pc_hazard", "neural_cif", "cox"):
+            cfg["finetuner"]["loss_name"] = base_loss_name
+        if base_loss_name.lower() == "cox":
+            cfg["target_undersampling_ratio"] = None
     cfg = apply_config_overrides(cfg, cli_args.overrides)
-    if cli_args.tasks:
-        wanted = [t.strip() for t in cli_args.tasks.split(",") if t.strip()]
-        cfg["prediction_tasks"] = {t: cfg["prediction_tasks"][t] for t in wanted if t in cfg["prediction_tasks"]}
 
-    # Identify pretraining and finetuning directories (same convention as classification)
+    if cli_args.tasks:
+        wanted = [
+            t.strip()
+            for arg in (cli_args.tasks if isinstance(cli_args.tasks, list) else [cli_args.tasks])
+            for t in arg.split(",")
+            if t.strip()
+        ]
+        missing = [t for t in wanted if t not in cfg["prediction_tasks"]]
+        if missing:
+            sys.exit(f"Error: --tasks entries {missing} not found in survival config {list(cfg['prediction_tasks'])}.")
+        cfg["prediction_tasks"] = {t: cfg["prediction_tasks"][t] for t in wanted}
+        print(f">>> --tasks filter active: running {list(cfg['prediction_tasks'])}")
+
     train_data_augment = cfg.get("train_data_augment", "all")
     pretrain_run_id = format_pretrain_run_id(cfg)
     val_tag = get_value_embedding_tag(cfg)
-    finetune_run_id = pretrain_run_id if not cli_args.reset_weights else f"no_pretrain_{val_tag}"
+    if cli_args.reset_weights:
+        finetune_run_id = f"no_pretrain_{val_tag}"
+    elif cfg.get("finetune_run_id"):
+        finetune_run_id = resolve_run_id_with_val_tag(str(cfg["finetune_run_id"]), val_tag)
+    else:
+        finetune_run_id = pretrain_run_id
     result_dir = Path(cfg["result_dir"]) / cfg["data_split_type"]
-    # Pretraining checkpoint can live in another result tree (e.g. the one built
-    # by the classification pipeline). Default: this config's own result_dir.
     pretrain_root = Path(cfg.get("pretrain_result_dir", cfg["result_dir"])) / cfg["data_split_type"]
     pretrained_dir = pretrain_root / pretrain_run_id / "pretraining"
-    finetuning_subdir = cfg["finetuner"].pop("ft_subdir", "finetuning_survival")
+    if pretrained_dir.exists():
+        pt_alias = result_dir / finetune_run_id / "pretraining"
+        pt_alias.parent.mkdir(parents=True, exist_ok=True)
+        if not pt_alias.exists() and not pt_alias.is_symlink():
+            pt_alias.symlink_to(pretrained_dir.resolve(), target_is_directory=True)
+    finetuning_subdir = cfg["finetuner"].pop("ft_subdir", "finetuning")
     finetuning_dir = result_dir / finetune_run_id / finetuning_subdir
 
-    # Iterate over prediction tasks (one endpoint outcome each)
     for task_key, task_specs in cfg["prediction_tasks"].items():
-
-        # Reporting horizons (int or list of ints)
-        horizons = task_specs.get("horizons", [30, 60, 90])
-        horizons = horizons if isinstance(horizons, list) else [horizons]
+        task_keys = list(task_specs.get("tasks", [task_key]))
+        raw_horizons = task_specs.get("horizons", [30, 60, 90])
+        if isinstance(raw_horizons, list) and len(raw_horizons) == 1 and isinstance(raw_horizons[0], list):
+            horizons = [int(h) for h in raw_horizons[0]]
+        elif isinstance(raw_horizons, list):
+            horizons = [int(h) for h in raw_horizons]
+        else:
+            horizons = [int(raw_horizons)]
         valid_fups = task_specs["fups"]
 
-        # Define run configurations: list of tuples (train_fups_list, valid_fups_list)
-        if train_data_augment == "none":  # one run per follow-up period
+        if train_data_augment == "none":
             run_configs = [([f], [f]) for f in valid_fups]
-        else:  # single run with all (valid) follow-up periods
+        else:
             if train_data_augment == "valid":
-                train_fups = valid_fups  # all of interest
+                train_fups = valid_fups
             elif train_data_augment == "all":
                 data_dir = Path(cfg["data_dir"]) / cfg["data_split_type"]
-                train_fups = scan_all_fups(data_dir)  # all available
+                train_fups = scan_all_fups(data_dir)
             else:
                 raise ValueError(f"Unsupported train_data_augment='{train_data_augment}' (expected 'all', 'valid', or 'none').")
             run_configs = [(train_fups, valid_fups)]
 
         for train_fups, valid_fups in run_configs:
             print(
-                f"Starting survival fine-tuning: Task={task_key} | Horizons={horizons} | "
-                f"Filtered={train_data_augment} | Train FUPs={train_fups} | Valid FUPs={valid_fups}"
+                f"Starting survival fine-tuning: Group={task_key} | Tasks={task_keys} | Horizons={horizons} | "
+                f"Filtered={train_data_augment} | Train FUPs={len(train_fups)} | Valid FUPs={len(valid_fups)}"
             )
             finetune_survival_model(
                 cfg=cfg,
                 cli_args=cli_args,
                 task_key=task_key,
+                task_keys=task_keys,
                 horizons=horizons,
                 fup_train=train_fups,
                 fup_valid=valid_fups,
@@ -125,6 +153,7 @@ def finetune_survival_model(
     cfg: dict,
     cli_args: argparse.Namespace,
     task_key: str,
+    task_keys: list[str],
     horizons: list[int],
     fup_valid: list[int],
     fup_train: list[int],
@@ -134,56 +163,134 @@ def finetune_survival_model(
     finetuning_dir: Path = None,
 ):
     """
-    Fine-tune one survival model (Cox PH) on a specific endpoint outcome.
+    Fine-tune a single-task (K=1) or multi-task (K>=2) Cox PH survival Transformer.
     """
     data_root_dir = Path(cfg["data_dir"]) / cfg["data_split_type"]
     all_possible_fups = scan_all_fups(data_root_dir)
 
-    # Resolve the survival label columns (derives category endpoints later)
-    time_key, status_key, is_derived = resolve_survival_label_keys(task_key)
-    label_keys = [time_key, status_key]
+    resolved_specs = [resolve_survival_label_keys(tk) for tk in task_keys]
+    survival_pairs = [(t_col, s_col) for t_col, s_col, _ in resolved_specs]
+    label_keys = [col for t_col, s_col in survival_pairs for col in (t_col, s_col)]
 
-    # Load raw dataset and metadata (survival columns travel as any other label_*)
-    undersampling_balancing = cfg.get("undersampling_balancing_label", None)
-    if undersampling_balancing == "status":
-        undersampling_balancing = status_key
+    ft_cfg = cfg["finetuner"].copy()
+    loss_name = str(ft_cfg.pop("loss_name", "surv_ehr")).lower()
+    loss_args = dict(ft_cfg.pop("loss_args", {}) or {})
+    is_pc_hazard = loss_name in ("surv_ehr", "pc_hazard", "neural_cif")
+
+    # Load FULL unfiltered survival splits first (`target_undersampling_ratio=None`) so we:
+    #   1) compute exact population empirical log-hazard priors on the full training split, and
+    #   2) apply exact Horvitz-Thompson inverse-probability per-FUP undersampling wrt `max(horizons)`.
     dataset, _, vocab = load_hf_data_and_metadata(
         data_dir=data_root_dir,
         fup_train=fup_train,
         fup_valid=all_possible_fups,
         fup_test=all_possible_fups,
         label_keys=label_keys,
-        target_undersampling_ratio=cfg.get("target_undersampling_ratio", None),
-        undersampling_balancing_label=undersampling_balancing,
+        target_undersampling_ratio=None,
+        undersampling_balancing_label=None,
         drop_unlabeled=cfg.get("drop_unlabeled", False),
         time_mapping=cfg["data_collator"]["time_mapping"],
         eav_mappings=cfg["data_collator"]["eav_mappings"],
     )
 
-    # Derive category-level survival labels (bacteria/virus/fungi) if necessary
     for split in dataset.keys():
-        if is_derived and status_key not in dataset[split].column_names:
-            dataset[split] = derive_category_survival_labels(dataset[split], task_key)
+        for tk, (_, s_col, is_derived) in zip(task_keys, resolved_specs):
+            if is_derived and s_col not in dataset[split].column_names:
+                dataset[split] = derive_category_survival_labels(dataset[split], tk)
 
-    # Prepare split identification flags across arrays
+    # Keep rows where at least one task carries a valid, informative survival label
+    for split in dataset.keys():
+        n_before = len(dataset[split])
+        any_keep = np.zeros(n_before, dtype=bool)
+        ev_summary = []
+        for tk, (t_col, s_col, _) in zip(task_keys, resolved_specs):
+            t_arr = np.asarray(dataset[split].data.column(t_col))
+            s_arr = np.asarray(dataset[split].data.column(s_col))
+            km = survival_keep_mask(t_arr, s_arr)
+            any_keep |= km
+            ev_summary.append(f"{tk}:{int((s_arr[km] == 1).sum())}")
+        if not any_keep.all():
+            dataset[split] = dataset[split].select(np.where(any_keep)[0], keep_in_memory=True).flatten_indices(keep_in_memory=True)
+        print(
+            f"[{split}] survival rows kept: {int(any_keep.sum())}/{n_before} "
+            f"(events -> {', '.join(ev_summary)})",
+            flush=True,
+        )
+
+    time_grid = None
+    empirical_log_hazards = None
+    if is_pc_hazard:
+        max_time_cfg = loss_args.pop("max_time", None)
+        time_grid = build_survival_time_grid(horizons=horizons, max_time=max_time_cfg)
+        tr_ds_full = dataset["train"]
+        tr_times_full = np.stack([np.asarray(tr_ds_full.data.column(t_c)) for t_c, _ in survival_pairs], axis=1)
+        tr_stats_full = np.stack([np.asarray(tr_ds_full.data.column(s_c)) for _, s_c in survival_pairs], axis=1)
+        tr_fups_full = np.asarray(tr_ds_full.data.column("fup"))
+        empirical_log_hazards = compute_empirical_log_hazard_priors(
+            times_2d=tr_times_full,
+            statuses_2d=tr_stats_full,
+            fups_1d=tr_fups_full,
+            time_grid=time_grid,
+        )
+        print(
+            f">>> [SurvivEHR] Built {len(time_grid)-1}-interval time grid {time_grid} "
+            f"and empirical ({len(task_keys)}x5x{len(time_grid)-1}) log-hazard priors from {len(tr_ds_full)} train rows.",
+            flush=True,
+        )
+
+        # Horvitz-Thompson per-FUP importance-weighted undersampling on train split:
+        # keeps 100% of rows with ANY observed event within `max(horizons)` (`w = 1.0`),
+        # and subsamples remaining rows at `target_undersampling_ratio` with `w = N_rest / n_kept`.
+        us_ratio = cfg.get("target_undersampling_ratio", None)
+        if us_ratio is not None and float(us_ratio) > 0.0:
+            max_h_case = float(max(horizons))
+            is_acute_case = ((tr_stats_full == 1) & (tr_times_full >= 0) & (tr_times_full <= max_h_case)).any(axis=1)
+            rng = np.random.default_rng(int(ft_cfg.get("seed", 1234)))
+            order = np.argsort(tr_fups_full, kind="mergesort")
+            uniq_fups, split_pts = np.unique(tr_fups_full[order], return_index=True)
+            kept_idx_list, kept_ipw_list = [], []
+            for grp in np.split(order, split_pts[1:]):
+                pos_g = grp[is_acute_case[grp]]
+                rest_g = grp[~is_acute_case[grp]]
+                n_pos = len(pos_g)
+                keep_rest_n = int(round(max(1, n_pos) * float(us_ratio)))
+                if len(rest_g) > keep_rest_n and keep_rest_n > 0:
+                    chosen_rest = rng.choice(rest_g, size=keep_rest_n, replace=False)
+                    w_rest = float(len(rest_g)) / float(keep_rest_n)
+                else:
+                    chosen_rest = rest_g
+                    w_rest = 1.0
+                merged_g = np.concatenate([pos_g, chosen_rest])
+                merged_w = np.concatenate([np.ones(len(pos_g), dtype=np.float32), np.full(len(chosen_rest), w_rest, dtype=np.float32)])
+                perm = rng.permutation(len(merged_g))
+                kept_idx_list.append(merged_g[perm])
+                kept_ipw_list.append(merged_w[perm])
+            final_tr_idx = np.concatenate(kept_idx_list)
+            final_tr_ipw = np.concatenate(kept_ipw_list)
+            n_full_tr = len(dataset["train"])
+            dataset["train"] = (
+                dataset["train"]
+                .select(final_tr_idx, keep_in_memory=True)
+                .flatten_indices(keep_in_memory=True)
+                .add_column("ipw_weight", final_tr_ipw.tolist())
+            )
+            print(
+                f">>> [SurvivEHR IPW] Per-FUP undersampling (ratio={us_ratio}, horizon<={int(max_h_case)}d): "
+                f"kept {len(dataset['train'])}/{n_full_tr} train rows "
+                f"(mean IPW={float(final_tr_ipw.mean()):.2f}, max IPW={float(final_tr_ipw.max()):.2f})",
+                flush=True,
+            )
+
+    teav_cols = [*list(cfg["data_collator"]["eav_mappings"].keys()), "value_num", list(cfg["data_collator"]["time_mapping"].keys())[0]]
     for split in dataset.keys():
         col_vals = [split] * len(dataset[split])
         dataset[split] = dataset[split].add_column("split", col_vals)
+        keep_cols = [
+            c for c in [*teav_cols, *label_keys, "patientid", "fup", "ipw_weight", "split"]
+            if c in dataset[split].column_names
+        ]
+        dataset[split].set_format(type="numpy", columns=keep_cols)
 
-    # Filter out rows with unknown or zero-information survival labels
-    for split in dataset.keys():
-        times = np.asarray(dataset[split][time_key])
-        statuses = np.asarray(dataset[split][status_key])
-        keep_mask = survival_keep_mask(times, statuses)
-        dataset[split] = dataset[split].select(np.where(keep_mask)[0], keep_in_memory=True)
-        print(
-            f"[{split}] survival rows kept: {keep_mask.sum()}/{len(keep_mask)} "
-            f"({int((statuses[keep_mask] == 1).sum())} events)"
-        )
-
-    # Prepare datasets used for training and runtime evaluation.
-    # During training we only score the validation FUPs configured in `fup_valid`
-    # (~7x faster mid-training evaluations while matching `_fuv(...)`).
     train_dataset = dataset["train"]
     val_eval_ds = dataset["validation"]
     if fup_valid:
@@ -192,28 +299,48 @@ def finetune_survival_model(
         if len(val_idx) > 0:
             val_eval_ds = val_eval_ds.select(val_idx, keep_in_memory=True)
     eval_datasets = {"all": val_eval_ds}
+    eval_fups = np.asarray(val_eval_ds.data.column("fup"))
 
-    # Auto-detect model sub-directory and best pre-trained model checkpoint
-    resolved_ckpt = resolve_best_checkpoint(pretrained_dir)
-    if resolved_ckpt is None:
-        sys.exit(f"Error: No valid pre-trained checkpoint found in {pretrained_dir}")
-    pretrained_last_ckpt_dir = str(resolved_ckpt)
+    fmt_fn = lambda x: "-".join(f"{i:04d}" for i in sorted(([x] if isinstance(x, int) else x or [])))
+    fut_str = fmt_fn(fup_train) if train_data_augment == "none" else train_data_augment
+    fuv_str = fmt_fn(fup_valid)
+    hrz_str = fmt_fn(horizons)
+    task_subdir = f"hrz({hrz_str})_fut({fut_str})_fuv({fuv_str})"
+    run_subdir = str(Path(task_key) / task_subdir)
+    output_dir_path = finetuning_dir / run_subdir
 
-    # Set up model configuration: single logit head = log hazard ratio
+    if cli_args.eval_only:
+        resolved_ckpt = resolve_best_checkpoint(output_dir_path)
+        if resolved_ckpt is None:
+            sys.exit(f"Error: --eval-only found no fine-tuned checkpoint inside {output_dir_path}")
+        init_ckpt_dir = str(resolved_ckpt)
+    else:
+        resolved_ckpt = resolve_best_checkpoint(pretrained_dir)
+        if resolved_ckpt is None:
+            sys.exit(f"Error: No valid pre-trained checkpoint found in {pretrained_dir}")
+        init_ckpt_dir = str(resolved_ckpt)
+
+    num_heads = len(task_keys)
     model_cfg = cfg["model"].copy()
-    model_cfg["pretrained_dir"] = pretrained_last_ckpt_dir
+    model_cfg["pretrained_dir"] = init_ckpt_dir
+    model_cfg["embedding_layer_config"] = dict(model_cfg["embedding_layer_config"])
     model_cfg["embedding_layer_config"]["vocab_size"] = len(vocab)
-    model_cfg["reset_weights"] = cli_args.reset_weights
+    model_cfg["reset_weights"] = cli_args.reset_weights and (not cli_args.eval_only)
     model_cfg["enforce_monotonicity"] = False
     model_cfg["task"] = "survival"
-    model_cfg["model_args"]["num_labels"] = 1
+    model_cfg["model_args"] = dict(model_cfg.get("model_args", {}))
+    model_cfg["model_args"]["num_labels"] = num_heads
     model_cfg["model_args"]["problem_type"] = "regression"
+    if is_pc_hazard:
+        model_cfg["survival_head_config"] = {
+            "num_tasks": num_heads,
+            "time_grid": time_grid,
+            "empirical_log_hazards": empirical_log_hazards,
+        }
 
-    # Initialize model
     model = PatientEmbeddingModelFactory.from_pretrained(**model_cfg)
     max_pos_embeddings = model.config.max_position_embeddings
 
-    # Inject LoRA, if required
     if cfg.get("use_lora", False):
         peft_conf = cfg.get("lora_config", {})
         peft_config = LoraConfig(**peft_conf)
@@ -221,39 +348,65 @@ def finetune_survival_model(
         print(">>> LoRA Enabled. Trainable parameters:")
         model.print_trainable_parameters()
 
-    # Custom data collator: labels = [time, status] per patient
     collator_cfg = cfg["data_collator"].copy()
     collator_cfg.pop("mlm_label_keys", None)
     collator_cfg.pop("mlm_masking_rules", None)
-    ft_collator = PatientDataCollatorForSurvival(
-        **collator_cfg,
-        time_label=time_key,
-        status_label=status_key,
-        max_position_embeddings=max_pos_embeddings,
-    )
+    if "use_numerical_embedding" not in collator_cfg:
+        collator_cfg["use_numerical_embedding"] = bool(model_cfg["embedding_layer_config"].get("use_numerical_embedding", True))
+    if num_heads == 1:
+        ft_collator = PatientDataCollatorForSurvival(
+            **collator_cfg,
+            time_label=survival_pairs[0][0],
+            status_label=survival_pairs[0][1],
+            max_position_embeddings=max_pos_embeddings,
+        )
+    else:
+        ft_collator = PatientDataCollatorForSurvival(
+            **collator_cfg,
+            survival_label_pairs=survival_pairs,
+            max_position_embeddings=max_pos_embeddings,
+        )
 
-    # Evaluation pipeline (C-index, horizon-wise AUROC/AP/IPCW-Brier)
-    ft_cfg = cfg["finetuner"].copy()
-    patience = ft_cfg.pop("early_stopping_patience", 10)
+    patience = ft_cfg.pop("early_stopping_patience", 7)
     callbacks = [EarlyStoppingCallback(early_stopping_patience=patience)]
     evaluator = CustomEvaluator(
         horizons=horizons,
-        early_stopping_metric=cfg["early_stopping_metric"],
+        task_keys=(task_keys if num_heads > 1 else None),
+        eval_fups=eval_fups,
+        early_stopping_metric=cfg.get("early_stopping_metric", "roc_auc"),
+        early_stopping_mean=cfg.get("early_stopping_mean", "random_effects"),
+        time_grid=time_grid,
     )
 
-    # Survival loss (Cox NLL partial likelihood)
-    loss_name = ft_cfg.pop("loss_name", "cox")
-    loss_args = ft_cfg.pop("loss_args", {}) or {}  # kwargs for CoxNLLLoss, see config
+    if is_pc_hazard:
+        loss_args["time_grid"] = time_grid
+        loss_args["horizons"] = horizons
     loss_func = make_survival_loss_func(loss_name, loss_args)
 
-    # Training arguments, with the correct output directory
-    fmt_fn = lambda x: "-".join(f"{i:04d}" for i in sorted(([x] if isinstance(x, int) else x or [])))
-    fut_str = fmt_fn(fup_train) if train_data_augment == "none" else train_data_augment
-    fuv_str = fmt_fn(fup_valid)
-    hrz_str = fmt_fn(horizons)
-    task_subdir = f"hrz({hrz_str})_fut({fut_str})_fuv({fuv_str})"
-    run_subdir = str(Path(task_key) / task_subdir)
-    ft_cfg["output_dir"] = str(finetuning_dir / run_subdir)
+    ft_cfg["output_dir"] = str(output_dir_path)
+    if not cli_args.eval_only:
+        for old_ckpt in output_dir_path.glob("checkpoint-*"):
+            shutil.rmtree(old_ckpt, ignore_errors=True)
+    output_dir_path.mkdir(parents=True, exist_ok=True)
+    head_pairs = [[t, int(h)] for t in task_keys for h in horizons]
+    with open(output_dir_path / "run_metadata.json", "w") as f:
+        json.dump(
+            {
+                "task_key": task_key,
+                "tasks": list(task_keys),
+                "horizons": list(horizons),
+                "task_horizons": {t: list(horizons) for t in task_keys},
+                "head_pairs": head_pairs,
+                "label_keys": label_keys,
+                "objective": loss_name,
+                "time_grid": time_grid,
+                "num_survival_tasks": num_heads,
+                "value_embedding": get_value_embedding_tag(cfg),
+                "use_numerical_embedding": bool(collator_cfg["use_numerical_embedding"]),
+            },
+            f, indent=2,
+        )
+
     if cli_args.silent:
         ft_cfg["report_to"] = "none"
     if not torch.cuda.is_available():
@@ -262,14 +415,12 @@ def finetune_survival_model(
         ft_cfg["use_cpu"] = True
     ft_args = TrainingArguments(**ft_cfg)
 
-    # Re-initialize a wandb run within the same workspace
     use_wandb = (not cli_args.silent) and (cfg.get("finetuner", {}).get("report_to") == "wandb")
     if use_wandb:
         workspace = Path(__file__).stem
         run_name = f"{run_id}_{run_subdir}"
         wandb.init(project=workspace, name=run_name, config=cfg)
 
-    # Trainer (standard HuggingFace, prefix-aware for multi-FUP evaluation)
     trainer = PrefixAwareTrainer(
         model=model,
         train_dataset=train_dataset,
@@ -283,18 +434,16 @@ def finetune_survival_model(
     )
     trainer.remove_callback(PrinterCallback)
 
-    # Fine-tune the model
-    trainer.train()
+    if not cli_args.eval_only:
+        trainer.train()
 
-    # Post-hoc evaluation over ALL un-truncated elements
     test_survival_model(
         trainer=trainer,
-        dataset_dict=dataset,  # Contains the full, filtered data splits
+        dataset_dict=dataset,
         all_possible_fups=all_possible_fups,
-        output_dir=Path(ft_cfg["output_dir"]),
+        output_dir=output_dir_path,
     )
 
-    # Reset wandb and clean up CUDA memory for the next run
     if use_wandb:
         wandb.finish()
     del dataset, model, trainer
@@ -311,12 +460,23 @@ def test_survival_model(
 ):
     """
     Post-training evaluation across ALL discovered FUP time-steps, on both the
-    validation and test splits. Uses a SINGLE GPU forward pass per split (`mega_ds`)
-    and slices logits/labels per FUP on CPU, matching `train_classification.test_model`.
+    validation and test splits. Uses a SINGLE GPU forward pass per split (`mega_ds`),
+    fits validation clinical-window/global Breslow priors before per-FUP validation
+    scoring, and freezes validation baselines on the test split.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     trainer.remove_callback(EarlyStoppingCallback)
+
+    meta_tasks = None
+    meta_head_pairs = None
+    meta_path = output_dir / "run_metadata.json"
+    if meta_path.exists():
+        meta_obj = json.loads(meta_path.read_text())
+        if len(meta_obj.get("tasks") or []) > 1:
+            meta_tasks = list(meta_obj["tasks"])
+            if meta_obj.get("head_pairs"):
+                meta_head_pairs = [(str(t), int(h)) for t, h in meta_obj["head_pairs"]]
 
     split_configs = []
     if "validation" in dataset_dict:
@@ -336,8 +496,6 @@ def test_survival_model(
         split_label = config["split_label"]
         mega_ds = config["dataset"]
         print(f"\n>>> Running final unified survival scoring pass over all FUPs for: [{split_label.upper()}]")
-        # Absolute test probabilities must not depend on test outcomes: reuse
-        # the per-FUP Breslow baselines fitted on the validation split above.
         trainer.compute_metrics.freeze_baseline_for_test = split_label == "test"
         final_metrics = {}
         all_predictions = {}
@@ -351,7 +509,10 @@ def test_survival_model(
         mega_pids = np.asarray(mega_ds.data.column("patientid")) if "patientid" in mega_ds.column_names else None
         trainer.compute_metrics.saved_labels_and_probs = None
 
-        # 2) Compute per-FUP metrics & Breslow survival probabilities on CPU by slicing mega_logits/mega_raw_labels
+        if split_label == "validation":
+            trainer.compute_metrics.fit_validation_priors_from_mega(mega_logits, mega_raw_labels, mega_fups)
+
+        # 2) Compute per-FUP metrics & empirical-Bayes Breslow survival probabilities on CPU
         for fup in all_possible_fups:
             idx = np.where(mega_fups == fup)[0]
             if len(idx) == 0:
@@ -380,8 +541,7 @@ def test_survival_model(
                 all_predictions[f"{prefix}_{key}"] = array
 
             if mega_pids is not None:
-                valid_mask = (fup_labels[:, 0] != -100) & (fup_labels[:, 1] != -100)
-                patient_ids = mega_pids[idx][valid_mask]
+                patient_ids = mega_pids[idx]
                 n_scored = len(trainer.compute_metrics.saved_labels_and_probs["labels"])
                 if len(patient_ids) == n_scored:
                     all_predictions[f"{prefix}_patientid"] = patient_ids
@@ -392,7 +552,6 @@ def test_survival_model(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # Write metrics to disk (predictions go to the tidy CSV below)
         with open(output_dir / config["json_name"], "w") as f:
             json.dump(final_metrics, f, indent=4)
         print(f"    [SUCCESS] Saved {split_label} stats under: {output_dir}")
@@ -403,6 +562,8 @@ def test_survival_model(
             horizons=extract_horizons_from_path(output_dir),
             output_dir=output_dir,
             csv_name=f"{split_label}_predictions.csv",
+            task_keys=meta_tasks,
+            head_pairs=meta_head_pairs,
         )
 
         print(f"    [SUCCESS] Saved {split_label} arrays and stats under: {output_dir}")

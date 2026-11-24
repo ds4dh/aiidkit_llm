@@ -34,6 +34,7 @@ from scripts.script_utils import (
     extract_horizons_from_path,
     format_pretrain_run_id,
     get_value_embedding_tag,
+    resolve_run_id_with_val_tag,
 )
 
 
@@ -48,7 +49,7 @@ def parse_args():
                         help="Skip training, load existing fine-tuned checkpoint from output_dir, and run full test_model + plots.")
     parser.add_argument("--silent", "-s", action="store_true", help="Disable wandb logging.")
     parser.add_argument("--optuna-json", "-J", action="append", default=[],
-                        help="Path(s) to best_{pretrain,finetune}_config.json written by train_optuna.py (applies portable_overrides before --overrides).")
+                        help="Path(s) to best_finetune_config.json written by train_optuna.py (applies portable_overrides before --overrides).")
     parser.add_argument("--overrides", "-o", action="append", default=[], help="Overrides config (JSON string or key=value).")
     parser.add_argument("--tasks", "-t", nargs="*", default=[],
                         help="Comma-separated prediction_tasks keys to run (default: all active entries in the config). "
@@ -91,9 +92,19 @@ def main():
     train_data_augment = cfg.get("train_data_augment", "all")
     pretrain_run_id = format_pretrain_run_id(cfg)
     val_tag = get_value_embedding_tag(cfg)
-    finetune_run_id = pretrain_run_id if not cli_args.reset_weights else f"no_pretrain_{val_tag}"
+    if cli_args.reset_weights:
+        finetune_run_id = f"no_pretrain_{val_tag}"
+    elif cfg.get("finetune_run_id"):
+        finetune_run_id = resolve_run_id_with_val_tag(str(cfg["finetune_run_id"]), val_tag)
+    else:
+        finetune_run_id = pretrain_run_id
     result_dir = Path(cfg["result_dir"]) / cfg["data_split_type"]
     pretrained_dir = result_dir / pretrain_run_id / "pretraining"
+    if finetune_run_id != pretrain_run_id and pretrained_dir.exists():
+        pt_alias = result_dir / finetune_run_id / "pretraining"
+        pt_alias.parent.mkdir(parents=True, exist_ok=True)
+        if not pt_alias.exists() and not pt_alias.is_symlink():
+            pt_alias.symlink_to(pretrained_dir.resolve(), target_is_directory=True)
     finetuning_subdir = cfg["finetuner"].pop("ft_subdir", "finetuning")
     finetuning_dir = result_dir / finetune_run_id / finetuning_subdir
 

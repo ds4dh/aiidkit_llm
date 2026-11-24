@@ -196,6 +196,18 @@ MODEL_REGISTRY = {
         multitask_scope="domain",
         results_subdir="transformer",
     ),
+    "tf_opt_mt": dict(
+        path_template=f"transformer/{{split}}/optuna_ft_raw/finetuning/multitask_bacteria/hrz(0030-0060-0090)_fut(all)_fuv({_DEFAULT_FUV_TAG})",
+        display="TFOM",
+        folder_tag="tf_opt_mt",
+        full="t-EAV-Transformer (Optuna-FT)",
+        calibrated=True,
+        val_tag="raw",
+        multitask=True,
+        multitask_scope="domain",
+        results_subdir="transformer",
+        run_id_override="optuna_ft",
+    ),
     "tf_raw_unified": dict(
         path_template=f"transformer/{{split}}/{{run_id}}_raw/finetuning/multitask_unified/hrz(0030-0060-0090-0180-0360-0720-1800)_fut(all)_fuv({_DEFAULT_FUV_TAG})",
         display="TFRU",
@@ -336,12 +348,24 @@ MODEL_REGISTRY = {
         multitask_scope="unified",
         results_subdir="generative_transformer",
     ),
+    "tf_surv_mt": dict(
+        path_template=f"survival_transformer/{{split}}/optuna_ft_raw/finetuning/multitask_bacteria/hrz(0030-0060-0090)_fut(all)_fuv({_DEFAULT_FUV_TAG})",
+        display="TFSM",
+        folder_tag="tf_surv_mt",
+        full="t-EAV-Transformer (Cox Survival)",
+        calibrated=True,
+        val_tag="raw",
+        multitask=True,
+        multitask_scope="domain",
+        results_subdir="survival_transformer",
+        run_id_override="optuna_ft",
+    ),
     "survival_transformer": dict(
-        path_template=f"survival_transformer/{{split}}/{{run_id}}_raw/finetuning/{{task}}/hrz(0030-0060-0090-0180-0360-0720-1800)_fut(all)_fuv({_DEFAULT_FUV_TAG})",
+        path_template=f"survival_transformer/{{split}}/{{run_id}}_raw/finetuning/{{task}}/hrz(0030-0060-0090)_fut(all)_fuv({_DEFAULT_FUV_TAG})",
         display="SURV",
         folder_tag="surv",
         full="t-EAV-Transformer (Cox)",
-        calibrated=False,
+        calibrated=True,
         val_tag="raw",
         multitask=False,
         results_subdir="survival_transformer",
@@ -510,23 +534,24 @@ MAIN_METRIC_MAPPING = [
 # Cache logic (some computations are long)
 # ================================================================================
 
-CACHE_SCHEMA_VERSION = 7
+CACHE_SCHEMA_VERSION = 8
 
 def _predictions_csv(model: str, split: str, task: str, dataset_split: str, horizon: int) -> Path:
     """Resolve the exact CSV path for one model/split/task/horizon."""
-    rel = MODEL_ENTRIES[model]["path_template"].format(
-        split=split, run_id=MODEL_RUN_ID, task=task, model=model, horizon=horizon,
+    entry = MODEL_ENTRIES[model]
+    eff_run_id = entry.get("run_id_override", MODEL_RUN_ID)
+    rel = entry["path_template"].format(
+        split=split, run_id=eff_run_id, task=task, model=model, horizon=horizon,
     )
     cand = RESULTS_DIR / rel / f"{dataset_split}_predictions.csv"
     if not cand.exists() and (task.startswith("infection_grp_") or task.startswith("grp_")):
         alt_task = task.replace("infection_grp_", "grp_", 1) if task.startswith("infection_grp_") else f"infection_{task}"
-        alt_rel = MODEL_ENTRIES[model]["path_template"].format(
-            split=split, run_id=MODEL_RUN_ID, task=alt_task, model=model, horizon=horizon,
+        alt_rel = entry["path_template"].format(
+            split=split, run_id=eff_run_id, task=alt_task, model=model, horizon=horizon,
         )
         alt_cand = RESULTS_DIR / alt_rel / f"{dataset_split}_predictions.csv"
         if alt_cand.exists():
             return alt_cand
-    entry = MODEL_ENTRIES[model]
     is_tf_single = ("val_tag" in entry and not entry.get("multitask", False))
     is_tf_multi = ("val_tag" in entry and entry.get("multitask", False))
     if is_tf_single and cand.exists():
@@ -538,7 +563,7 @@ def _predictions_csv(model: str, split: str, task: str, dataset_split: str, hori
         valid_cands = []
         if is_tf_single and cand.exists():
             valid_cands.append(cand)
-        ft_root = RESULTS_DIR / results_subdir / split / f"{MODEL_RUN_ID}_{val_tag}" / "finetuning"
+        ft_root = RESULTS_DIR / results_subdir / split / f"{eff_run_id}_{val_tag}" / "finetuning"
         if ft_root.exists():
             for meta_file in sorted(ft_root.glob("*/*/run_metadata.json")):
                 if "_fut(" in meta_file.parent.name and "_fut(all)_" not in meta_file.parent.name:
@@ -878,9 +903,6 @@ def build_report_layout_and_mapping():
         row_cleaning_map[key_head] = key_head
 
         sub_metrics = [
-            (f"  ROC-AUC winner ({disp})", "  Statistical winner (ROC-AUC)"),
-            (f"  Threshold-free ROC-AUC p-value ({disp})", f"  ROC-AUC cluster-bootstrap p-value ({PROPOSED_DISP} vs {disp})"),
-            (f"  Threshold-free ROC-AUC q-value ({disp})", f"  ROC-AUC cluster-bootstrap FDR q-value ({PROPOSED_DISP} vs {disp})"),
             (f"  PR-AUC winner ({disp})", "  Statistical winner (PR-AUC)"),
             (f"  Threshold-free PR-AUC p-value ({disp})", f"  PR-AUC cluster-bootstrap p-value ({PROPOSED_DISP} vs {disp})"),
             (f"  Threshold-free PR-AUC q-value ({disp})", f"  PR-AUC cluster-bootstrap FDR q-value ({PROPOSED_DISP} vs {disp})"),
@@ -908,10 +930,9 @@ def build_report_layout_and_mapping():
 
 def fdr_and_reports(results, outdir, split, hs):
     """Apply Benjamini-Hochberg FDR separately within each statistical test family
-    (`ROC-AUC`, `PR-AUC`, `McNemar`) and export detailed + main summary CSV reports.
+    (`PR-AUC`, `McNemar`) and export detailed + main summary CSV reports.
     """
     test_fields = (
-        ("ROC-AUC", "  Threshold-free ROC-AUC p-value ({disp})"),
         ("PR-AUC", "  Threshold-free PR-AUC p-value ({disp})"),
         ("McNemar", "  McNemar p-value ({disp})"),
     )
@@ -957,7 +978,6 @@ def fdr_and_reports(results, outdir, split, hs):
                 disp = MODEL_DISPLAY_MAP[model]
                 main_win_record[f"  {disp}_{head_lbl}"] = record.get(f"  {head_lbl} ({disp})", "")
 
-        main_win_record["ROC-AUC bootstrap statistical winner and p-value"] = ""
         main_win_record["PR-AUC bootstrap statistical winner and p-value"] = ""
         main_win_record["McNemar statistical winner and p-value"] = ""
 
@@ -965,7 +985,6 @@ def fdr_and_reports(results, outdir, split, hs):
             disp = MODEL_DISPLAY_MAP[m]
 
             for test_key, w_field, q_field in (
-                ("ROC-AUC", f"  ROC-AUC winner ({disp})", f"  Threshold-free ROC-AUC q-value ({disp})"),
                 ("PR-AUC", f"  PR-AUC winner ({disp})", f"  Threshold-free PR-AUC q-value ({disp})"),
                 ("McNemar", f"  McNemar winner ({disp})", f"  McNemar q-value ({disp})"),
             ):
@@ -992,7 +1011,6 @@ def fdr_and_reports(results, outdir, split, hs):
         for model in MODEL_PLOT_ORDER:
             main_rows_order.append(f"  {MODEL_DISPLAY_MAP[model]}_{head_lbl}")
     for hdr, tkey in (
-        ("ROC-AUC bootstrap statistical winner and p-value", "ROC-AUC"),
         ("PR-AUC bootstrap statistical winner and p-value", "PR-AUC"),
         ("McNemar statistical winner and p-value", "McNemar"),
     ):
@@ -1015,7 +1033,7 @@ def fdr_and_reports(results, outdir, split, hs):
                     "winner": results[window_name].get(f"  {tkey} winner ({disp})", "Tie"),
                     "q_value": q_map.get((window_name, disp, tkey)),
                 }
-                for tkey in ("ROC-AUC", "PR-AUC", "McNemar")
+                for tkey in ("PR-AUC", "McNemar")
             }
 
     return df_main, df_detailed, winners
@@ -1192,17 +1210,12 @@ def process(task, split, horizon, outdir):
 
         for m in CONTENDER_MODELS:
             disp = MODEL_DISPLAY_MAP[m]
-            # 1) Primary threshold-free ROC-AUC paired patient-cluster bootstrap test
-            p_roc = _two_sided_paired_boot_pvalue(model_boots[PROPOSED_MODEL]["ROC-AUC"], model_boots[m]["ROC-AUC"])
-            tf_roc, b_roc = model_points[PROPOSED_MODEL]["ROC-AUC"], model_points[m]["ROC-AUC"]
-            roc_winner = "NaN" if pd.isna(p_roc) else ("Tie" if (p_roc >= 0.05 or tf_roc == b_roc) else (PROPOSED_DISP if tf_roc > b_roc else disp))
-
-            # 2) Threshold-free PR-AUC paired patient-cluster bootstrap test
+            # 1) Threshold-free PR-AUC paired patient-cluster bootstrap test
             p_pr = _two_sided_paired_boot_pvalue(model_boots[PROPOSED_MODEL]["PR-AUC"], model_boots[m]["PR-AUC"])
             tf_pr, b_pr = model_points[PROPOSED_MODEL]["PR-AUC"], model_points[m]["PR-AUC"]
             pr_winner = "NaN" if pd.isna(p_pr) else ("Tie" if (p_pr >= 0.05 or tf_pr == b_pr) else (PROPOSED_DISP if tf_pr > b_pr else disp))
 
-            # 3) Threshold-based Clustered McNemar test (evaluated at per-horizon 80%-recall thresholds)
+            # 2) Threshold-based Clustered McNemar test (evaluated at per-horizon 80%-recall thresholds)
             tfc = sub[f"y_pred_{PROPOSED_MODEL}"].to_numpy() == y_stack
             bc = sub[f"y_pred_{m}"].to_numpy() == y_stack
             n10 = int(np.sum(tfc & ~bc))
@@ -1215,8 +1228,6 @@ def process(task, split, horizon, outdir):
                 mcn_winner = "NaN"
 
             rec[f"{PROPOSED_DISP} vs {disp}"] = ""
-            rec[f"  Threshold-free ROC-AUC p-value ({disp})"] = f"{p_roc:.3e}" if not pd.isna(p_roc) else "NaN"
-            rec[f"  ROC-AUC winner ({disp})"] = roc_winner
             rec[f"  Threshold-free PR-AUC p-value ({disp})"] = f"{p_pr:.3e}" if not pd.isna(p_pr) else "NaN"
             rec[f"  PR-AUC winner ({disp})"] = pr_winner
             rec[f"  Discordant pairs ({PROPOSED_DISP} correct) ({disp})"] = n10
@@ -1271,7 +1282,7 @@ def process(task, split, horizon, outdir):
     for w_name in CLINICAL_WINDOWS:
         for m in CONTENDER_MODELS:
             disp = MODEL_DISPLAY_MAP[m]
-            for tkey in ("ROC-AUC", "PR-AUC", "McNemar"):
+            for tkey in ("PR-AUC", "McNemar"):
                 payload[f"{w_name}_{disp}_{tkey}_winner"] = winners.get(w_name, {}).get(disp, {}).get(tkey, {}).get("winner", "Tie")
 
     payload["__schema_version__"] = np.array(CACHE_SCHEMA_VERSION)
@@ -1301,7 +1312,7 @@ def _nice_pr_axis(max_val: float) -> tuple[tuple[float, float], np.ndarray]:
 
 
 def render_bars(task, horizon, outdir, hs, csv_summaries_in_memory=None):
-    """Render grouped bar charts (rows 1-4) + threshold-free statistical test matrix rows (ROC-AUC & PR-AUC)."""
+    """Render grouped bar charts (rows 1-4) + statistical test matrix rows (PR-AUC & McNemar)."""
     metrics_to_plot = [("ROC-AUC", "↑"), ("PR-AUC", "↑"), ("Sensitivity", "↑"), ("Specificity", "↑")]
 
     csv_summary_by_split = csv_summaries_in_memory or {}
@@ -1327,28 +1338,25 @@ def render_bars(task, horizon, outdir, hs, csv_summaries_in_memory=None):
 
     window_keys = list(CLINICAL_WINDOWS.keys())
 
-    # Compute dynamic, unclipped ROC-AUC floor and PR-AUC ceiling across all splits/windows
-    roc_lows, pr_highs = [], []
+    # Compute ROC-AUC floor (default 0.4) while fixing upper y-limits to 0.9 (ROC-AUC) and 0.4 (PR-AUC)
+    roc_lows = []
     for s in active_splits:
         cd = npz_data_by_split.get(s, {})
         for w in window_keys:
             for m in MODEL_PLOT_ORDER:
                 if f"{w}_{m}_ROC-AUC_low" in cd:
                     roc_lows.append(float(cd[f"{w}_{m}_ROC-AUC_low"]))
-                if f"{w}_{m}_PR-AUC_high" in cd:
-                    pr_highs.append(float(cd[f"{w}_{m}_PR-AUC_high"]))
     roc_floor = min(0.4, max(0.0, np.floor(min(roc_lows) * 10.0) / 10.0)) if roc_lows else 0.4
-    pr_ylim, pr_yticks = _nice_pr_axis(max(pr_highs) if pr_highs else 0.30)
 
     metric_ylim_map = {
-        "ROC-AUC": (roc_floor, 1.02),
-        "PR-AUC": pr_ylim,
+        "ROC-AUC": (roc_floor, 0.9),
+        "PR-AUC": (0.0, 0.4),
         "Sensitivity": (0.0, 1.02),
         "Specificity": (0.0, 1.02),
     }
     metric_yticks_map = {
-        "ROC-AUC": np.round(np.arange(roc_floor, 1.05, 0.1), 2),
-        "PR-AUC": pr_yticks,
+        "ROC-AUC": np.round(np.arange(roc_floor, 0.95, 0.1), 2),
+        "PR-AUC": np.round(np.arange(0.0, 0.45, 0.1), 2),
         "Sensitivity": np.arange(0.0, 1.1, 0.2),
         "Specificity": np.arange(0.0, 1.1, 0.2),
     }
@@ -1446,7 +1454,7 @@ def render_bars(task, horizon, outdir, hs, csv_summaries_in_memory=None):
                 ax.tick_params(axis="y", left=False, labelleft=False, which="both")
                 ax.tick_params(axis="x", length=6, width=1.0)
 
-    test_rows_info = [("ROC-AUC test", "ROC-AUC"), ("PR-AUC test", "PR-AUC")]
+    test_rows_info = [("PR-AUC test", "PR-AUC"), ("McNemar test", "McNemar")]
     sub_baselines = [MODEL_DISPLAY_MAP[m] for m in CONTENDER_MODELS]
     y_positions = [0.0] if len(sub_baselines) <= 1 else list(np.linspace(0.65, -0.65, len(sub_baselines)))
 

@@ -86,7 +86,8 @@ def get_tf_multi_folder_horizon_metrics(
 
 
 MODEL_COLUMNS = [
-    ("B_CAT_MT",   lambda r, s, run_id, t, hs, es, m: get_tf_horizon_metrics(r, "transformer", s, run_id, _category_folder(t), t, hs, es, m)),
+    ("TF_OPT_MT",  lambda r, s, run_id, t, hs, es, m: get_tf_horizon_metrics(r, "transformer", s, "optuna_ft", _category_folder(t), t, hs, es, m)),
+    ("TF_SURV_MT", lambda r, s, run_id, t, hs, es, m: get_tf_horizon_metrics(r, "survival_transformer", s, "optuna_ft", _category_folder(t), t, hs, es, m)),
     ("LR",         lambda r, s, run_id, t, hs, es, m: get_cml_horizon_metrics(r, "logistic_regression", s, t, hs, es, m)),
     ("RF",         lambda r, s, run_id, t, hs, es, m: get_cml_horizon_metrics(r, "random_forest", s, t, hs, es, m)),
     ("XGB",        lambda r, s, run_id, t, hs, es, m: get_cml_horizon_metrics(r, "xgboost", s, t, hs, es, m)),
