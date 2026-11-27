@@ -40,7 +40,7 @@ def _find_matching_results_json(parent_dir: Path, horizon: int, eval_split: str,
     for d in sorted(parent_dir.glob("hrz(*)*"), key=lambda p: p.stat().st_mtime_ns, reverse=True):
         if not d.is_dir() or not (d / fname).exists():
             continue
-        if require_fut_all and "_fut(" in d.name and "_fut(all)_" not in d.name:
+        if require_fut_all and "_fut(" in d.name and not any(tag in d.name for tag in ("_fut(all)_", "_fut(random)_")):
             continue
         m = re.match(r"hrz\(([0-9\-]+)\)", d.name)
         if m and tag in m.group(1).split("-"):
@@ -86,8 +86,8 @@ def get_tf_multi_folder_horizon_metrics(
 
 
 MODEL_COLUMNS = [
-    ("TF_OPT_MT",  lambda r, s, run_id, t, hs, es, m: get_tf_horizon_metrics(r, "transformer", s, "optuna_ft", _category_folder(t), t, hs, es, m)),
-    ("TF_SURV_MT", lambda r, s, run_id, t, hs, es, m: get_tf_horizon_metrics(r, "survival_transformer", s, "optuna_ft", _category_folder(t), t, hs, es, m)),
+    ("TF_MT",      lambda r, s, run_id, t, hs, es, m: get_tf_horizon_metrics(r, "transformer", s, run_id, _category_folder(t), t, hs, es, m) or get_tf_horizon_metrics(r, "transformer", s, "optuna_ft", _category_folder(t), t, hs, es, m)),
+    ("TF_SURV_MT", lambda r, s, run_id, t, hs, es, m: get_tf_horizon_metrics(r, "survival_transformer", s, run_id, _category_folder(t), t, hs, es, m) or get_tf_horizon_metrics(r, "survival_transformer", s, "optuna_ft", _category_folder(t), t, hs, es, m)),
     ("LR",         lambda r, s, run_id, t, hs, es, m: get_cml_horizon_metrics(r, "logistic_regression", s, t, hs, es, m)),
     ("RF",         lambda r, s, run_id, t, hs, es, m: get_cml_horizon_metrics(r, "random_forest", s, t, hs, es, m)),
     ("XGB",        lambda r, s, run_id, t, hs, es, m: get_cml_horizon_metrics(r, "xgboost", s, t, hs, es, m)),

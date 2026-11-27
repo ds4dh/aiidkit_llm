@@ -191,3 +191,8 @@ scoping_review/data
 scoping_review/results
 web_tool/server_bundle/
 web_tool/.env
+
+# Ad-hoc exploratory SLURM launchers & cluster handoff notes
+scripts/submit_*.sh
+scripts/summarize_*.py
+HANDOFF_*.md

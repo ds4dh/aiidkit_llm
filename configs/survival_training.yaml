@@ -2,7 +2,7 @@
 # Mirrors configs/discriminative_training.yaml, but instead of binary labels
 # per horizon, each patient provides (time, status) survival labels
 # (label_{outcome}_time / label_{outcome}_status).
-data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v3.9/teav
+data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v4.0/teav
 data_split_type: random_split  # random_split, center_split, temporal_split
 result_dir: results/survival_transformer  # base directory name for all results
 pretrain_result_dir: results/transformer  # where the MLM pretraining checkpoint lives
@@ -23,15 +23,15 @@ data_collator:
     attribute_id: 0.15
     value_id: 0.60
 
-finetune_run_id: optuna_ft
-train_data_augment: all
+finetune_run_id: e00-a15-v60
+train_data_augment: random  # "random" (per-epoch continuous daily landmarks), "all", "valid", or "none"
 target_undersampling_ratio: 15.0  # Horvitz-Thompson IPW per-FUP undersampling (keeps 100% of <=90d events, unbiased population hazard)
 undersampling_balancing_label: status
 drop_unlabeled: true
 early_stopping_metric: roc_auc
 early_stopping_mean: random_effects
 prediction_tasks:
-  # Domain-grouped 5-head multi-task Cox survival (1-to-1 architectural match with TFOM `multitask_bacteria`)
+  # Domain-grouped multi-task survival (1-to-1 architectural match with binary category-MT)
   multitask_bacteria:
     tasks: [
       infection_bacteria,
@@ -39,6 +39,22 @@ prediction_tasks:
       infection_grp_gram_positive,
       infection_grp_gn_nonfermenters,
       infection_grp_clostridium,
+    ]
+    fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600]
+    horizons: [30, 60, 90]
+  multitask_viruses:
+    tasks: [
+      infection_virus,
+      infection_grp_herpes_viruses,
+      infection_grp_cmv,
+      infection_grp_bkpyv,
+    ]
+    fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600]
+    horizons: [30, 60, 90]
+  multitask_fungi:
+    tasks: [
+      infection_fungi,
+      infection_grp_candida,
     ]
     fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600]
     horizons: [30, 60, 90]

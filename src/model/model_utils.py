@@ -288,10 +288,12 @@ class FocalLoss(nn.Module):
         self,
         inputs: torch.Tensor,
         targets: torch.Tensor,
+        sample_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         inputs: Logits [Batch, Num_Labels]
         targets: Binary Targets [Batch, Num_Labels] (float), can contain -100
+        sample_weight: Optional per-sample Horvitz-Thompson / patient weights [Batch, 1]
         """
         # Create mask for valid labels
         valid_mask = (targets != -100).float()
@@ -317,12 +319,15 @@ class FocalLoss(nn.Module):
             alpha = self.alpha.to(device=inputs.device, dtype=loss.dtype)
             loss = loss * torch.where(safe_targets > 0.5, alpha, torch.ones_like(loss))
         
-        # Apply mask to zero out contributions from invalid labels
-        loss = loss * valid_mask
+        # Apply mask (and optional unbiased sample weights)
+        eff_mask = valid_mask
+        if sample_weight is not None:
+            eff_mask = eff_mask * sample_weight.to(device=loss.device, dtype=loss.dtype)
+        loss = loss * eff_mask
 
         # Reduction
         if self.reduction == "mean":
-            return loss.sum() / valid_mask.sum().clamp(min=1e-6)
+            return loss.sum() / eff_mask.sum().clamp(min=1e-6)
         elif self.reduction == "sum":
             return loss.sum()
         
@@ -353,6 +358,7 @@ class WeightedCELoss(nn.Module):
         self,
         inputs: torch.Tensor,
         targets: torch.Tensor,
+        sample_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Create mask for valid labels
         valid_mask = (targets != -100).float()
@@ -373,12 +379,15 @@ class WeightedCELoss(nn.Module):
             reduction="none"
         )
 
-        # Apply mask
-        loss = loss * valid_mask
+        # Apply mask (and optional unbiased sample weights)
+        eff_mask = valid_mask
+        if sample_weight is not None:
+            eff_mask = eff_mask * sample_weight.to(device=loss.device, dtype=loss.dtype)
+        loss = loss * eff_mask
 
         # Reduction
         if self.reduction == "mean":
-            return loss.sum() / valid_mask.sum().clamp(min=1e-6)
+            return loss.sum() / eff_mask.sum().clamp(min=1e-6)
         elif self.reduction == "sum":
             return loss.sum()
         
@@ -414,6 +423,7 @@ class Poly1FocalLoss(nn.Module):
         self,
         inputs: torch.Tensor,
         targets: torch.Tensor,
+        sample_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Create mask for valid labels
         valid_mask = (targets != -100).float()
@@ -437,12 +447,15 @@ class Poly1FocalLoss(nn.Module):
             alpha = self.alpha.to(device=inputs.device, dtype=loss.dtype)
             loss = loss * torch.where(safe_targets > 0.5, alpha, torch.ones_like(loss))
 
-        # Apply mask
-        loss = loss * valid_mask
+        # Apply mask (and optional unbiased sample weights)
+        eff_mask = valid_mask
+        if sample_weight is not None:
+            eff_mask = eff_mask * sample_weight.to(device=loss.device, dtype=loss.dtype)
+        loss = loss * eff_mask
 
         # Reduction
         if self.reduction == "mean":
-            return loss.sum() / valid_mask.sum().clamp(min=1e-6)
+            return loss.sum() / eff_mask.sum().clamp(min=1e-6)
         elif self.reduction == "sum":
             return loss.sum()
         
@@ -538,8 +551,14 @@ def make_loss_func(loss_name: str, loss_args: dict = None):
         # Ensure labels are float for binary cross-entropy
         if labels.dtype != torch.float:
             labels = labels.float()
+
+        # Unpack trailing Horvitz-Thompson / patient sample-weight column when present
+        sample_weight = None
+        if labels.ndim == 2 and logits.ndim == 2 and labels.shape[1] == logits.shape[1] + 1:
+            sample_weight = labels[:, -1:]
+            labels = labels[:, :-1]
             
         # The loss classes handle masking of -100 internally
-        return loss_fct(logits, labels)
+        return loss_fct(logits, labels, sample_weight=sample_weight)
 
     return compute_loss

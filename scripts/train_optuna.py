@@ -47,8 +47,8 @@ def parse_args():
     parser.add_argument(
         "--tasks",
         type=str,
-        default="multitask_bacteria",
-        help="Comma-separated task key(s) for fine-tuning optimization (default: multitask_bacteria).",
+        default="infection_bacteria",
+        help="Comma-separated task key(s) for fine-tuning optimization (default: infection_bacteria).",
     )
     parser.add_argument(
         "--pretrained-dir",
@@ -124,13 +124,19 @@ IS_CAUSAL = PatientEmbeddingModelFactory._is_causal_backbone(
     architecture_type=CLI_CFG["model"].get("architecture_type"),
 )
 
-# Isolate Optuna fine-tuning study per model family, split, value embedding tag, and task group
+# Isolate Optuna fine-tuning study per model family, split, export tag, value embedding tag, and task group
 SAFE_TASK_TAG = TASKS_ARG.replace(",", "-")
-OPTUNA_DIR = BASE_RESULTS_DIR / "optuna_finetune" / f"{SPLIT_TYPE}_{VAL_TAG}" / SAFE_TASK_TAG
-DEFAULT_TOTAL_TRIALS = int(CLI_CFG["optuna"]["num_trials"] if not DEBUG else CLI_CFG["optuna"]["num_trials_debug"])
+STUDY_PREFIX = (
+    f"{SPLIT_TYPE}_{cli_args.export_run_id}_{VAL_TAG}"
+    if cli_args.export_run_id != "optuna_ft"
+    else f"{SPLIT_TYPE}_{VAL_TAG}"
+)
+OPTUNA_DIR = BASE_RESULTS_DIR / "optuna_finetune" / STUDY_PREFIX / SAFE_TASK_TAG
+OPTUNA_CFG = CLI_CFG.get("optuna", {}) or {}
+DEFAULT_TOTAL_TRIALS = int(OPTUNA_CFG.get("num_trials", 50) if not DEBUG else OPTUNA_CFG.get("num_trials_debug", 2))
 TARGET_TRIALS = cli_args.target_trials if cli_args.target_trials is not None else DEFAULT_TOTAL_TRIALS
 N_TRIALS = cli_args.n_trials  # None = run until TARGET_TRIALS reached globally; 0 = finalize only
-STUDY_NAME = f"{CLI_CFG['optuna']['study_name']}_finetune_{SPLIT_TYPE}_{VAL_TAG}_{SAFE_TASK_TAG}"
+STUDY_NAME = f"{OPTUNA_CFG.get('study_name', 'finetuning_hp_optimization')}_finetune_{STUDY_PREFIX}_{SAFE_TASK_TAG}"
 
 BEST_MODEL_LOCK = threading.Lock()
 BEST_MODEL_INFO = {
@@ -272,20 +278,28 @@ def load_or_create_study_once(log_file: str, study_name: str, sampler: TPESample
                 load_if_exists=False,
                 sampler=sampler,
             )
-            # Enqueue the canonical YAML fine-tuning defaults as Trial #0 so TPE starts
-            # with an exact apples-to-apples baseline anchor on e00-a15-v60_raw!
+            # Enqueue the active YAML fine-tuning defaults as Trial #0 so TPE starts
+            # with our exact winning baseline anchor (e.g. TFC8-MTI8)!
+            ft_defaults = CLI_CFG.get("finetuner", {}) or {}
+            m_defaults = (CLI_CFG.get("model", {}) or {}).get("config_args", {}) or {}
+            def _clamp(val, lo, hi):
+                return max(lo, min(hi, val))
+            def _snap(val, lo, hi, step):
+                return round(_clamp(round(val / step) * step, lo, hi), 6)
+
             base_anchor = {
-                "lr_fine": 4.0e-5,
-                "weight_decay_fine": 1.0e-2,
-                "warmup_base_fine": 50,
-                "grad_accum_fine": 4,
-                "undersampling_ratio": 15.0,
-                "dropout_embedding": 0.00,
-                "dropout_attention": 0.10,
-                "dropout_classifier": 0.10,
+                "lr_fine": float(_clamp(float(ft_defaults.get("learning_rate", 8.0e-5)), 2.0e-5, 2.5e-4)),
+                "weight_decay_fine": float(_clamp(float(ft_defaults.get("weight_decay", 2.0e-2)), 1.0e-3, 1.0e-1)),
+                "warmup_base_fine": int(_snap(float(ft_defaults.get("warmup_steps", 60)), 20, 140, 10)),
+                "grad_accum_fine": int(ft_defaults.get("gradient_accumulation_steps", 4)) if int(ft_defaults.get("gradient_accumulation_steps", 4)) in (2, 4, 8) else 4,
+                "lr_scheduler_type": str(ft_defaults.get("lr_scheduler_type", "linear")) if str(ft_defaults.get("lr_scheduler_type", "linear")) in ("linear", "cosine") else "linear",
+                "patient_weight_alpha": float(CLI_CFG.get("patient_weight_alpha", 0.5)) if float(CLI_CFG.get("patient_weight_alpha", 0.5)) in (0.0, 0.25, 0.5, 0.75) else 0.5,
+                "dropout_embedding": float(_snap(float(m_defaults.get("dropout_embedding", 0.0)), 0.0, 0.20, 0.05)),
+                "dropout_attention": float(_snap(float(m_defaults.get("dropout_attention", 0.15)), 0.05, 0.30, 0.05)),
+                "dropout_classifier": float(_snap(float(m_defaults.get("dropout_classifier", 0.15)), 0.0, 0.40, 0.05)),
             }
             if not IS_CAUSAL:
-                base_anchor["dropout_mlp"] = 0.10
+                base_anchor["dropout_mlp"] = float(_snap(float(m_defaults.get("dropout_mlp", 0.15)), 0.05, 0.30, 0.05))
             study.enqueue_trial(base_anchor)
             return study, storage
     finally:
@@ -308,8 +322,8 @@ def reap_stale_running_trials(study: optuna.Study, storage: JournalStorage) -> i
     return reaped
 
 
-def get_run_id(masking_rules: dict) -> str:
-    return format_pretrain_run_id(CLI_CFG, masking_rules)
+def get_run_id(masking_rules: dict | None = None) -> str:
+    return format_pretrain_run_id(CLI_CFG, masking_rules=None if CLI_CFG.get("run_id") else masking_rules)
 
 
 def resolve_source_pretrained_dir() -> Path:
@@ -493,14 +507,16 @@ def objective_finetune(trial: optuna.Trial) -> float:
             if not pt_link.exists() and not pt_link.is_symlink():
                 os.symlink(source_pt_dir.resolve(), pt_link, target_is_directory=True)
 
-        # 1. Optimization & class-balancing hyperparameters (normalize step cadence by effective batch size!)
-        lr_fine = trial.suggest_float("lr_fine", 1e-5, 2e-4, log=True)
-        weight_decay_fine = trial.suggest_float("weight_decay_fine", 1e-4, 1e-1, log=True)
+        # 1. Optimization & patient-weighting hyperparameters (normalize step cadence by effective batch size!)
+        # Loss ("ce"), undersampling_mode ("global"), and global 1:15 ratio are fixed KEEP invariants.
+        lr_fine = trial.suggest_float("lr_fine", 2.0e-5, 2.5e-4, log=True)
+        weight_decay_fine = trial.suggest_float("weight_decay_fine", 1.0e-3, 1.0e-1, log=True)
         warmup_base_fine = trial.suggest_int("warmup_base_fine", 20, 140, step=10)
         grad_accum_fine = trial.suggest_categorical("grad_accum_fine", [2, 4, 8])
-        # Per-FUP negative:positive cap (3:1 strong .. 30:1 light, plus 0.0 -> None = full natural distribution)
-        undersamp_choice = trial.suggest_categorical("undersampling_ratio", [3.0, 5.0, 10.0, 15.0, 30.0, 0.0])
-        eff_undersampling_ratio = float(undersamp_choice) if undersamp_choice > 0.0 else None
+        lr_scheduler_type = trial.suggest_categorical("lr_scheduler_type", ["linear", "cosine"])
+        patient_weight_alpha = trial.suggest_categorical("patient_weight_alpha", [0.0, 0.25, 0.5, 0.75])
+        eff_undersampling_ratio = float(CLI_CFG.get("target_undersampling_ratio", 15.0))
+        eff_undersampling_mode = str(CLI_CFG.get("undersampling_mode", "global"))
 
         base_ga = int(CLI_CFG["finetuner"].get("gradient_accumulation_steps", 4))
         base_eval_steps = int(CLI_CFG["finetuner"].get("eval_steps", 50))
@@ -511,8 +527,8 @@ def objective_finetune(trial: optuna.Trial) -> float:
         scaled_max_steps = max(40, int(round(base_max_steps * step_scale))) if not DEBUG else 30
 
         # 2. Regularization hyperparameters (architecture-aware: no dead no-op params)
-        dropout_emb = trial.suggest_float("dropout_embedding", 0.0, 0.25, step=0.05)
-        dropout_att = trial.suggest_float("dropout_attention", 0.0, 0.25, step=0.05)
+        dropout_emb = trial.suggest_float("dropout_embedding", 0.0, 0.20, step=0.05)
+        dropout_att = trial.suggest_float("dropout_attention", 0.05, 0.30, step=0.05)
         dropout_cls = trial.suggest_float("dropout_classifier", 0.0, 0.40, step=0.05)
         cfg_dropouts = {
             "dropout_embedding": dropout_emb,
@@ -520,20 +536,26 @@ def objective_finetune(trial: optuna.Trial) -> float:
             "dropout_classifier": dropout_cls,
         }
         if not IS_CAUSAL:
-            cfg_dropouts["dropout_mlp"] = trial.suggest_float("dropout_mlp", 0.0, 0.25, step=0.05)
+            cfg_dropouts["dropout_mlp"] = trial.suggest_float("dropout_mlp", 0.05, 0.30, step=0.05)
 
         # 3. Unweighted BCE ("ce") for calibrated probabilities + hierarchical random-effects head aggregation
         # Note: portable_overrides sets `finetune_run_id` (NOT `run_id`) so `train_classification.py`
-        # always loads pretraining from canonical `e00-a15-v60_<raw|bin>/pretraining` across all splits!
+        # always loads pretraining from canonical `<run_id>_<val_tag>/pretraining` across all splits!
+        use_num_emb = VAL_TAG.startswith("raw")
         loss_name = "ce"
         es_mean = CLI_CFG.get("early_stopping_mean", "random_effects")
         portable_overrides = {
             "finetune_run_id": cli_args.export_run_id,
+            "use_landmark_summary": bool(CLI_CFG.get("use_landmark_summary", False)),
             "target_undersampling_ratio": eff_undersampling_ratio,
+            "undersampling_mode": eff_undersampling_mode,
+            "patient_weight_alpha": float(patient_weight_alpha),
             "early_stopping_mean": es_mean,
-            "data_collator": {"use_numerical_embedding": (VAL_TAG == "raw")},
+            "data_collator": {"use_numerical_embedding": use_num_emb},
             "finetuner": {
                 "learning_rate": lr_fine,
+                "head_lr_multiplier": 1.0,
+                "lr_scheduler_type": lr_scheduler_type,
                 "weight_decay": weight_decay_fine,
                 "warmup_steps": scaled_warmup_steps,
                 "gradient_accumulation_steps": grad_accum_fine,
@@ -544,7 +566,7 @@ def objective_finetune(trial: optuna.Trial) -> float:
             },
             "model": {
                 "config_args": cfg_dropouts,
-                "embedding_layer_config": {"use_numerical_embedding": (VAL_TAG == "raw")},
+                "embedding_layer_config": {"use_numerical_embedding": use_num_emb},
             },
         }
         work_overrides = {
@@ -562,8 +584,8 @@ def objective_finetune(trial: optuna.Trial) -> float:
 
         print(
             f"\n[Finetune Trial {trial.number}] GPU {gpu_id} ({TASKS_ARG}): "
-            f"lr={lr_fine:.2e}, wd={weight_decay_fine:.2e}, warmup={scaled_warmup_steps}, "
-            f"ga={grad_accum_fine}, bal_ratio={eff_undersampling_ratio or 'none'} "
+            f"lr={lr_fine:.2e} ({lr_scheduler_type}), wd={weight_decay_fine:.2e}, warmup={scaled_warmup_steps}, "
+            f"ga={grad_accum_fine}, alpha={patient_weight_alpha}, us={eff_undersampling_mode}:{eff_undersampling_ratio} "
             f"(eval_steps={scaled_eval_steps}), drop={cfg_dropouts}"
         )
         try:

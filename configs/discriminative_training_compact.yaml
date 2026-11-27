@@ -1,0 +1,243 @@
+# =============================================================================
+# Compact t-EAV ModernBERT Configuration (8L x 384d, ~15.5M params)
+#
+# Right-sized for ~2,330 unique transplant patients (~7.5x fewer parameters
+# than ModernBERT-base's ~115M) while keeping full static conditioning,
+# continuous numerical embeddings, global 1:15 undersampling (matching LR),
+# inverse-sqrt patient-length weighting, and bottlenecked LandmarkSummaryEncoder.
+# =============================================================================
+
+run_id: e00-a15-v60_c8x384
+data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v4.0/teav
+data_split_type: random_split
+result_dir: results/transformer
+
+data_collator:
+  eav_mappings:
+    entity_id: entity
+    attribute_id: attribute
+    value_id: value_binned
+  time_mapping:
+    days_since_tpx: time
+  mlm_label_keys:
+    - entity_id
+    - attribute_id
+    - value_id
+  mlm_masking_rules:
+    entity_id: 0.00
+    attribute_id: 0.15
+    value_id: 0.60
+
+# Fine-tuning sampling, weighting, and tabular anti-ablation regularization
+train_data_augment: random
+target_undersampling_ratio: 15.0  # global 1:15 undersampling (matches LR -> constant logit shift across FUPs)
+undersampling_mode: global
+patient_weight_alpha: 0.5         # w_p ~ n_frames(p)^(-0.5) to reduce 40x long-survivor dominance without label bias
+landmark_bottleneck_dim: 128      # compact tabular branch (~0.35M params)
+landmark_dropout: 0.25            # explicit tabular dropout decoupled from dropout_embedding=0.0
+landmark_fup_gate: false          # set true for FUP-gated tabular fusion (sequence-led in POP, tabular-assisted in VLT)
+drop_unlabeled: true
+early_stopping_metric: roc_auc
+early_stopping_subset: null
+early_stopping_mean: random_effects
+n_bootstrap_eval: 100
+
+prediction_tasks:
+  infection_bacteria: {fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600], horizons: [[30, 60, 90]]}
+  multitask_bacteria:
+    tasks: [
+      infection_bacteria,
+      infection_grp_enterobacterales,
+      infection_grp_gram_positive,
+      infection_grp_gn_nonfermenters,
+      infection_grp_clostridium,
+    ]
+    fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600]
+    horizons: [[30, 60, 90]]
+  multitask_bv:
+    tasks: [
+      infection_bacteria,
+      infection_grp_enterobacterales,
+      infection_grp_gram_positive,
+      infection_grp_gn_nonfermenters,
+      infection_grp_clostridium,
+      infection_virus,
+      infection_grp_herpes_viruses,
+      infection_grp_cmv,
+      infection_grp_bkpyv,
+    ]
+    fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600]
+    horizons: [[30, 60, 90]]
+  multitask_infections:
+    tasks: [
+      infection_bacteria,
+      infection_grp_enterobacterales,
+      infection_grp_gram_positive,
+      infection_grp_gn_nonfermenters,
+      infection_grp_clostridium,
+      infection_virus,
+      infection_grp_herpes_viruses,
+      infection_grp_cmv,
+      infection_grp_bkpyv,
+      infection_fungi,
+      infection_grp_candida,
+    ]
+    fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600]
+    horizons: [[30, 60, 90]]
+  multitask_pan_13:
+    tasks: [
+      infection_bacteria,
+      infection_grp_enterobacterales,
+      infection_grp_gram_positive,
+      infection_grp_gn_nonfermenters,
+      infection_grp_clostridium,
+      infection_virus,
+      infection_grp_herpes_viruses,
+      infection_grp_cmv,
+      infection_grp_bkpyv,
+      infection_fungi,
+      infection_grp_candida,
+      death,
+      graft_loss,
+    ]
+    fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600]
+    horizons: [[30, 60, 90]]
+    task_horizons:
+      death: [360, 720, 1800]
+      graft_loss: [360, 720, 1800]
+  multitask_acute_13:
+    tasks: [
+      infection_bacteria,
+      infection_grp_enterobacterales,
+      infection_grp_gram_positive,
+      infection_grp_gn_nonfermenters,
+      infection_grp_clostridium,
+      infection_virus,
+      infection_grp_herpes_viruses,
+      infection_grp_cmv,
+      infection_grp_bkpyv,
+      infection_fungi,
+      infection_grp_candida,
+      death,
+      graft_loss,
+    ]
+    fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600]
+    horizons: [[30, 60, 90]]
+  multitask_unified:
+    tasks: [
+      infection_bacteria,
+      infection_grp_enterobacterales,
+      infection_grp_gram_positive,
+      infection_grp_gn_nonfermenters,
+      infection_grp_clostridium,
+      infection_virus,
+      infection_grp_herpes_viruses,
+      infection_grp_cmv,
+      infection_grp_bkpyv,
+      infection_fungi,
+      infection_grp_candida,
+      death,
+      graft_loss,
+    ]
+    fups: [0, 30, 60, 90, 120, 150, 180, 240, 300, 360, 540, 720, 900, 1080, 1440, 1800, 2700, 3600]
+    horizons: [[30, 60, 90, 180, 360, 720, 1800]]
+
+do_clustering: false
+optuna:
+  num_trials: 50
+  num_trials_debug: 2
+  study_name: finetuning_hp_c8x384
+
+pretrainer:
+  seed: 1234
+  logging_steps: 10
+  warmup_steps: 100
+  num_train_epochs: 300
+  max_steps: 6000
+  lr_scheduler_type: cosine
+  eval_strategy: steps
+  save_strategy: steps
+  eval_steps: 100
+  save_steps: 100
+  save_total_limit: 1
+  gradient_accumulation_steps: 4
+  per_device_train_batch_size: 24
+  per_device_eval_batch_size: 24
+  learning_rate: 3.0e-4           # compact 8L/384d tolerates higher MLM LR cleanly
+  weight_decay: 0.02
+  max_grad_norm: 1.0
+  adam_beta1: 0.9
+  adam_beta2: 0.98
+  adam_epsilon: 1.0e-6
+  bf16: true
+  report_to: none
+  remove_unused_columns: false
+  load_best_model_at_end: true
+  metric_for_best_model: eval_mlm_accuracy
+  greater_is_better: true
+  early_stopping_patience: 8
+
+finetuner:
+  seed: 1234
+  ft_subdir: "finetuning"
+  logging_steps: 10
+  warmup_steps: 60
+  num_train_epochs: 10
+  max_steps: 10000
+  eval_strategy: steps
+  save_strategy: steps
+  eval_steps: 50
+  save_steps: 50
+  save_total_limit: 1
+  eval_accumulation_steps: 500
+  gradient_accumulation_steps: 4
+  per_device_train_batch_size: 24
+  per_device_eval_batch_size: 48
+  dataloader_num_workers: 4
+  learning_rate: 8.0e-5           # tuned for compact 8L/384d backbone
+  head_lr_multiplier: 1.0         # >1 enables differential LR (fresh head/tabular = learning_rate * multiplier)
+  weight_decay: 0.02              # stronger L2 regularization for ~2.3k patients
+  max_grad_norm: 1.0
+  adam_beta1: 0.9
+  adam_beta2: 0.99
+  adam_epsilon: 1.0e-6
+  loss_name: ce
+  enforce_monotonicity: true
+  bf16: true
+  report_to: none
+  remove_unused_columns: false
+  load_best_model_at_end: true
+  metric_for_best_model: eval_all_early_stopping_metric
+  greater_is_better: true
+  early_stopping_patience: 7
+
+use_lora: false
+
+model:
+  model_id: answerdotai/ModernBERT-base
+  load_backbone_weights: false
+  config_args:
+    max_position_embeddings: 1024
+    tie_word_embeddings: false
+    output_hidden_states: true
+    classifier_pooling: mean
+    pad_token_id: 0
+    bos_token_id: 2
+    cls_token_id: 2
+    eos_token_id: 3
+    sep_token_id: 3
+    num_hidden_layers: 8
+    num_attention_heads: 6
+    hidden_size: 384
+    intermediate_size: 768
+    layer_types: [full_attention, sliding_attention, sliding_attention, full_attention, sliding_attention, sliding_attention, sliding_attention, full_attention]
+    dropout_embedding: 0.0
+    dropout_attention: 0.15
+    dropout_mlp: 0.15
+    dropout_classifier: 0.15
+  model_args:
+    dtype: bfloat16
+    attn_implementation: sdpa
+  embedding_layer_config:
+    use_numerical_embedding: true
+    use_static_conditioning: true

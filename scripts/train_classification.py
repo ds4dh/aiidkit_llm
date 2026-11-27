@@ -15,6 +15,7 @@ from transformers import Trainer, TrainingArguments, EarlyStoppingCallback, Eval
 from transformers.trainer_callback import PrinterCallback
 from peft import LoraConfig, get_peft_model
 from src.utils import apply_config_overrides, load_optuna_json_overrides
+from src.data.dynamic_store import LandmarkSummaryPreprocessor, make_dynamic_epoch_callback
 from src.data.patient_dataset import load_hf_data_and_metadata
 from src.model.model_utils import (
     make_loss_func,
@@ -92,10 +93,15 @@ def main():
     train_data_augment = cfg.get("train_data_augment", "all")
     pretrain_run_id = format_pretrain_run_id(cfg)
     val_tag = get_value_embedding_tag(cfg)
+    use_landmark_summary = bool(cfg.get("use_landmark_summary", False))
     if cli_args.reset_weights:
         finetune_run_id = f"no_pretrain_{val_tag}"
     elif cfg.get("finetune_run_id"):
         finetune_run_id = resolve_run_id_with_val_tag(str(cfg["finetune_run_id"]), val_tag)
+        if use_landmark_summary and not finetune_run_id.endswith("_tab"):
+            finetune_run_id = f"{finetune_run_id}_tab"
+    elif use_landmark_summary:
+        finetune_run_id = f"{pretrain_run_id}_tab"
     else:
         finetune_run_id = pretrain_run_id
     result_dir = Path(cfg["result_dir"]) / cfg["data_split_type"]
@@ -127,11 +133,11 @@ def main():
                 else:  # single run with pooled follow-up periods
                     if train_data_augment == "valid":
                         train_fups = valid_fups  # 18 clinical landmarks only
-                    elif train_data_augment == "all":
+                    elif train_data_augment in ("all", "random"):
                         data_dir = Path(cfg["data_dir"]) / cfg["data_split_type"]
-                        train_fups = scan_all_fups(data_dir)  # all 121 FUPs
+                        train_fups = scan_all_fups(data_dir)  # all 121 eval FUPs (random mode samples continuously)
                     else:
-                        raise ValueError(f"Unsupported train_data_augment='{train_data_augment}' (expected 'all', 'valid', or 'none').")
+                        raise ValueError(f"Unsupported train_data_augment='{train_data_augment}' (expected 'all', 'random', 'valid', or 'none').")
                     run_configs = [(train_fups, valid_fups)]
 
                 # Ensure horizons is a sorted list (even if only a single entry)
@@ -225,7 +231,27 @@ def finetune_discriminative_model(
     label_keys = [f"label_{t}_{h:04d}d" for t, h in head_pairs]
     unique_all_horizons = sorted({h for _, h in head_pairs})
 
-    # Load raw dataset and metadata
+    # Compute output_dir early so --eval-only can locate existing checkpoint & landmark_scaler.json
+    fmt_fn = lambda x: "-".join(f"{i:04d}" for i in sorted(([x] if isinstance(x, int) else x or [])))
+    fut_str = fmt_fn(fup_train) if train_data_augment == "none" else train_data_augment
+    fuv_str = fmt_fn(fup_valid)
+    hrz_str = fmt_fn(unique_all_horizons)
+    task_subdir = f"hrz({hrz_str})_fut({fut_str})_fuv({fuv_str})"
+    run_subdir = str(Path(task_key) / task_subdir)
+    output_dir_path = finetuning_dir / run_subdir
+
+    # Load raw dataset and metadata (auto-switches to portable dynamic store when manifest.json is present)
+    max_seq_len = int(cfg.get("model", {}).get("config_args", {}).get("max_position_embeddings", 1024)) - 2
+    use_static_cond = bool(cfg.get("model", {}).get("embedding_layer_config", {}).get("use_static_conditioning", False))
+    use_landmark_summary = bool(cfg.get("use_landmark_summary", False))
+    classic_ml_split_dir = None
+    saved_lm_prep = None
+    if use_landmark_summary:
+        cml_root = cfg.get("classic_ml_data_dir") or str(Path(cfg["data_dir"]).parent / "classic_ml")
+        classic_ml_split_dir = Path(cml_root) / cfg["data_split_type"]
+        scaler_path = output_dir_path / "landmark_scaler.json"
+        if cli_args.eval_only and scaler_path.exists():
+            saved_lm_prep = LandmarkSummaryPreprocessor.from_dict(json.loads(scaler_path.read_text(encoding="utf-8")))
     dataset, _, vocab = load_hf_data_and_metadata(
         data_dir=data_root_dir,
         fup_train=fup_train,
@@ -233,10 +259,29 @@ def finetune_discriminative_model(
         fup_test=all_possible_fups,
         label_keys=label_keys,
         target_undersampling_ratio=cfg.get("target_undersampling_ratio", None),
+        undersampling_mode=str(cfg.get("undersampling_mode", "global")),
+        ipw_weight_cap=float(cfg.get("ipw_weight_cap", 10.0)),
+        patient_weight_alpha=float(cfg.get("patient_weight_alpha", 0.0)),
         drop_unlabeled=cfg.get("drop_unlabeled", False),
         time_mapping=cfg["data_collator"]["time_mapping"],
         eav_mappings=cfg["data_collator"]["eav_mappings"],
+        landmark_mode=("random_landmark" if train_data_augment == "random" else "fixed_grid"),
+        random_landmark_stride_days=int(cfg.get("random_landmark_stride_days", 30)),
+        random_landmark_max_fup=int(cfg.get("random_landmark_max_fup", 3600)),
+        random_landmark_seed=int(cfg.get("finetuner", {}).get("seed", 1234)),
+        max_length=max_seq_len,
+        use_global_salience_truncation=bool(cfg.get("use_global_salience_truncation", True)),
+        separate_static=use_static_cond,
+        classic_ml_data_dir=classic_ml_split_dir,
+        landmark_preprocessor=saved_lm_prep,
     )
+    if "ipw_weight" in getattr(dataset["train"], "_extra_cols", {}):
+        w_tr = dataset["train"]._extra_cols["ipw_weight"]
+        print(
+            f"    [Unbiased Training Weights] undersampling_mode={cfg.get('undersampling_mode', 'global')}, "
+            f"patient_weight_alpha={cfg.get('patient_weight_alpha', 0.0)}, "
+            f"w_min={float(w_tr.min()):.3f}, w_mean={float(w_tr.mean()):.3f}, w_max={float(w_tr.max()):.3f}"
+        )
 
     # Prepare split identification flags across arrays
     for split in dataset.keys():
@@ -263,15 +308,6 @@ def finetune_discriminative_model(
             val_eval_ds = val_eval_ds.select(val_idx, keep_in_memory=True)
     eval_datasets = {"all": val_eval_ds}
 
-    # Compute output_dir first so --eval-only can locate the existing fine-tuned checkpoint
-    fmt_fn = lambda x: "-".join(f"{i:04d}" for i in sorted(([x] if isinstance(x, int) else x or [])))
-    fut_str = fmt_fn(fup_train) if train_data_augment == "none" else train_data_augment
-    fuv_str = fmt_fn(fup_valid)
-    hrz_str = fmt_fn(unique_all_horizons)
-    task_subdir = f"hrz({hrz_str})_fut({fut_str})_fuv({fuv_str})"
-    run_subdir = str(Path(task_key) / task_subdir)
-    output_dir_path = finetuning_dir / run_subdir
-
     # Auto-detect model sub-directory and best checkpoint (fine-tuned when --eval-only, else pre-trained)
     ckpt_search_dir = output_dir_path if cli_args.eval_only else pretrained_dir
     resolved_ckpt = resolve_best_checkpoint(ckpt_search_dir)
@@ -296,8 +332,32 @@ def finetune_discriminative_model(
 
     # Set up model configuration
     model_cfg = cfg["model"].copy()
+    model_cfg["embedding_layer_config"] = dict(cfg["model"]["embedding_layer_config"])
     model_cfg["pretrained_dir"] = pretrained_last_ckpt_dir
     model_cfg["embedding_layer_config"]["vocab_size"] = len(vocab)
+    lm_prep_fitted = getattr(train_dataset, "landmark_preprocessor", None)
+    if use_landmark_summary and lm_prep_fitted is not None and lm_prep_fitted.is_fitted:
+        model_cfg["embedding_layer_config"]["landmark_summary_group_dims"] = list(lm_prep_fitted.group_dims)
+        lm_bdim = cfg.get("landmark_bottleneck_dim", model_cfg["embedding_layer_config"].get("landmark_bottleneck_dim"))
+        lm_drop = cfg.get("landmark_dropout", model_cfg["embedding_layer_config"].get("landmark_dropout"))
+        lm_fup_gate = cfg.get("landmark_fup_gate", model_cfg["embedding_layer_config"].get("landmark_fup_gate", False))
+        if cli_args.eval_only and (output_dir_path / "run_metadata.json").exists():
+            prev_meta = json.loads((output_dir_path / "run_metadata.json").read_text(encoding="utf-8"))
+            if lm_bdim is None and "landmark_bottleneck_dim" in prev_meta:
+                lm_bdim = prev_meta["landmark_bottleneck_dim"]
+            if lm_drop is None and "landmark_dropout" in prev_meta:
+                lm_drop = prev_meta["landmark_dropout"]
+            if "landmark_fup_gate" in prev_meta and "landmark_fup_gate" not in cfg:
+                lm_fup_gate = prev_meta["landmark_fup_gate"]
+        if lm_bdim is not None:
+            model_cfg["embedding_layer_config"]["landmark_bottleneck_dim"] = int(lm_bdim)
+        if lm_drop is not None:
+            model_cfg["embedding_layer_config"]["landmark_dropout"] = float(lm_drop)
+        model_cfg["embedding_layer_config"]["landmark_fup_gate"] = bool(lm_fup_gate)
+        print(
+            f"    [LandmarkSummaryEncoder] domains={dict(zip(lm_prep_fitted.group_names, lm_prep_fitted.group_dims))} "
+            f"(total={sum(lm_prep_fitted.group_dims)}, bottleneck={lm_bdim}, dropout={lm_drop}, fup_gate={bool(lm_fup_gate)})"
+        )
     model_cfg["reset_weights"] = cli_args.reset_weights
     model_cfg["enforce_monotonicity"] = monotonic_groups if monotonic_groups else enforce_monotonicity
     model_cfg["task"] = "classification"
@@ -332,7 +392,10 @@ def finetune_discriminative_model(
     # Evaluation pipelines
     ft_cfg = cfg["finetuner"].copy()
     patience = ft_cfg.pop("early_stopping_patience", 20)
+    head_lr_multiplier = float(ft_cfg.pop("head_lr_multiplier", 1.0))
     callbacks = [EarlyStoppingCallback(early_stopping_patience=patience)]
+    if hasattr(train_dataset, "set_epoch") and getattr(train_dataset, "mode", None) == "random_landmark":
+        callbacks.append(make_dynamic_epoch_callback(train_dataset))
     evaluator = CustomEvaluator(
         do_clustering=False,
         label_names=label_keys,
@@ -358,6 +421,10 @@ def finetune_discriminative_model(
         for old_ckpt in output_dir_path.glob("checkpoint-*"):
             shutil.rmtree(old_ckpt, ignore_errors=True)
     output_dir_path.mkdir(parents=True, exist_ok=True)
+    if use_landmark_summary and lm_prep_fitted is not None and lm_prep_fitted.is_fitted and not cli_args.eval_only:
+        (output_dir_path / "landmark_scaler.json").write_text(
+            json.dumps(lm_prep_fitted.to_dict(), indent=2), encoding="utf-8"
+        )
     with open(output_dir_path / "run_metadata.json", "w") as f:
         json.dump(
             {
@@ -369,6 +436,13 @@ def finetune_discriminative_model(
                 "label_keys": label_keys,
                 "value_embedding": get_value_embedding_tag(cfg),
                 "use_numerical_embedding": bool(collator_cfg["use_numerical_embedding"]),
+                "undersampling_mode": str(cfg.get("undersampling_mode", "global")),
+                "patient_weight_alpha": float(cfg.get("patient_weight_alpha", 0.0)),
+                "landmark_bottleneck_dim": model_cfg["embedding_layer_config"].get("landmark_bottleneck_dim"),
+                "landmark_dropout": model_cfg["embedding_layer_config"].get("landmark_dropout"),
+                "landmark_fup_gate": bool(model_cfg["embedding_layer_config"].get("landmark_fup_gate", False)),
+                "head_lr_multiplier": head_lr_multiplier,
+                "backbone_lr": float(ft_cfg.get("learning_rate", 0.0)),
             },
             f, indent=2,
         )
@@ -387,7 +461,7 @@ def finetune_discriminative_model(
         run_name = f"{run_id}_{run_subdir}"
         wandb.init(project=workspace, name=run_name, config=cfg)
 
-    # Trainer (standard HuggingFace)
+    # Trainer (standard HuggingFace + optional differential LR for fresh heads/tabular modules)
     trainer = PrefixAwareTrainer(
         model=model,
         train_dataset=train_dataset, 
@@ -398,12 +472,30 @@ def finetune_discriminative_model(
         compute_metrics=evaluator,
         callbacks=callbacks,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+        head_lr_multiplier=head_lr_multiplier,
     )
     trainer.remove_callback(PrinterCallback)
 
     # Fine-tune the model (unless --eval-only was requested on an already-trained checkpoint)
     if not cli_args.eval_only:
         trainer.train()
+
+    # Log learned FUP-gate profile if enabled
+    lm_enc = getattr(getattr(trainer.model, "patient_embedder", None), "landmark_encoder", None)
+    if lm_enc is not None and getattr(lm_enc, "use_fup_gate", False) and getattr(lm_enc, "fup_gate_lin", None) is not None:
+        probe_fups = [0, 30, 90, 180, 360, 1080, 3600]
+        with torch.no_grad():
+            g_film_v, g_cls_v = lm_enc.compute_fup_gates(torch.tensor(probe_fups, dtype=torch.float32))
+        gate_profile = {
+            str(d): {"g_film": round(float(gf), 4), "g_cls": round(float(gc), 4)}
+            for d, gf, gc in zip(probe_fups, g_film_v.squeeze(-1).cpu().tolist(), g_cls_v.squeeze(-1).cpu().tolist())
+        }
+        print(f"    [FupGate learned profile] {gate_profile}")
+        meta_p = output_dir_path / "run_metadata.json"
+        if meta_p.exists():
+            meta_obj = json.loads(meta_p.read_text(encoding="utf-8"))
+            meta_obj["learned_fup_gate"] = gate_profile
+            meta_p.write_text(json.dumps(meta_obj, indent=2), encoding="utf-8")
 
     if cli_args.skip_test:
         # Fast validation-only evaluation on the 18 validation FUPs (~2s on GPU) for Optuna trials
@@ -432,13 +524,68 @@ def finetune_discriminative_model(
 
 class PrefixAwareTrainer(GradientClippingGuard, Trainer):
     """
-    Trainer that keeps per-FUP evaluation prefixes in sync and adds gradient clipping
-    diagnostics + a non-finite gradient guard (see GradientClippingGuard).
+    Trainer that keeps per-FUP evaluation prefixes in sync, supports optional differential
+    learning rates for freshly initialized classification/tabular modules vs. the pretrained
+    backbone, and adds gradient clipping diagnostics + a non-finite gradient guard.
     """
-    def __init__(self, *args, **kwargs):
+    _HEAD_PARAM_PREFIXES = (
+        "head.",
+        "classifier.",
+        "static_cls_fusion.",
+        "landmark_cls_fusion.",
+        "patient_embedder.landmark_encoder.",
+    )
+
+    def __init__(self, *args, head_lr_multiplier: float = 1.0, **kwargs):
+        self.head_lr_multiplier = float(head_lr_multiplier)
         super().__init__(*args, **kwargs)
         if self.compute_loss_func is not None:
             self.model_accepts_loss_kwargs = False
+
+    def create_optimizer(self):
+        if self.optimizer is not None:
+            return self.optimizer
+        if abs(self.head_lr_multiplier - 1.0) < 1e-6:
+            return super().create_optimizer()
+
+        opt_model = self.model
+        decay_parameters = set(self.get_decay_parameter_names(opt_model))
+        base_lr = float(self.args.learning_rate)
+        head_lr = base_lr * self.head_lr_multiplier
+        wd = float(self.args.weight_decay)
+
+        bb_decay, bb_nodecay, hd_decay, hd_nodecay = [], [], [], []
+        for name, param in opt_model.named_parameters():
+            if not param.requires_grad:
+                continue
+            is_head = any(name.startswith(pref) or (f".{pref}" in name) for pref in self._HEAD_PARAM_PREFIXES)
+            use_decay = (name in decay_parameters) and ("fup_gate" not in name)
+            if is_head:
+                (hd_decay if use_decay else hd_nodecay).append(param)
+            else:
+                (bb_decay if use_decay else bb_nodecay).append(param)
+
+        groups = []
+        if bb_decay:
+            groups.append({"params": bb_decay, "lr": base_lr, "weight_decay": wd})
+        if bb_nodecay:
+            groups.append({"params": bb_nodecay, "lr": base_lr, "weight_decay": 0.0})
+        if hd_decay:
+            groups.append({"params": hd_decay, "lr": head_lr, "weight_decay": wd})
+        if hd_nodecay:
+            groups.append({"params": hd_nodecay, "lr": head_lr, "weight_decay": 0.0})
+
+        bb_n = sum(p.numel() for p in bb_decay) + sum(p.numel() for p in bb_nodecay)
+        hd_n = sum(p.numel() for p in hd_decay) + sum(p.numel() for p in hd_nodecay)
+        print(
+            f"    [Differential LR] backbone_lr={base_lr:.2e} ({bb_n/1e6:.2f}M params) | "
+            f"head_lr={head_lr:.2e} ({hd_n/1e6:.2f}M params, mult={self.head_lr_multiplier:.1f}x)"
+        )
+
+        optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args)
+        optimizer_kwargs.pop("lr", None)
+        self.optimizer = optimizer_cls(groups, **optimizer_kwargs)
+        return self.optimizer
 
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
         if hasattr(self.compute_metrics, "current_prefix"):

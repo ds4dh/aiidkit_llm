@@ -1,5 +1,5 @@
 # Run parameters
-data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v3.9/classic_ml
+data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v4.0/classic_ml
 data_split_type: random_split  # random_split, center_split, temporal_split
 result_dir: results/classic_ml
 model_types: [logistic_regression, random_forest, xgboost]
@@ -29,7 +29,7 @@ ignore_columns:
   - "label_*"
 
 # Hyper parameters for all model types
-train_data_augment: all  # none, valid, all
+train_data_augment: random  # random (continuous daily landmarks), all (30d grid), valid, none
 target_undersampling_ratio: 15.0  # same as for transformer pipeline (undersample if worse than this ratio)
 models:
 
@@ -37,11 +37,12 @@ models:
   logistic_regression:
     n_optuna_trials: 50
     optuna_params:
-      C: ["float", 0.0001, 100.0, "log"]
+      C: ["float", 0.0001, 10.0, "log"]
       penalty: ["categorical", "l1", "l2"]
       feature_fraction: ["int", 25, 100]
       solver: "liblinear"
-      max_iter: 1000
+      tol: 0.001
+      max_iter: 300
       random_state: 1234
     fixed_params:
       C: 1.0

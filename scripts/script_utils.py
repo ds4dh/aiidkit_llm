@@ -14,17 +14,16 @@ from src.tasks import DEFAULT_VALIDATION_FUPS, get_task_meta, normalize_task_key
 
 
 def get_value_embedding_tag(cfg: dict) -> str:
-    """Return short value-embedding notation ('raw' for continuous values, 'bin' for 7-level binned values)."""
-    use_num = (
-        cfg.get("model", {})
-        .get("embedding_layer_config", {})
-        .get("use_numerical_embedding", cfg.get("data_collator", {}).get("use_numerical_embedding", True))
-    )
-    return "raw" if bool(use_num) else "bin"
+    """Return short embedding notation (e.g. 'raw', 'bin', 'raw_stcond', 'bin_stcond')."""
+    emb_cfg = cfg.get("model", {}).get("embedding_layer_config", {})
+    use_num = emb_cfg.get("use_numerical_embedding", cfg.get("data_collator", {}).get("use_numerical_embedding", True))
+    use_st = bool(emb_cfg.get("use_static_conditioning", False))
+    base = "raw" if bool(use_num) else "bin"
+    return f"{base}_stcond" if use_st else base
 
 
 def format_pretrain_run_id(cfg: dict, masking_rules: dict | None = None) -> str:
-    """Build the pre-training subfolder identifier, e.g. 'e00-a15-v60_raw' or 'optuna_best_raw'."""
+    """Build the pre-training subfolder identifier, e.g. 'e00-a15-v60_raw' or 'e00-a15-v60_raw_stcond'."""
     val_tag = get_value_embedding_tag(cfg)
     if masking_rules is None and cfg.get("run_id"):
         return resolve_run_id_with_val_tag(str(cfg["run_id"]), val_tag)
@@ -34,25 +33,18 @@ def format_pretrain_run_id(cfg: dict, masking_rules: dict | None = None) -> str:
 
 
 def resolve_run_id_with_val_tag(run_id: str, val_tag: str) -> str:
-    """Ensure a pretraining run_id ends with the expected '_raw' or '_bin' suffix."""
-    base = re.sub(r"_(raw|bin)$", "", run_id.strip())
+    """Ensure a pretraining run_id ends with the expected value/static embedding suffix."""
+    base = re.sub(r"_(raw|bin)(_stcond)?$", "", run_id.strip())
     return f"{base}_{val_tag}" if base else f"e00-a15-v60_{val_tag}"
 
 
 def scan_all_fups(data_dir: Path) -> list[int]:
-    """Finds all available follow-up folders (fup_XXXX) in the data directory."""
-    fups = []
-    if not data_dir.exists():
-        return fups
-    for path in data_dir.iterdir():
-        if path.is_dir() and path.name.startswith("fup_"):
-            try:
-                # Strips trailing 'd' or similar suffix formatting characters cleanly
-                val = int(path.name.split("_")[-1].replace("d", ""))
-                fups.append(val)
-            except ValueError:
-                continue  # Skip unparseable directory signatures (e.g. fup_None)
-    return sorted(fups)
+    """Read evaluation follow-up milestones from a v4.0 dynamic store's ``manifest.json``."""
+    manifest_p = Path(data_dir) / "manifest.json"
+    if not manifest_p.exists():
+        return []
+    meta = json.loads(manifest_p.read_text(encoding="utf-8"))
+    return sorted(int(f) for f in meta.get("default_eval_fups", []))
 
 
 def prepare_dataset_fup_dict(dataset: Dataset, fup_list: list[int]):
@@ -249,7 +241,7 @@ def find_best_checkpoint(base_dir: Path, task_key: str, horizon: int) -> Path:
     h_str = f"{horizon:04d}"
     pattern = re.compile(rf"hrz\(([^)]*\b{h_str}\b[^)]*)\)")
     all_cands = [p for p in task_dir.iterdir() if p.is_dir() and pattern.search(p.name)]
-    fut_all_cands = [p for p in all_cands if "_fut(" not in p.name or "_fut(all)_" in p.name]
+    fut_all_cands = [p for p in all_cands if "_fut(" not in p.name or "_fut(all)_" in p.name or "_fut(random)_" in p.name]
     candidates = fut_all_cands or all_cands
     if not candidates:
         raise FileNotFoundError(f"No run found matching horizon configuration {h_str} inside {task_dir}")
@@ -322,7 +314,7 @@ def find_best_checkpoint_multitask(
         ):
             continue
         hrz_dirs = sorted(p for p in run_dir.iterdir() if p.is_dir() and pattern.search(p.name))
-        fut_all_hrz = [p for p in hrz_dirs if "_fut(" not in p.name or "_fut(all)_" in p.name]
+        fut_all_hrz = [p for p in hrz_dirs if "_fut(" not in p.name or "_fut(all)_" in p.name or "_fut(random)_" in p.name]
         for hrz_dir in (fut_all_hrz or hrz_dirs):
             meta = load_run_metadata(hrz_dir)
             tasks_in_run = meta.get("tasks", []) if meta else []
@@ -684,7 +676,7 @@ def resolve_predictions_csv(
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
-        fut_all = [d for d in all_cands if "_fut(" not in d.name or "_fut(all)_" in d.name]
+        fut_all = [d for d in all_cands if "_fut(" not in d.name or "_fut(all)_" in d.name or "_fut(random)_" in d.name]
         candidates = fut_all or all_cands
         if horizon is None:
             for d in candidates:

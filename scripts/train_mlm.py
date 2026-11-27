@@ -48,6 +48,7 @@ def main():
     # and associated entity-attribute-value vocabulary (required for encoding)
     time_mapping = cfg["data_collator"]["time_mapping"]
     eav_mappings = cfg["data_collator"]["eav_mappings"]
+    use_static_cond = bool(cfg.get("model", {}).get("embedding_layer_config", {}).get("use_static_conditioning", False))
     data_dir = Path(cfg["data_dir"]) / cfg["data_split_type"]
     dataset, _, vocab = load_hf_data_and_metadata(
         data_dir=data_dir,
@@ -55,6 +56,7 @@ def main():
         fup_valid=None,  # look for folder 'fup_None'
         time_mapping=time_mapping,
         eav_mappings=eav_mappings,
+        separate_static=use_static_cond,
     )
     dataset = {k: v.add_column("split", [k] * len(v)) for k, v in dataset.items()}
 
@@ -134,8 +136,15 @@ def main():
     np.random.seed(1234)
     ref_metrics = trainer.evaluate(eval_dataset=dataset["validation"], metric_key_prefix="ref_eval")
     ref_metrics["train_runtime"] = float(getattr(train_out, "metrics", {}).get("train_runtime", 0.0))
+    ref_metrics["total_params"] = int(sum(p.numel() for p in model.parameters()))
+    ref_metrics["trainable_params"] = int(sum(p.numel() for p in model.parameters() if p.requires_grad))
+    ref_metrics["num_hidden_layers"] = int(getattr(model.config, "num_hidden_layers", -1))
+    ref_metrics["hidden_size"] = int(getattr(model.config, "hidden_size", -1))
+    ref_metrics["intermediate_size"] = int(getattr(model.config, "intermediate_size", -1))
+    ref_metrics["num_attention_heads"] = int(getattr(model.config, "num_attention_heads", -1))
+    ref_metrics["best_model_checkpoint"] = getattr(trainer.state, "best_model_checkpoint", None)
     with open(Path(pt_cfg["output_dir"]) / "pretraining_results.json", "w") as f:
-        json.dump({k: float(v) if isinstance(v, (int, float, np.floating)) else v for k, v in ref_metrics.items()}, f, indent=2)
+        json.dump({k: float(v) if isinstance(v, np.floating) else (int(v) if isinstance(v, np.integer) else v) for k, v in ref_metrics.items()}, f, indent=2)
 
     # Reset wandb and clean up memory for the next run
     if use_wandb:

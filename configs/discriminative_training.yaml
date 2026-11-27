@@ -12,7 +12,7 @@
 # =============================================================================
 
 # Run configuration and task (data collator) definition
-data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v3.9/teav
+data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v4.0/teav
 data_split_type: random_split    # random_split, center_split, temporal_split
 result_dir: results/transformer  # base directory name for all results
 data_collator:
@@ -32,8 +32,12 @@ data_collator:
     value_id: 0.60      # probability of masking a value sub-token
 
 # Configuration for finetuning tasks to run
-train_data_augment: all           # default: "all" (pool all 121 FUP folders). "valid" = pool listed 18 FUPs, "none" = one model per FUP
-target_undersampling_ratio: 15.0  # per-FUP negative-to-positive cap (undersample majority class if ratio exceeds 15:1)
+train_data_augment: random        # "random" (per-epoch continuous daily landmarks), "all" (30d grid), "valid" (18 FUPs), "none" (per-FUP)
+target_undersampling_ratio: 15.0  # global negative-to-positive cap (matches Classic ML RandomUnderSampler -> unbiased hazard-vs-FUP shift)
+undersampling_mode: global        # "global" (constant logit shift across all FUPs, matches LR), "stratified_ipw", or "stratified"
+patient_weight_alpha: 0.5         # inverse-sqrt patient frame-count weighting w_p ~ n_frames(p)^(-alpha) to curb 40x long-survivor dominance (0.0 disables)
+landmark_bottleneck_dim: 128      # compact bottleneck for LandmarkSummaryEncoder (~0.45M params vs ~6.5M at D=768)
+landmark_dropout: 0.25            # explicit dropout on LandmarkSummaryEncoder (decoupled from dropout_embedding=0.0)
 drop_unlabeled: true              # drop rows whose horizon labels are all -100 (unknown outcome; the loss masks them anyway)
 early_stopping_metric: roc_auc    # metric to use for early stopping (per label, then averaged)
 early_stopping_subset: null       # tasks whose heads VOTE on early stopping / checkpoint selection (null = every valid head in the group votes)
@@ -213,7 +217,7 @@ finetuner:
   seed: 1234
   ft_subdir: "finetuning"
   logging_steps: 10
-  warmup_steps: 50
+  warmup_steps: 60
   num_train_epochs: 10  # maximum number of epochs (loses to max_steps)
   max_steps: 10000  # maximum number of steps (training + validation)
   eval_strategy: steps
@@ -226,8 +230,8 @@ finetuner:
   per_device_train_batch_size: 24
   per_device_eval_batch_size: 48
   dataloader_num_workers: 4
-  learning_rate: 4.0e-5
-  weight_decay: 0.01
+  learning_rate: 4.5e-5
+  weight_decay: 0.0075
   max_grad_norm: 1.0  # global-norm cap, applied after gradient accumulation (0 disables)
   adam_beta1: 0.9
   adam_beta2: 0.99  # a bit more spike-tolerant than the 0.999 default
@@ -286,4 +290,5 @@ model:
     dtype: bfloat16
     attn_implementation: sdpa  # flash_attention_2 will create a shape mismatch in ModernBERT, with input_embeds as input
   embedding_layer_config:
-    use_numerical_embedding: true  # true: continuous value embedding + dual-head MLM; false: 7-bin discrete token embedding + standard CE MLM
+    use_numerical_embedding: true   # true: continuous value embedding + dual-head MLM; false: 7-bin discrete token embedding + standard CE MLM
+    use_static_conditioning: true   # true: Set/Self-Attention static encoder + FiLM conditioning on every timed event + classifier fusion (no day-0 static prefix)

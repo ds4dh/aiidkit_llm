@@ -14,6 +14,7 @@ from transformers import Trainer, TrainingArguments, EarlyStoppingCallback, Eval
 from transformers.trainer_callback import PrinterCallback
 from peft import LoraConfig, get_peft_model
 from src.utils import apply_config_overrides, load_optuna_json_overrides
+from src.data.dynamic_store import make_dynamic_epoch_callback
 from src.data.patient_dataset import load_hf_data_and_metadata
 from src.data.survival_labels import (
     resolve_survival_label_keys, derive_category_survival_labels, survival_keep_mask,
@@ -122,11 +123,11 @@ def main():
         else:
             if train_data_augment == "valid":
                 train_fups = valid_fups
-            elif train_data_augment == "all":
+            elif train_data_augment in ("all", "random"):
                 data_dir = Path(cfg["data_dir"]) / cfg["data_split_type"]
                 train_fups = scan_all_fups(data_dir)
             else:
-                raise ValueError(f"Unsupported train_data_augment='{train_data_augment}' (expected 'all', 'valid', or 'none').")
+                raise ValueError(f"Unsupported train_data_augment='{train_data_augment}' (expected 'all', 'random', 'valid', or 'none').")
             run_configs = [(train_fups, valid_fups)]
 
         for train_fups, valid_fups in run_configs:
@@ -180,6 +181,7 @@ def finetune_survival_model(
     # Load FULL unfiltered survival splits first (`target_undersampling_ratio=None`) so we:
     #   1) compute exact population empirical log-hazard priors on the full training split, and
     #   2) apply exact Horvitz-Thompson inverse-probability per-FUP undersampling wrt `max(horizons)`.
+    max_seq_len = int(cfg.get("model", {}).get("config_args", {}).get("max_position_embeddings", 1024)) - 2
     dataset, _, vocab = load_hf_data_and_metadata(
         data_dir=data_root_dir,
         fup_train=fup_train,
@@ -191,6 +193,12 @@ def finetune_survival_model(
         drop_unlabeled=cfg.get("drop_unlabeled", False),
         time_mapping=cfg["data_collator"]["time_mapping"],
         eav_mappings=cfg["data_collator"]["eav_mappings"],
+        landmark_mode=("random_landmark" if train_data_augment == "random" else "fixed_grid"),
+        random_landmark_stride_days=int(cfg.get("random_landmark_stride_days", 30)),
+        random_landmark_max_fup=int(cfg.get("random_landmark_max_fup", 3600)),
+        random_landmark_seed=int(ft_cfg.get("seed", 1234)),
+        max_length=max_seq_len,
+        use_global_salience_truncation=bool(cfg.get("use_global_salience_truncation", True)),
     )
 
     for split in dataset.keys():
@@ -246,8 +254,10 @@ def finetune_survival_model(
             max_h_case = float(max(horizons))
             is_acute_case = ((tr_stats_full == 1) & (tr_times_full >= 0) & (tr_times_full <= max_h_case)).any(axis=1)
             rng = np.random.default_rng(int(ft_cfg.get("seed", 1234)))
-            order = np.argsort(tr_fups_full, kind="mergesort")
-            uniq_fups, split_pts = np.unique(tr_fups_full[order], return_index=True)
+            # Group by 30-day bins (exact match on 30d grid, smooth on continuous random landmarks)
+            fup_bins = tr_fups_full // 30
+            order = np.argsort(fup_bins, kind="mergesort")
+            uniq_fups, split_pts = np.unique(fup_bins[order], return_index=True)
             kept_idx_list, kept_ipw_list = [], []
             for grp in np.split(order, split_pts[1:]):
                 pos_g = grp[is_acute_case[grp]]
@@ -369,6 +379,13 @@ def finetune_survival_model(
 
     patience = ft_cfg.pop("early_stopping_patience", 7)
     callbacks = [EarlyStoppingCallback(early_stopping_patience=patience)]
+    if hasattr(train_dataset, "configure_survival_resampling") and getattr(train_dataset, "mode", None) == "random_landmark":
+        train_dataset.configure_survival_resampling(
+            survival_pairs=survival_pairs,
+            max_horizon=float(max(horizons)),
+            us_ratio=(cfg.get("target_undersampling_ratio", None) if is_pc_hazard else None),
+        )
+        callbacks.append(make_dynamic_epoch_callback(train_dataset))
     evaluator = CustomEvaluator(
         horizons=horizons,
         task_keys=(task_keys if num_heads > 1 else None),

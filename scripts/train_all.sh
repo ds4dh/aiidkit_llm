@@ -21,13 +21,21 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SHARED_DATA_DIR="/home/shares/ds4dh/"
 
-# Locate Apptainer image
-if [ -f "${PROJECT_DIR}/research-env.sif" ]; then
+# Locate Python runtime: prefer repo Apptainer SIF if built, else local uv .venv
+SOURCE_SIF=${SOURCE_SIF:-""}
+PYTHON_BIN=${PYTHON_BIN:-""}
+if [ -n "$SOURCE_SIF" ] && [ -f "$SOURCE_SIF" ]; then
+    RUNTIME_MODE="sif"
+elif [ -f "${PROJECT_DIR}/research-env.sif" ]; then
     SOURCE_SIF="${PROJECT_DIR}/research-env.sif"
-elif [ -f "/home/users/b/borneta/aiidkit_llm/research-env.sif" ]; then
-    SOURCE_SIF="/home/users/b/borneta/aiidkit_llm/research-env.sif"
+    RUNTIME_MODE="sif"
+elif [ -n "$PYTHON_BIN" ] && [ -x "$PYTHON_BIN" ]; then
+    RUNTIME_MODE="venv"
+elif [ -x "${PROJECT_DIR}/.venv/bin/python" ]; then
+    PYTHON_BIN="${PROJECT_DIR}/.venv/bin/python"
+    RUNTIME_MODE="venv"
 else
-    SOURCE_SIF="${PROJECT_DIR}/research-env.sif"
+    RUNTIME_MODE="missing"
 fi
 
 # ==============================================================================
@@ -55,7 +63,7 @@ done
 # DATA MODE AND ROOT DIRECTORIES
 # ==============================================================================
 USE_SYNTHETIC=${USE_SYNTHETIC:-false}
-STCS_DATA_ROOT="/home/shares/ds4dh/aiidkit_project/data_new/processed/v3.9"
+STCS_DATA_ROOT="/home/shares/ds4dh/aiidkit_project/data_new/processed/v4.0"
 SYNTHETIC_DATA_ROOT="${PROJECT_DIR}/data/synthetic"
 
 # ==============================================================================
@@ -76,12 +84,12 @@ mkdir -p "$LOG_DIR"
 # ==============================================================================
 GPU_PARTITION=${GPU_PARTITION:-"shared-gpu"}
 CPU_PARTITION=${CPU_PARTITION:-"shared-cpu"}
-GPU_SPEC=${GPU_SPEC:-"nvidia_a100-pcie-40gb:1"}
+GPU_SPEC=${GPU_SPEC:-"nvidia_geforce_rtx_3090:1"}
 GPU_CONSTRAINT=${GPU_CONSTRAINT:-""}
-SLURM_CPUS_GPU=${SLURM_CPUS_GPU:-${SLURM_CPUS:-8}}
-SLURM_CPUS_CPU=${SLURM_CPUS_CPU:-${SLURM_CPUS:-16}}
-SLURM_MEM_GPU=${SLURM_MEM_GPU:-"32G"}
-SLURM_MEM_CPU=${SLURM_MEM_CPU:-"64G"}
+SLURM_CPUS_GPU=${SLURM_CPUS_GPU:-${SLURM_CPUS:-4}}
+SLURM_CPUS_CPU=${SLURM_CPUS_CPU:-${SLURM_CPUS:-8}}
+SLURM_MEM_GPU=${SLURM_MEM_GPU:-"24G"}
+SLURM_MEM_CPU=${SLURM_MEM_CPU:-"32G"}
 
 # Reasonable walltimes per stage (based on empirical Baobab runtimes + safety margin; shared-gpu max is 12h)
 TIME_PREWARM=${TIME_PREWARM:-"00-02:00:00"}       # CPU dataset cache prewarming (~3-8m cold, ~2s warm on 16 CPU cores)
@@ -130,64 +138,41 @@ EXTRA_FT_OVERRIDES=${EXTRA_FT_OVERRIDES:-"{}"}
 # Pre-training uses fixed canonical config (e00-a15-v60_raw); Optuna optimizes fine-tuning only.
 RUN_STEP_0_OPTUNA_FINETUNE=${RUN_STEP_0_OPTUNA_FINETUNE:-false}
 OPTUNA_SPLIT=${OPTUNA_SPLIT:-"random_split"}
-OPTUNA_WORKERS=${OPTUNA_WORKERS:-12}
+OPTUNA_WORKERS=${OPTUNA_WORKERS:-3}
 OPTUNA_FT_TOTAL_TRIALS=${OPTUNA_FT_TOTAL_TRIALS:-50}
-DEFAULT_FT_WORKER_CAP=$(( (OPTUNA_FT_TOTAL_TRIALS + OPTUNA_WORKERS - 1) / OPTUNA_WORKERS + 2 ))
+DEFAULT_FT_WORKER_CAP=$(( (OPTUNA_FT_TOTAL_TRIALS + OPTUNA_WORKERS - 1) / OPTUNA_WORKERS + 8 ))
 OPTUNA_FT_TRIALS_PER_WORKER=${OPTUNA_FT_TRIALS_PER_WORKER:-$DEFAULT_FT_WORKER_CAP}
 OPTUNA_REAP_RUNNING=${OPTUNA_REAP_RUNNING:-false}
-OPTUNA_TASKS=${OPTUNA_TASKS:-"multitask_bacteria"}
+OPTUNA_TASKS=${OPTUNA_TASKS:-"infection_bacteria"}
 OPTUNA_EXPORT_RUN_ID=${OPTUNA_EXPORT_RUN_ID:-"optuna_ft"}
 
 # ==============================================================================
 # STEP EXECUTION TOGGLES (env-overridable)
 # ==============================================================================
-RUN_STEP_0_PREWARM=${RUN_STEP_0_PREWARM:-true}                                    # Step 0: Prewarm t-EAV processed caches on CPU nodes before GPU jobs
+RUN_STEP_0_PREWARM=${RUN_STEP_0_PREWARM:-false}                                   # Step 0: Not needed for v4.0 dynamic stores
 RUN_STEP_1_MLM=${RUN_STEP_1_MLM:-true}                                            # Step 1a: Pre-train t-EAV-Transformer (parallel across splits)
 RUN_STEP_4_CLASSIC_ML=${RUN_STEP_4_CLASSIC_ML:-true}                              # Step 1b: Classic ML baselines (LR, RF, XGBoost; parallel across splits & tasks)
-RUN_STEP_3_FINETUNING=${RUN_STEP_3_FINETUNING:-true}                              # Step 2: Binary fine-tuning (MT and non-MT; parallel across splits & tasks)
-RUN_STEP_2_SURVIVAL_FT=${RUN_STEP_2_SURVIVAL_FT:-false}                           # Step 3: Survival (Cox) fine-tuning (default: false)
-RUN_STEP_5_COMPARISON=${RUN_STEP_5_COMPARISON:-true}                              # Step 5: Head-to-head comparison (TFMT vs LR, RF, XGBoost)
+RUN_STEP_3_FINETUNING=${RUN_STEP_3_FINETUNING:-true}                              # Step 2: Binary fine-tuning (single-task by default)
+RUN_STEP_2_SURVIVAL_FT=${RUN_STEP_2_SURVIVAL_FT:-false}                           # Step 3: Survival fine-tuning (default: false)
+RUN_STEP_5_COMPARISON=${RUN_STEP_5_COMPARISON:-true}                              # Step 5: Head-to-head comparison (TF vs LR, RF, XGBoost)
 RUN_STEP_6_SURVIVAL_COMP=${RUN_STEP_6_SURVIVAL_COMP:-false}                       # Step 6: Cross-family survival comparison (default: false)
 RUN_STEP_7_INTERPRET=${RUN_STEP_7_INTERPRET:-true}                                # Step 7: Captum feature attribution
 RUN_STEP_8_STRATIFICATION=${RUN_STEP_8_STRATIFICATION:-true}                      # Step 8: Patient stratification and Kaplan-Meier survival
 
 if [ -z "${RUN_SPLITS+x}" ]; then
-    RUN_SPLITS=("random_split" "temporal_split" "center_split")
+    RUN_SPLITS=("random_split")
 elif [[ "$(declare -p RUN_SPLITS 2>/dev/null)" != "declare -a"* ]]; then
     read -r -a RUN_SPLITS <<< "${RUN_SPLITS//,/ }"
 fi
 
 # ==============================================================================
-# TASK LISTS FOR PARALLEL SLURM SUBMISSION
+# TASK LISTS FOR PARALLEL SLURM SUBMISSION (single-task bacteria default)
 # ==============================================================================
-# All 13 well-powered canonical tasks (5 bacterial + 4 viral + 2 fungal + 2 long-term)
-DEFAULT_SINGLE_TASKS=(
-    "infection_bacteria"
-    "infection_grp_enterobacterales"
-    "infection_grp_gram_positive"
-    "infection_grp_gn_nonfermenters"
-    "infection_grp_clostridium"
-    "infection_virus"
-    "infection_grp_herpes_viruses"
-    "infection_grp_cmv"
-    "infection_grp_bkpyv"
-    "infection_fungi"
-    "infection_grp_candida"
-    "death"
-    "graft_loss"
-)
+DEFAULT_SINGLE_TASKS=("infection_bacteria")
 
-# Category-grouped multi-task entries (B_CAT_MT: 5 fine-tuning runs per split)
-DEFAULT_MULTITASK_TASKS=(
-    "multitask_bacteria"
-    "multitask_viruses"
-    "multitask_fungi"
-    "death"
-    "graft_loss"
-)
-
-# Step 1b (Classic ML) tasks: comma- or space-separated override via CLASSIC_ML_TASKS
-if [ -n "${CLASSIC_ML_TASKS:-}" ]; then
+if [ -n "${CLASSIC_ML_TASK_GROUPS:-}" ]; then
+    IFS=';' read -r -a CML_TASK_LIST <<< "${CLASSIC_ML_TASK_GROUPS}"
+elif [ -n "${CLASSIC_ML_TASKS:-}" ]; then
     read -r -a CML_TASK_LIST <<< "${CLASSIC_ML_TASKS//,/ }"
 else
     CML_TASK_LIST=("${DEFAULT_SINGLE_TASKS[@]}")
@@ -195,55 +180,25 @@ fi
 CLASSIC_ML_MODELS=${CLASSIC_ML_MODELS:-"logistic_regression,random_forest,xgboost"}
 CLASSIC_ML_FIXED_HP=${CLASSIC_ML_FIXED_HP:-false}
 
-# Step 2 (Binary Fine-Tuning) tasks: defaults to unified multi-task (override FT_TASKS for domain/single-task sweeps)
 if [ -n "${FT_TASKS:-}" ]; then
     read -r -a FT_TASK_LIST <<< "${FT_TASKS//,/ }"
 else
-    FT_TASK_LIST=("${DEFAULT_MULTITASK_TASKS[@]}")
+    FT_TASK_LIST=("${DEFAULT_SINGLE_TASKS[@]}")
 fi
 
-# Step 3 (Survival Fine-Tuning) tasks (when RUN_STEP_2_SURVIVAL_FT=true)
 if [ -n "${SURVIVAL_TASKS:-}" ]; then
     read -r -a SURV_TASK_LIST <<< "${SURVIVAL_TASKS//,/ }"
 else
-    SURV_TASK_LIST=(
-        "infection_bacteria"
-        "grp_enterobacterales"
-        "grp_gram_positive"
-        "grp_gn_nonfermenters"
-        "grp_clostridium"
-        "infection_virus"
-        "grp_herpes_viruses"
-        "grp_cmv"
-        "grp_bkpyv"
-        "infection_fungi"
-        "grp_candida"
-        "death"
-        "graft_loss"
-    )
+    SURV_TASK_LIST=("${DEFAULT_SINGLE_TASKS[@]}")
 fi
 
-# ==============================================================================
-# ANALYSIS MODEL SELECTION (Steps 5, 7, 8)
-# Supported transformer variants (no un-suffixed aliases):
-#   - tf_raw_mt  (TFRM):  discriminative multi-task + raw continuous value embeddings
-#   - tf_raw_st  (TFRS):  discriminative single-task + raw continuous value embeddings
-#   - tf_bin_mt  (TFBM):  discriminative multi-task + 7-level binned value embeddings
-#   - tf_bin_st  (TFBS):  discriminative single-task + 7-level binned value embeddings
-#   - tfg_raw_mt (TFGRM): generative causal multi-task + raw continuous value embeddings
-#   - tfg_raw_st (TFGRS): generative causal single-task + raw continuous value embeddings
-#   - tfg_bin_mt (TFGBM): generative causal multi-task + 7-level binned value embeddings
-#   - tfg_bin_st (TFGBS): generative causal single-task + 7-level binned value embeddings
-# Default proposed model is `${DEFAULT_MODEL_PREFIX}_{raw|bin}_mt` compared against
-# classical ML baselines (`logistic_regression random_forest xgboost`).
-# ==============================================================================
 USE_NUMERICAL_EMBEDDING=${USE_NUMERICAL_EMBEDDING:-true}
 if [ "$USE_NUMERICAL_EMBEDDING" = "false" ]; then
     DEFAULT_VAL_TAG="bin"
 else
     DEFAULT_VAL_TAG="raw"
 fi
-ANALYSIS_PROPOSED_MODEL=${ANALYSIS_PROPOSED_MODEL:-"${DEFAULT_MODEL_PREFIX}_${DEFAULT_VAL_TAG}_mt"}
+ANALYSIS_PROPOSED_MODEL=${ANALYSIS_PROPOSED_MODEL:-"${DEFAULT_MODEL_PREFIX}_${DEFAULT_VAL_TAG}_st"}
 ANALYSIS_CONTENDER_MODELS=${ANALYSIS_CONTENDER_MODELS:-"logistic_regression random_forest xgboost"}
 if [ -n "${RUN_ID_OVERRIDE}" ]; then
     DEFAULT_ANALYSIS_RUN_ID="${RUN_ID_OVERRIDE}_${DEFAULT_VAL_TAG}"
@@ -254,7 +209,7 @@ else
 fi
 ANALYSIS_RUN_ID=${ANALYSIS_RUN_ID:-"${DEFAULT_ANALYSIS_RUN_ID}"}
 
-ANALYSIS_TASKS=${ANALYSIS_TASKS:-"infection_bacteria infection_grp_enterobacterales infection_grp_gram_positive infection_grp_gn_nonfermenters infection_grp_clostridium infection_virus infection_grp_herpes_viruses infection_grp_cmv infection_grp_bkpyv infection_fungi infection_grp_candida death graft_loss"}
+ANALYSIS_TASKS=${ANALYSIS_TASKS:-"infection_bacteria"}
 COMPARISON_TASKS=${COMPARISON_TASKS:-"$ANALYSIS_TASKS"}
 COMPARISON_HORIZONS=${COMPARISON_HORIZONS:-""}
 INTERPRET_TASKS=${INTERPRET_TASKS:-"infection_bacteria"}
@@ -264,7 +219,8 @@ STRATIFICATION_HORIZON=${STRATIFICATION_HORIZON:-90}
 
 COMPARISON_THRESHOLD_MODE=${COMPARISON_THRESHOLD_MODE:-"window_specific"}
 COMPARISON_TARGET_RECALL=${COMPARISON_TARGET_RECALL:-80}
-COMPARISON_WORKERS=${COMPARISON_WORKERS:-14}
+COMPARISON_WORKERS=${COMPARISON_WORKERS:-$SLURM_CPUS_CPU}
+COMPARISON_SINGLE_JOB=${COMPARISON_SINGLE_JOB:-true}
 
 # ==============================================================================
 # ACTIVE PATH SELECTION AND OVERRIDES
@@ -311,16 +267,17 @@ if [ "$DRY_RUN" != true ]; then
         echo "Error: Data root directory does not exist: $DATA_ROOT" >&2
         exit 1
     fi
-    if [ ! -f "$SOURCE_SIF" ]; then
-        echo "Error: Apptainer image not found at $SOURCE_SIF" >&2
+    if [ "$RUNTIME_MODE" = "missing" ]; then
+        echo "Error: Neither ${PROJECT_DIR}/research-env.sif nor ${PROJECT_DIR}/.venv/bin/python was found." >&2
+        echo "Build a venv ('uv venv --python 3.12 .venv && uv pip install -e .') or container ('sbatch research-env.sbatch')." >&2
         exit 1
     fi
 fi
 
 # ==============================================================================
 # SLURM WORKER TEMPLATE (generated inside LOG_DIR)
-# Copies research-env.sif to node-local /scratch/${USER}/${SLURM_JOB_ID} and
-# executes the requested step inside the container.
+# Uses repo Apptainer SIF (copied to node-local scratch) when available,
+# or runs directly inside the local .venv with node-local scratch temp dirs.
 # ==============================================================================
 WORKER_SCRIPT="${LOG_DIR}/_slurm_pipeline_worker.sbatch"
 cat << 'EOF' > "$WORKER_SCRIPT"
@@ -330,7 +287,6 @@ cat << 'EOF' > "$WORKER_SCRIPT"
 set -euo pipefail
 
 SCRATCH_DIR="/scratch/${USER}/${SLURM_JOB_ID}"
-TARGET_SIF="${SCRATCH_DIR}/research-env.sif"
 mkdir -p -m 700 "/scratch/${USER}" "${SCRATCH_DIR}" "${SCRATCH_DIR}/torch"
 chmod 700 "/scratch/${USER}" "${SCRATCH_DIR}" 2>/dev/null || true
 
@@ -339,136 +295,161 @@ cleanup() {
 }
 trap cleanup EXIT SIGTERM SIGINT
 
-echo "============================================================"
-echo "[$(date -Is)] Slurm Job ${SLURM_JOB_ID} (${SLURM_JOB_NAME}) on $(hostname)"
-echo "Stage: ${JOB_STAGE} | Split: ${JOB_SPLIT:-all} | Task: ${JOB_TASK:-all}"
-echo "Copying SIF (${SOURCE_SIF}) to node-local scratch (${TARGET_SIF})..."
-echo "============================================================"
-cp "$SOURCE_SIF" "$TARGET_SIF"
-
 PERSISTENT_CACHE_DIR="$HOME/.cache"
 mkdir -p "$PERSISTENT_CACHE_DIR/huggingface" \
          "$PERSISTENT_CACHE_DIR/triton" \
          "$PERSISTENT_CACHE_DIR/matplotlib"
 
-export APPTAINERENV_VIRTUAL_ENV="/opt/venv"
-export APPTAINERENV_PATH="/opt/venv/bin:$PATH"
-export APPTAINERENV_XDG_CACHE_HOME="$PERSISTENT_CACHE_DIR"
-export APPTAINERENV_HF_HOME="$PERSISTENT_CACHE_DIR/huggingface"
-export APPTAINERENV_TRITON_CACHE_DIR="$PERSISTENT_CACHE_DIR/triton"
-export APPTAINERENV_TORCH_HOME="${SCRATCH_DIR}/torch"
-export APPTAINERENV_MPLCONFIGDIR="$PERSISTENT_CACHE_DIR/matplotlib"
-export APPTAINERENV_REQUESTS_CA_BUNDLE="/mnt/host_cert.crt"
-export APPTAINERENV_SSL_CERT_FILE="/mnt/host_cert.crt"
-export APPTAINERENV_PYTHONUNBUFFERED="1"
-export APPTAINERENV_PYTORCH_ALLOC_CONF="expandable_segments:True"
-export APPTAINERENV_AIIDKIT_LOG_FILE="${JOB_LOG_FILE}"
-export APPTAINERENV_AIIDKIT_SCRATCH_DIR="/tmp"
-export APPTAINERENV_HF_DATASETS_CACHE="/tmp/hf_datasets_cache"
+echo "============================================================"
+echo "[$(date -Is)] Slurm Job ${SLURM_JOB_ID} (${SLURM_JOB_NAME}) on $(hostname)"
+echo "Stage: ${JOB_STAGE} | Split: ${JOB_SPLIT:-all} | Task: ${JOB_TASK:-all}"
+
+if [ "${RUNTIME_MODE}" = "sif" ]; then
+    TARGET_SIF="${SCRATCH_DIR}/research-env.sif"
+    echo "Runtime: Apptainer SIF (${SOURCE_SIF}) -> ${TARGET_SIF}"
+    echo "============================================================"
+    cp "$SOURCE_SIF" "$TARGET_SIF"
+
+    export APPTAINERENV_VIRTUAL_ENV="/opt/venv"
+    export APPTAINERENV_PATH="/opt/venv/bin:$PATH"
+    export APPTAINERENV_XDG_CACHE_HOME="$PERSISTENT_CACHE_DIR"
+    export APPTAINERENV_HF_HOME="$PERSISTENT_CACHE_DIR/huggingface"
+    export APPTAINERENV_TRITON_CACHE_DIR="$PERSISTENT_CACHE_DIR/triton"
+    export APPTAINERENV_TORCH_HOME="${SCRATCH_DIR}/torch"
+    export APPTAINERENV_MPLCONFIGDIR="$PERSISTENT_CACHE_DIR/matplotlib"
+    export APPTAINERENV_REQUESTS_CA_BUNDLE="/mnt/host_cert.crt"
+    export APPTAINERENV_SSL_CERT_FILE="/mnt/host_cert.crt"
+    export APPTAINERENV_PYTHONUNBUFFERED="1"
+    export APPTAINERENV_PYTORCH_ALLOC_CONF="expandable_segments:True"
+    export APPTAINERENV_AIIDKIT_LOG_FILE="${JOB_LOG_FILE}"
+    export APPTAINERENV_AIIDKIT_SCRATCH_DIR="/tmp"
+    export APPTAINERENV_HF_DATASETS_CACHE="/tmp/hf_datasets_cache"
+
+    BIND_MOUNTS="$HOME:$HOME,${SCRATCH_DIR}:/tmp,${SHARED_DATA_DIR}:${SHARED_DATA_DIR},/etc/pki/tls/certs/ca-bundle.crt:/mnt/host_cert.crt:ro"
+    if [ -d "/srv/beegfs/scratch" ]; then
+        BIND_MOUNTS="${BIND_MOUNTS},/srv/beegfs/scratch:/srv/beegfs/scratch"
+    fi
+else
+    echo "Runtime: Python venv (${PYTHON_BIN})"
+    echo "============================================================"
+    export XDG_CACHE_HOME="$PERSISTENT_CACHE_DIR"
+    export HF_HOME="$PERSISTENT_CACHE_DIR/huggingface"
+    export TRITON_CACHE_DIR="$PERSISTENT_CACHE_DIR/triton"
+    export TORCH_HOME="${SCRATCH_DIR}/torch"
+    export MPLCONFIGDIR="$PERSISTENT_CACHE_DIR/matplotlib"
+    export TMPDIR="${SCRATCH_DIR}"
+    export PYTHONUNBUFFERED="1"
+    export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
+    export PYTORCH_ALLOC_CONF="expandable_segments:True"
+    export AIIDKIT_LOG_FILE="${JOB_LOG_FILE}"
+    export AIIDKIT_SCRATCH_DIR="${SCRATCH_DIR}"
+    export HF_DATASETS_CACHE="${SCRATCH_DIR}/hf_datasets_cache"
+fi
+
+run_py() {
+    local nv_flag=()
+    if [ "${1:-}" = "--gpu" ]; then
+        nv_flag=(--nv)
+        shift
+    fi
+    if [ "${RUNTIME_MODE}" = "sif" ]; then
+        apptainer exec "${nv_flag[@]}" --bind "$BIND_MOUNTS" "$TARGET_SIF" /opt/venv/bin/python "$@"
+    else
+        "${PYTHON_BIN}" "$@"
+    fi
+}
 
 cd "$PROJECT_DIR"
 START_TS=$(date +%s)
 
-BIND_MOUNTS="$HOME:$HOME,${SCRATCH_DIR}:/tmp,${SHARED_DATA_DIR}:${SHARED_DATA_DIR},/etc/pki/tls/certs/ca-bundle.crt:/mnt/host_cert.crt:ro"
-if [ -d "/srv/beegfs/scratch" ]; then
-    BIND_MOUNTS="${BIND_MOUNTS},/srv/beegfs/scratch:/srv/beegfs/scratch"
-fi
-
 case "${JOB_STAGE}" in
     prewarm)
-        apptainer exec --bind "$BIND_MOUNTS" "$TARGET_SIF" \
-            /opt/venv/bin/python scripts/prewarm_caches.py \
-                -c "${FT_CONFIG}" \
-                --data-dir "${TEAV_DATA_DIR}" \
-                --splits "${JOB_SPLIT}"
+        run_py scripts/prewarm_caches.py \
+            -c "${FT_CONFIG}" \
+            --data-dir "${TEAV_DATA_DIR}" \
+            --splits "${JOB_SPLIT}"
         ;;
     optuna_ft_worker)
         OPTUNA_TASKS_COMMA="${OPTUNA_TASKS_COLON//:/,}"
         EXTRA_OPT_FLAGS=()
         [ "${DEBUG_MODE}" = "true" ] && EXTRA_OPT_FLAGS+=(--debug)
         [ -n "${OPTUNA_PRETRAINED_DIR:-}" ] && EXTRA_OPT_FLAGS+=(--pretrained-dir "${OPTUNA_PRETRAINED_DIR}")
-        apptainer exec --nv --bind "$BIND_MOUNTS" "$TARGET_SIF" \
-            /opt/venv/bin/python scripts/train_optuna.py \
-                --stage finetune \
-                -c "${FT_CONFIG}" \
-                --split "${JOB_SPLIT}" \
-                --tasks "${OPTUNA_TASKS_COMMA}" \
-                --target-trials "${OPTUNA_FT_TOTAL_TRIALS}" \
-                --n-trials "${OPTUNA_FT_TRIALS_PER_WORKER}" \
-                --export-run-id "${OPTUNA_EXPORT_RUN_ID}" \
-                --skip-final-eval \
-                --overrides "${FT_OVERRIDES}" \
-                --overrides "${EXTRA_FT_OVERRIDES}" \
-                "${EXTRA_OPT_FLAGS[@]}"
+        run_py --gpu scripts/train_optuna.py \
+            --stage finetune \
+            -c "${FT_CONFIG}" \
+            --split "${JOB_SPLIT}" \
+            --tasks "${OPTUNA_TASKS_COMMA}" \
+            --target-trials "${OPTUNA_FT_TOTAL_TRIALS}" \
+            --n-trials "${OPTUNA_FT_TRIALS_PER_WORKER}" \
+            --export-run-id "${OPTUNA_EXPORT_RUN_ID}" \
+            --skip-final-eval \
+            --overrides "${FT_OVERRIDES}" \
+            --overrides "${EXTRA_FT_OVERRIDES}" \
+            "${EXTRA_OPT_FLAGS[@]}"
         ;;
     optuna_ft_finalize)
         OPTUNA_TASKS_COMMA="${OPTUNA_TASKS_COLON//:/,}"
         EXTRA_FIN_FLAGS=(--compact-journal --reap-running)
         [ -n "${OPTUNA_PRETRAINED_DIR:-}" ] && EXTRA_FIN_FLAGS+=(--pretrained-dir "${OPTUNA_PRETRAINED_DIR}")
-        apptainer exec --nv --bind "$BIND_MOUNTS" "$TARGET_SIF" \
-            /opt/venv/bin/python scripts/train_optuna.py \
-                --stage finetune \
-                -c "${FT_CONFIG}" \
-                --split "${JOB_SPLIT}" \
-                --tasks "${OPTUNA_TASKS_COMMA}" \
-                --n-trials 0 \
-                --export-run-id "${OPTUNA_EXPORT_RUN_ID}" \
-                --overrides "${FT_OVERRIDES}" \
-                --overrides "${EXTRA_FT_OVERRIDES}" \
-                "${EXTRA_FIN_FLAGS[@]}"
+        run_py --gpu scripts/train_optuna.py \
+            --stage finetune \
+            -c "${FT_CONFIG}" \
+            --split "${JOB_SPLIT}" \
+            --tasks "${OPTUNA_TASKS_COMMA}" \
+            --n-trials 0 \
+            --export-run-id "${OPTUNA_EXPORT_RUN_ID}" \
+            --overrides "${FT_OVERRIDES}" \
+            --overrides "${EXTRA_FT_OVERRIDES}" \
+            "${EXTRA_FIN_FLAGS[@]}"
         ;;
     mlm)
         EXTRA_MLM_ARGS=()
         [ -n "${RUN_ID_OVERRIDE:-}" ] && EXTRA_MLM_ARGS+=(--overrides "{\"run_id\": \"${RUN_ID_OVERRIDE}\"}")
-        apptainer exec --nv --bind "$BIND_MOUNTS" "$TARGET_SIF" \
-            /opt/venv/bin/python scripts/train_mlm.py \
-                -c "${MLM_CONFIG}" \
-                -s \
-                "${EXTRA_MLM_ARGS[@]}" \
-                --overrides "${MLM_OVERRIDES}" \
-                --overrides "${EXTRA_MLM_OVERRIDES}" \
-                --overrides "{\"data_split_type\": \"${JOB_SPLIT}\"}" \
-                --overrides "${DEBUG_MLM_OVERRIDES}"
+        run_py --gpu scripts/train_mlm.py \
+            -c "${MLM_CONFIG}" \
+            -s \
+            "${EXTRA_MLM_ARGS[@]}" \
+            --overrides "${MLM_OVERRIDES}" \
+            --overrides "${EXTRA_MLM_OVERRIDES}" \
+            --overrides "{\"data_split_type\": \"${JOB_SPLIT}\"}" \
+            --overrides "${DEBUG_MLM_OVERRIDES}"
         ;;
     classic_ml)
         MODELS_COMMA="${CLASSIC_ML_MODELS_COLON//:/,}"
         EXTRA_CML_ARGS=()
         [ "${CLASSIC_ML_FIXED_HP:-false}" = "true" ] && EXTRA_CML_ARGS+=(--fixed_hp)
-        apptainer exec --bind "$BIND_MOUNTS" "$TARGET_SIF" \
-            /opt/venv/bin/python scripts/train_classic_ml.py \
-                -c "${CLASSIC_ML_CONFIG}" \
-                --tasks "${JOB_TASK}" \
-                --models "${MODELS_COMMA}" \
-                "${EXTRA_CML_ARGS[@]}" \
-                --overrides "${ML_OVERRIDES}" \
-                --overrides "{\"data_split_type\": \"${JOB_SPLIT}\"}" \
-                --overrides "${DEBUG_ML_OVERRIDES}"
+        run_py scripts/train_classic_ml.py \
+            -c "${CLASSIC_ML_CONFIG}" \
+            --tasks "${JOB_TASK}" \
+            --models "${MODELS_COMMA}" \
+            "${EXTRA_CML_ARGS[@]}" \
+            --overrides "${ML_OVERRIDES}" \
+            --overrides "{\"data_split_type\": \"${JOB_SPLIT}\"}" \
+            --overrides "${DEBUG_ML_OVERRIDES}"
         ;;
     finetune)
         EXTRA_FT_ARGS=()
         [ -n "${OPTUNA_FINETUNE_JSON:-}" ] && EXTRA_FT_ARGS+=(--optuna-json "${OPTUNA_FINETUNE_JSON}")
         [ -n "${RUN_ID_OVERRIDE:-}" ] && EXTRA_FT_ARGS+=(--overrides "{\"run_id\": \"${RUN_ID_OVERRIDE}\"}")
         [ -n "${TRAIN_DATA_AUGMENT:-}" ] && EXTRA_FT_ARGS+=(--overrides "{\"train_data_augment\": \"${TRAIN_DATA_AUGMENT}\"}")
-        apptainer exec --nv --bind "$BIND_MOUNTS" "$TARGET_SIF" \
-            /opt/venv/bin/python scripts/train_classification.py \
-                -c "${FT_CONFIG}" \
-                -s \
-                --tasks "${JOB_TASK}" \
-                "${EXTRA_FT_ARGS[@]}" \
-                --overrides "${FT_OVERRIDES}" \
-                --overrides "${EXTRA_FT_OVERRIDES}" \
-                --overrides "{\"data_split_type\": \"${JOB_SPLIT}\"}" \
-                --overrides "${DEBUG_FT_OVERRIDES}"
+        run_py --gpu scripts/train_classification.py \
+            -c "${FT_CONFIG}" \
+            -s \
+            --tasks "${JOB_TASK}" \
+            "${EXTRA_FT_ARGS[@]}" \
+            --overrides "${FT_OVERRIDES}" \
+            --overrides "${EXTRA_FT_OVERRIDES}" \
+            --overrides "{\"data_split_type\": \"${JOB_SPLIT}\"}" \
+            --overrides "${DEBUG_FT_OVERRIDES}"
         ;;
     survival_ft)
-        apptainer exec --nv --bind "$BIND_MOUNTS" "$TARGET_SIF" \
-            /opt/venv/bin/python scripts/train_survival.py \
-                -c "${SURVIVAL_FT_CONFIG}" \
-                -s \
-                --tasks "${JOB_TASK}" \
-                --overrides "${SURV_FT_OVERRIDES}" \
-                --overrides "{\"data_split_type\": \"${JOB_SPLIT}\"}" \
-                --overrides "${DEBUG_SURV_FT_OVERRIDES}"
+        run_py --gpu scripts/train_survival.py \
+            -c "${SURVIVAL_FT_CONFIG}" \
+            -s \
+            --tasks "${JOB_TASK}" \
+            --overrides "${SURV_FT_OVERRIDES}" \
+            --overrides "{\"data_split_type\": \"${JOB_SPLIT}\"}" \
+            --overrides "${DEBUG_SURV_FT_OVERRIDES}"
         ;;
     comparison)
         IFS=':' read -r -a CONTENDER_ARR <<< "${CONTENDERS_COLON}"
@@ -483,64 +464,58 @@ case "${JOB_STAGE}" in
             IFS=':' read -r -a COMP_HRZ_ARR <<< "${COMP_HORIZONS_COLON}"
             EXTRA_COMP_ARGS+=(--horizons "${COMP_HRZ_ARR[@]}")
         fi
-        apptainer exec --bind "$BIND_MOUNTS" "$TARGET_SIF" \
-            /opt/venv/bin/python scripts/analysis_comparison.py \
-                --results-dir "${RESULTS_DIR}" \
-                --run-id "${ANALYSIS_RUN_ID}" \
-                --proposed-model "${ANALYSIS_PROPOSED_MODEL}" \
-                --contender-models "${CONTENDER_ARR[@]}" \
-                --splits "${SPLIT_ARR[@]}" \
-                --threshold_mode "${COMPARISON_THRESHOLD_MODE}" \
-                --target_recall "${COMPARISON_TARGET_RECALL}" \
-                --workers "${COMPARISON_WORKERS}" \
-                --tasks "${COMP_TASK_ARR[@]}" \
-                "${EXTRA_COMP_ARGS[@]}"
+        run_py scripts/analysis_comparison.py \
+            --results-dir "${RESULTS_DIR}" \
+            --run-id "${ANALYSIS_RUN_ID}" \
+            --proposed-model "${ANALYSIS_PROPOSED_MODEL}" \
+            --contender-models "${CONTENDER_ARR[@]}" \
+            --splits "${SPLIT_ARR[@]}" \
+            --threshold_mode "${COMPARISON_THRESHOLD_MODE}" \
+            --target_recall "${COMPARISON_TARGET_RECALL}" \
+            --workers "${COMPARISON_WORKERS}" \
+            --tasks "${COMP_TASK_ARR[@]}" \
+            "${EXTRA_COMP_ARGS[@]}"
         if [ -z "${JOB_TASK:-}" ]; then
-            apptainer exec --bind "$BIND_MOUNTS" "$TARGET_SIF" \
-                /opt/venv/bin/python scripts/generate_summary_report.py \
-                    --results-dir "${RESULTS_DIR}" \
-                    --splits "${SPLIT_ARR[@]}"
+            run_py scripts/generate_summary_report.py \
+                --results-dir "${RESULTS_DIR}" \
+                --splits "${SPLIT_ARR[@]}"
         fi
         ;;
     summary_report)
         IFS=':' read -r -a SPLIT_ARR <<< "${SPLITS_COLON}"
-        apptainer exec --bind "$BIND_MOUNTS" "$TARGET_SIF" \
-            /opt/venv/bin/python scripts/generate_summary_report.py \
-                --results-dir "${RESULTS_DIR}" \
-                --run-id "${ANALYSIS_RUN_ID}" \
-                --splits "${SPLIT_ARR[@]}"
+        run_py scripts/generate_summary_report.py \
+            --results-dir "${RESULTS_DIR}" \
+            --run-id "${ANALYSIS_RUN_ID}" \
+            --splits "${SPLIT_ARR[@]}"
         ;;
     survival_comp)
-        apptainer exec --bind "$BIND_MOUNTS" "$TARGET_SIF" \
-            /opt/venv/bin/python scripts/analysis_survival_comparison.py \
-                -c "${SURV_COMP_CONFIG}" \
-                --overrides "${SURV_COMP_OVERRIDES}" \
-                --overrides "{\"data_split_type\": \"${JOB_SPLIT}\"}" \
-                --overrides "${DEBUG_SURV_COMP_OVERRIDES}"
+        run_py scripts/analysis_survival_comparison.py \
+            -c "${SURV_COMP_CONFIG}" \
+            --overrides "${SURV_COMP_OVERRIDES}" \
+            --overrides "{\"data_split_type\": \"${JOB_SPLIT}\"}" \
+            --overrides "${DEBUG_SURV_COMP_OVERRIDES}"
         ;;
     interpretability)
-        apptainer exec --nv --bind "$BIND_MOUNTS" "$TARGET_SIF" \
-            /opt/venv/bin/python scripts/analysis_interpretability.py \
-                --data-dir "${TEAV_DATA_DIR}" \
-                --config "${ANALYSIS_CONFIG}" \
-                --data-split-type "${JOB_SPLIT}" \
-                --results-dir "${RESULTS_DIR}" \
-                --proposed-model "${ANALYSIS_PROPOSED_MODEL}" \
-                --run-id "${ANALYSIS_RUN_ID}" \
-                --tasks "${JOB_TASK}"
+        run_py --gpu scripts/analysis_interpretability.py \
+            --data-dir "${TEAV_DATA_DIR}" \
+            --config "${ANALYSIS_CONFIG}" \
+            --data-split-type "${JOB_SPLIT}" \
+            --results-dir "${RESULTS_DIR}" \
+            --proposed-model "${ANALYSIS_PROPOSED_MODEL}" \
+            --run-id "${ANALYSIS_RUN_ID}" \
+            --tasks "${JOB_TASK}"
         ;;
     stratification)
         IFS=':' read -r -a STRAT_TASK_ARR <<< "${STRAT_TASKS_COLON}"
-        apptainer exec --nv --bind "$BIND_MOUNTS" "$TARGET_SIF" \
-            /opt/venv/bin/python scripts/analysis_stratification.py \
-                --data-dir "${TEAV_DATA_DIR}" \
-                --config "${ANALYSIS_CONFIG}" \
-                --data-split-type "${JOB_SPLIT}" \
-                --results-dir "${RESULTS_DIR}" \
-                --proposed-model "${STRATIFICATION_PROPOSED_MODEL}" \
-                --run-id "${ANALYSIS_RUN_ID}" \
-                --horizon "${STRATIFICATION_HORIZON}" \
-                --tasks "${STRAT_TASK_ARR[@]}"
+        run_py --gpu scripts/analysis_stratification.py \
+            --data-dir "${TEAV_DATA_DIR}" \
+            --config "${ANALYSIS_CONFIG}" \
+            --data-split-type "${JOB_SPLIT}" \
+            --results-dir "${RESULTS_DIR}" \
+            --proposed-model "${STRATIFICATION_PROPOSED_MODEL}" \
+            --run-id "${ANALYSIS_RUN_ID}" \
+            --horizon "${STRATIFICATION_HORIZON}" \
+            --tasks "${STRAT_TASK_ARR[@]}"
         ;;
     *)
         echo "Error: Unknown JOB_STAGE='${JOB_STAGE}'" >&2
@@ -625,7 +600,7 @@ submit_slurm_job() {
     fi
 
     # Pass stage parameters via environment variables (avoid commas inside --export values)
-    export PROJECT_DIR SHARED_DATA_DIR SOURCE_SIF RESULTS_DIR TEAV_DATA_DIR
+    export PROJECT_DIR SHARED_DATA_DIR RUNTIME_MODE SOURCE_SIF PYTHON_BIN RESULTS_DIR TEAV_DATA_DIR
     export MLM_CONFIG CLASSIC_ML_CONFIG FT_CONFIG SURVIVAL_FT_CONFIG SURV_COMP_CONFIG ANALYSIS_CONFIG
     export MLM_OVERRIDES FT_OVERRIDES SURV_FT_OVERRIDES ML_OVERRIDES SURV_COMP_OVERRIDES EXTRA_MLM_OVERRIDES EXTRA_FT_OVERRIDES
     export DEBUG_MLM_OVERRIDES DEBUG_FT_OVERRIDES DEBUG_SURV_FT_OVERRIDES DEBUG_ML_OVERRIDES DEBUG_SURV_COMP_OVERRIDES
@@ -662,6 +637,7 @@ submit_slurm_job() {
 
 echo "=============================================================================="
 echo "AIIDKIT Slurm Pipeline Orchestrator"
+echo "  Runtime        : ${RUNTIME_MODE} (${SOURCE_SIF:-$PYTHON_BIN})"
 echo "  Logs directory : ${LOG_DIR}"
 echo "  Splits         : ${RUN_SPLITS[*]}"
 echo "  GPU Partition  : ${GPU_PARTITION} (${GPU_SPEC}, ${SLURM_CPUS_GPU} CPUs, ${SLURM_MEM_GPU})"
@@ -815,8 +791,13 @@ if [ "$RUN_STEP_4_CLASSIC_ML" = true ]; then
     for split in "${RUN_SPLITS[@]}"; do
         sp=$(short_split "$split")
         split_cml_jobs=()
-        for task in "${CML_TASK_LIST[@]}"; do
-            tk=$(short_task "$task")
+        for idx in "${!CML_TASK_LIST[@]}"; do
+            task="${CML_TASK_LIST[$idx]}"
+            if [[ "$task" == *","* ]]; then
+                tk="batch$((idx + 1))"
+            else
+                tk=$(short_task "$task")
+            fi
             submit_slurm_job \
                 "cml-${sp}-${tk}" \
                 "$CPU_PARTITION" \
@@ -827,7 +808,7 @@ if [ "$RUN_STEP_4_CLASSIC_ML" = true ]; then
                 "classic_ml" \
                 "$split" \
                 "$task" \
-                "step1b_classic_ml_${split}_${task}"
+                "step1b_classic_ml_${split}_${tk}"
             split_cml_jobs+=("$LAST_JOB_ID")
             ALL_CML_JOBS+=("$LAST_JOB_ID")
         done
@@ -939,11 +920,9 @@ if [ "$RUN_STEP_5_COMPARISON" = true ]; then
     if [ ${#comp_deps[@]} -gt 0 ]; then
         dep="afterok:$(join_by_colon "${comp_deps[@]}")"
     fi
-    comp_task_jobs=()
-    for ctask in "${COMP_TASK_LIST[@]}"; do
-        tk=$(short_task "$ctask")
+    if [ "$COMPARISON_SINGLE_JOB" = true ]; then
         submit_slurm_job \
-            "anl-cmp-${tk}" \
+            "anl-cmp-all" \
             "$CPU_PARTITION" \
             "$TIME_COMPARISON" \
             "$SLURM_MEM_CPU" \
@@ -951,22 +930,38 @@ if [ "$RUN_STEP_5_COMPARISON" = true ]; then
             "$dep" \
             "comparison" \
             "" \
-            "$ctask" \
-            "step5_comparison_${ctask}"
-        comp_task_jobs+=("$LAST_JOB_ID")
-    done
-    sum_dep="afterok:$(join_by_colon "${comp_task_jobs[@]}")"
-    submit_slurm_job \
-        "anl-summary" \
-        "$CPU_PARTITION" \
-        "00-00:30:00" \
-        "16G" \
-        "false" \
-        "$sum_dep" \
-        "summary_report" \
-        "" \
-        "" \
-        "step5_summary_report"
+            "" \
+            "step5_comparison_all"
+    else
+        comp_task_jobs=()
+        for ctask in "${COMP_TASK_LIST[@]}"; do
+            tk=$(short_task "$ctask")
+            submit_slurm_job \
+                "anl-cmp-${tk}" \
+                "$CPU_PARTITION" \
+                "$TIME_COMPARISON" \
+                "$SLURM_MEM_CPU" \
+                "false" \
+                "$dep" \
+                "comparison" \
+                "" \
+                "$ctask" \
+                "step5_comparison_${ctask}"
+            comp_task_jobs+=("$LAST_JOB_ID")
+        done
+        sum_dep="afterok:$(join_by_colon "${comp_task_jobs[@]}")"
+        submit_slurm_job \
+            "anl-summary" \
+            "$CPU_PARTITION" \
+            "00-00:30:00" \
+            "16G" \
+            "false" \
+            "$sum_dep" \
+            "summary_report" \
+            "" \
+            "" \
+            "step5_summary_report"
+    fi
 else
     echo -e "\n>>> [Step 5] Skipped Model Comparison Analysis (RUN_STEP_5_COMPARISON=false)"
 fi

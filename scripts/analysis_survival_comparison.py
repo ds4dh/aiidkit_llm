@@ -38,12 +38,11 @@ import yaml
 import numpy as np
 import pandas as pd
 from collections import defaultdict
-from datasets import load_from_disk
 from sklearn.metrics import roc_auc_score, average_precision_score
 
+from src.data.dynamic_store import get_dynamic_teav_store
 from src.data.survival_labels import (
-    resolve_survival_label_keys, derive_category_survival_labels,
-    survival_keep_mask, binarize_survival_labels,
+    resolve_survival_label_keys, survival_keep_mask, binarize_survival_labels,
 )
 from src.evaluation.survival_metrics import (
     concordance_index, ipcw_brier_scores, integrated_brier_score,
@@ -64,21 +63,27 @@ def load_survival_truth(
     cache: dict,
 ) -> pd.DataFrame:
     """
-    Returns DataFrame(patient_id, time, status) for one fup snapshot and outcome,
-    with invalid/zero-information survival rows removed.
+    Returns DataFrame(patient_id, time, status) for one fup snapshot and outcome
+    directly from the portable v4.0 dynamic t-EAV store.
     """
-    ds = cache.get(fup)
-    if ds is None:
-        ds = load_from_disk(str(teav_root / split_type / f"fup_{fup:04d}"))[hf_split]
-        cache[fup] = ds
+    store_key = (str(teav_root), split_type)
+    store = cache.get(store_key)
+    if store is None:
+        store = get_dynamic_teav_store(teav_root / split_type)
+        cache[store_key] = store
 
     time_key, status_key, _ = resolve_survival_label_keys(task_key)
-    if status_key not in ds.column_names:
-        ds = derive_category_survival_labels(ds, task_key)
+    split_pidx = np.flatnonzero(store.splits_arr == hf_split)
+    ok = store.max_allowed_fup_arr[split_pidx] >= int(fup)
+    p_idx = split_pidx[ok]
+    if len(p_idx) == 0:
+        return pd.DataFrame(columns=["patient_id", "time", "status"])
 
-    patientid = np.asarray(ds["patientid"])
-    times = np.asarray(ds[time_key], dtype=np.float64)
-    statuses = np.asarray(ds[status_key], dtype=np.int64)
+    obs_end = np.full(len(p_idx), int(fup), dtype=np.int64)
+    lbls = store.compute_labels_batch(p_idx, obs_end, split=hf_split, label_keys=[time_key, status_key])
+    patientid = store.patids[p_idx]
+    times = np.asarray(lbls[time_key], dtype=np.float64)
+    statuses = np.asarray(lbls[status_key], dtype=np.int64)
     keep = survival_keep_mask(times, statuses)
     return pd.DataFrame({
         "patient_id": patientid[keep].astype(str),
@@ -221,14 +226,24 @@ def load_survival_transformer_predictions(
     fup: int,
     dataset_split: str,
 ) -> pd.DataFrame:
-    """Loads P(event by horizon) = 1 - S(horizon|x) from the Cox survival run (tidy CSV)."""
+    """Loads P(event by horizon) = 1 - S(horizon|x) from single-task or multi-task survival runs."""
     clean_run_id = run_id if run_id.endswith(("_raw", "_bin")) else f"{run_id}_raw"
     norm_task = normalize_task_key(task_key)
+    folder_candidates = [
+        task_key, norm_task,
+        "multitask_bacteria", "multitask_viruses", "multitask_fungi",
+    ]
     for subdir in ("finetuning_survival", "finetuning"):
-        for t_cand in (task_key, norm_task):
-            cand_dir = results_root / split_type / clean_run_id / subdir / t_cand
-            if cand_dir.exists():
-                return _load_predictions(cand_dir, horizon, fup, dataset_split)
+        for folder in folder_candidates:
+            cand_dir = results_root / split_type / clean_run_id / subdir / folder
+            if not cand_dir.exists():
+                continue
+            try:
+                df = _load_predictions(cand_dir, horizon, fup, dataset_split, task_filter=norm_task)
+                if not df.empty:
+                    return df
+            except FileNotFoundError:
+                continue
     raise FileNotFoundError(f"Missing survival predictions for {task_key} under {results_root}")
 
 
@@ -417,6 +432,8 @@ def main():
 
     tasks = comp.get("prediction_tasks") or cfg["prediction_tasks"]
     for task_key, task_specs in tasks.items():
+        if isinstance(task_specs, dict) and "tasks" in task_specs:
+            continue  # skip multi-task bundle definitions; evaluate individual endpoints
         fups = task_specs["fups"]
         grid = sorted(int(h) for h in task_specs["horizons"])
         print(f"\n===== Task: {task_key} | fups={fups} | horizons={grid} =====")

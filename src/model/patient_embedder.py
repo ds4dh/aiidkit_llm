@@ -1,3 +1,4 @@
+import math
 import os
 import types
 import random
@@ -277,6 +278,9 @@ class PatientEmbeddingModelFactory:
             if not has_num_emb and getattr(model.patient_embedder, "use_numerical_embedding", False):
                 print("  [Note] Checkpoint predates NumericalValueEmbedding; falling back to discrete value_id embeddings.")
                 model.patient_embedder.use_numerical_embedding = False
+            has_st_enc = any(k.startswith("patient_embedder.static_encoder.") for k in state_dict)
+            if not has_st_enc and getattr(model.patient_embedder, "use_static_conditioning", False):
+                print("  [Note] Checkpoint predates StaticContextEncoder; static encoder initialized randomly.")
             # strict=False allows switching from MLM/CausalLM head (saved) to classification head (new)
             model.load_state_dict(state_dict, strict=False)
         else:
@@ -363,6 +367,33 @@ class PatientEmbeddingModelFactory:
             ).to(dtype=model.dtype, device=model.device)
             model.drop = nn.Dropout(cls_drop)
             model.classifier = nn.Linear(hidden_size, num_labels).to(dtype=model.dtype, device=model.device)
+
+        if task == "classification" and getattr(custom_embed, "use_static_conditioning", False):
+            # Direct static residual fusion into sequence-level pooled representation before head/classifier
+            static_fusion_proj = nn.Linear(hidden_size, hidden_size)
+            nn.init.zeros_(static_fusion_proj.weight)
+            nn.init.zeros_(static_fusion_proj.bias)
+            model.static_cls_fusion = nn.Sequential(
+                nn.LayerNorm(hidden_size),
+                static_fusion_proj,
+            ).to(dtype=model.dtype, device=model.device)
+
+        if task == "classification" and getattr(custom_embed, "landmark_encoder", None) is not None:
+            # Direct semi-static landmark summary residual fusion (zero-init for smooth fine-tuning)
+            cls_drop_lm = float(
+                config_dict.get(
+                    "dropout_classifier",
+                    getattr(model.config, "dropout_classifier", getattr(model.config, "classifier_dropout", 0.1)),
+                ) or 0.0
+            )
+            lm_fusion_proj = nn.Linear(hidden_size, hidden_size)
+            nn.init.zeros_(lm_fusion_proj.weight)
+            nn.init.zeros_(lm_fusion_proj.bias)
+            model.landmark_cls_fusion = nn.Sequential(
+                nn.LayerNorm(hidden_size),
+                nn.Dropout(cls_drop_lm),
+                lm_fusion_proj,
+            ).to(dtype=model.dtype, device=model.device)
 
         if task == "masked" and getattr(custom_embed, "use_numerical_embedding", True):
             model.numerical_mlm_head = nn.Sequential(
@@ -540,6 +571,19 @@ class PatientEmbeddingModelFactory:
                 else:
                     pooled = last_hidden[:, -1, :]
 
+                static_ctx = getattr(self.patient_embedder, "_last_static_context", None)
+                if static_ctx is not None and hasattr(self, "static_cls_fusion"):
+                    fusion_dtype = self.static_cls_fusion[0].weight.dtype
+                    pooled = pooled + self.static_cls_fusion(static_ctx.to(dtype=fusion_dtype)).to(dtype=pooled.dtype)
+                lm_ctx = getattr(self.patient_embedder, "_last_landmark_context", None)
+                if lm_ctx is not None and hasattr(self, "landmark_cls_fusion"):
+                    lm_dtype = self.landmark_cls_fusion[0].weight.dtype
+                    lm_res = self.landmark_cls_fusion(lm_ctx.to(dtype=lm_dtype)).to(dtype=pooled.dtype)
+                    lm_gate = getattr(self.patient_embedder, "_last_landmark_cls_gate", None)
+                    if lm_gate is not None:
+                        lm_res = lm_res * lm_gate.to(dtype=pooled.dtype)
+                    pooled = pooled + lm_res
+
                 head_dtype = self.head[0].weight.dtype
                 pooled_head = self.head(pooled.to(dtype=head_dtype))
                 logits = self.classifier(self.drop(pooled_head).to(dtype=self.classifier.weight.dtype))
@@ -575,11 +619,55 @@ class PatientEmbeddingModelFactory:
                         outputs.hidden_states = None
                     return outputs
 
-                if labels is not None:
-                    if labels.dtype in (torch.int32, torch.int64):
-                        labels = torch.where(labels >= 0, labels, torch.full_like(labels, -100))
-                    kwargs["labels"] = labels
-                outputs = self.original_forward(inputs_embeds=inputs_embeds, **kwargs)
+                static_ctx = getattr(self.patient_embedder, "_last_static_context", None)
+                lm_ctx = getattr(self.patient_embedder, "_last_landmark_context", None)
+                has_cond_fusion = (
+                    (static_ctx is not None and hasattr(self, "static_cls_fusion"))
+                    or (lm_ctx is not None and hasattr(self, "landmark_cls_fusion"))
+                )
+                if has_cond_fusion and hasattr(self, "classifier") and hasattr(self, "model"):
+                    need_hidden = bool(kwargs.pop("output_hidden_states", False))
+                    attn_mask = kwargs.get("attention_mask", None)
+                    backbone_out = self.model(
+                        inputs_embeds=inputs_embeds,
+                        attention_mask=attn_mask,
+                        output_hidden_states=False,
+                        return_dict=True,
+                    )
+                    last_hidden = backbone_out.last_hidden_state
+                    if getattr(self.config, "classifier_pooling", "mean") == "cls":
+                        pooled = last_hidden[:, 0]
+                    elif attn_mask is not None:
+                        mask = attn_mask.unsqueeze(-1).to(dtype=last_hidden.dtype)
+                        pooled = (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
+                    else:
+                        pooled = last_hidden.mean(dim=1)
+                    if static_ctx is not None and hasattr(self, "static_cls_fusion"):
+                        fusion_dtype = self.static_cls_fusion[0].weight.dtype
+                        pooled = pooled + self.static_cls_fusion(static_ctx.to(dtype=fusion_dtype)).to(dtype=pooled.dtype)
+                    if lm_ctx is not None and hasattr(self, "landmark_cls_fusion"):
+                        lm_dtype = self.landmark_cls_fusion[0].weight.dtype
+                        lm_res = self.landmark_cls_fusion(lm_ctx.to(dtype=lm_dtype)).to(dtype=pooled.dtype)
+                        lm_gate = getattr(self.patient_embedder, "_last_landmark_cls_gate", None)
+                        if lm_gate is not None:
+                            lm_res = lm_res * lm_gate.to(dtype=pooled.dtype)
+                        pooled = pooled + lm_res
+                    pooled_head = self.head(pooled.to(dtype=last_hidden.dtype))
+                    logits = self.classifier(self.drop(pooled_head).to(dtype=self.classifier.weight.dtype))
+                    outputs = SequenceClassifierOutput(
+                        loss=None,
+                        logits=logits,
+                        hidden_states=(last_hidden,) if need_hidden else None,
+                    )
+                else:
+                    if labels is not None:
+                        if labels.ndim == 2 and getattr(self.config, "num_labels", None) is not None and labels.shape[-1] == int(self.config.num_labels) + 1:
+                            labels = None  # trailing sample-weight column handled by external compute_loss_func
+                        else:
+                            if labels.dtype in (torch.int32, torch.int64):
+                                labels = torch.where(labels >= 0, labels, torch.full_like(labels, -100))
+                            kwargs["labels"] = labels
+                    outputs = self.original_forward(inputs_embeds=inputs_embeds, **kwargs)
             
             # Enforce monotonic logits multi-label classification (discrete survival analysis)
             is_monotonic = getattr(self.config, "enforce_monotonicity", False)
@@ -634,6 +722,191 @@ class PatientEmbeddingModelFactory:
         return model
 
 
+class StaticContextEncoder(nn.Module):
+    """
+    Encodes a variable-length set of baseline static EAV embeddings ``(B, S, D)`` into:
+      - a patient context vector ``s`` of shape ``(B, D)`` via 1-layer Pre-LN self-attention
+        (capturing static x static interactions like Donor Age x Donor Type or CMV x Induction)
+        followed by masked attention pooling, and
+      - identity-initialized FiLM modulation parameters ``(gamma, beta)`` to condition every
+        timed event without fake day-0 prefix tokens or RoPE distance decay.
+    """
+
+    def __init__(self, embedding_dim: int, dropout_prob: float = 0.1, include_film: bool = True):
+        super().__init__()
+        num_heads = 8 if embedding_dim % 8 == 0 else (4 if embedding_dim % 4 == 0 else 1)
+        self.norm1 = nn.LayerNorm(embedding_dim)
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=embedding_dim, num_heads=num_heads, dropout=dropout_prob, batch_first=True
+        )
+        self.drop = nn.Dropout(dropout_prob)
+        self.norm2 = nn.LayerNorm(embedding_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout_prob),
+            nn.Linear(embedding_dim * 2, embedding_dim),
+            nn.Dropout(dropout_prob),
+        )
+        self.attn_pool = nn.Sequential(
+            nn.Linear(embedding_dim, max(32, embedding_dim // 2)),
+            nn.Tanh(),
+            nn.Linear(max(32, embedding_dim // 2), 1),
+        )
+        self.out_norm = nn.LayerNorm(embedding_dim)
+        self.include_film = bool(include_film)
+        if self.include_film:
+            self.film = nn.Linear(embedding_dim, embedding_dim * 2)
+            nn.init.zeros_(self.film.weight)
+            nn.init.zeros_(self.film.bias)
+        else:
+            self.film = None
+
+    def forward(
+        self, static_embeds: torch.Tensor, static_attention_mask: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        batch_size, seq_len, _ = static_embeds.shape
+        if static_attention_mask is None:
+            valid_mask = torch.ones((batch_size, seq_len), dtype=torch.bool, device=static_embeds.device)
+        else:
+            valid_mask = static_attention_mask.bool()
+        any_valid = valid_mask.any(dim=1)
+        safe_mask = valid_mask.clone()
+        if not bool(any_valid.all()):
+            safe_mask[~any_valid, 0] = True
+
+        normed = self.norm1(static_embeds)
+        attn_out, _ = self.self_attn(
+            normed, normed, normed, key_padding_mask=~safe_mask, need_weights=False
+        )
+        h = static_embeds + self.drop(attn_out)
+        h = h + self.ffn(self.norm2(h))
+
+        scores = self.attn_pool(h).squeeze(-1).float()
+        scores = scores.masked_fill(~safe_mask, -1e9)
+        weights = torch.softmax(scores, dim=1).to(dtype=h.dtype)
+        context = self.out_norm((h * weights.unsqueeze(-1)).sum(dim=1))
+        if not bool(any_valid.all()):
+            context = torch.where(any_valid.unsqueeze(-1), context, torch.zeros_like(context))
+
+        if self.film is not None:
+            gamma, beta = self.film(context).chunk(2, dim=-1)
+            return context, gamma, beta
+        return context, None, None
+
+
+class LandmarkSummaryEncoder(nn.Module):
+    """
+    Domain-grouped semi-static encoder mirroring ``StaticContextEncoder`` for fine-tuning
+    anti-ablation with Classic ML landmark summaries (recency, counts, trajectories, meds, hosp):
+      1. Projects each of the 5 clinical domains into one compact domain token ``(B, G, D_b)``.
+      2. Runs 1-layer Pre-LN self-attention + masked attention pooling across domains -> ``(B, D_b)``.
+      3. Projects to ``s_lm (B, D)`` and zero-initialized FiLM parameters ``(gamma, beta)``.
+    Using ``bottleneck_dim < embedding_dim`` (e.g. 128) keeps newly-initialized supervised
+    parameters small (~0.45M instead of ~6.5M at D=768) and well-regularized.
+    """
+
+    def __init__(
+        self,
+        group_dims: list[int],
+        embedding_dim: int,
+        dropout_prob: float = 0.25,
+        bottleneck_dim: int | None = None,
+        use_fup_gate: bool = False,
+    ):
+        super().__init__()
+        self.group_dims = [int(d) for d in group_dims]
+        inner_dim = (
+            int(bottleneck_dim)
+            if (bottleneck_dim is not None and 0 < int(bottleneck_dim) < int(embedding_dim))
+            else int(embedding_dim)
+        )
+        self.inner_dim = inner_dim
+        self.embedding_dim = int(embedding_dim)
+        self.use_fup_gate = bool(use_fup_gate)
+        self.domain_tokenizers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_g, inner_dim),
+                nn.LayerNorm(inner_dim),
+                nn.GELU(),
+                nn.Dropout(dropout_prob),
+            )
+            for d_g in self.group_dims
+        ])
+        self.domain_type_embed = nn.Parameter(torch.zeros(1, len(self.group_dims), inner_dim))
+        nn.init.normal_(self.domain_type_embed, std=0.02)
+        self.context_encoder = StaticContextEncoder(
+            embedding_dim=inner_dim,
+            dropout_prob=dropout_prob,
+            include_film=(inner_dim == self.embedding_dim),
+        )
+        if inner_dim != self.embedding_dim:
+            self.out_proj = nn.Sequential(
+                nn.Dropout(dropout_prob),
+                nn.Linear(inner_dim, self.embedding_dim),
+                nn.LayerNorm(self.embedding_dim),
+            )
+            self.film_proj = nn.Linear(inner_dim, self.embedding_dim * 2)
+            nn.init.zeros_(self.film_proj.weight)
+            nn.init.zeros_(self.film_proj.bias)
+        else:
+            self.out_proj = None
+            self.film_proj = None
+
+        if self.use_fup_gate:
+            # Smooth log-time gate g(fup) in (0, 1) -> [g_film, g_cls].
+            # Initialized around sigmoid(3.0 * u - 1.5), u = log1p(fup) / log1p(3600):
+            #   fup=0d -> ~0.18 (sequence-led in POP), fup=3600d -> ~0.82 (tabular-assisted in VLT).
+            self.fup_gate_lin = nn.Linear(1, 2)
+            with torch.no_grad():
+                self.fup_gate_lin.weight.fill_(3.0)
+                self.fup_gate_lin.bias.fill_(-1.5)
+            self.fup_gate_mlp = nn.Sequential(
+                nn.Linear(2, 16),
+                nn.SiLU(),
+                nn.Linear(16, 2),
+            )
+            nn.init.zeros_(self.fup_gate_mlp[-1].weight)
+            nn.init.zeros_(self.fup_gate_mlp[-1].bias)
+        else:
+            self.fup_gate_lin = None
+            self.fup_gate_mlp = None
+
+    def compute_fup_gates(self, landmark_fup: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        w_dtype = self.fup_gate_lin.weight.dtype
+        w_dev = self.fup_gate_lin.weight.device
+        u = (
+            torch.log1p(landmark_fup.to(device=w_dev, dtype=torch.float32).clamp(min=0.0))
+            / math.log1p(3600.0)
+        ).unsqueeze(-1)
+        u_feat = torch.cat([u, u * u], dim=-1)
+        logits = self.fup_gate_lin(u.to(dtype=w_dtype)) + self.fup_gate_mlp(u_feat.to(dtype=w_dtype))
+        gates = torch.sigmoid(logits.float())
+        return gates[:, 0:1], gates[:, 1:2]
+
+    def forward(
+        self,
+        landmark_summary: torch.Tensor,
+        landmark_fup: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        chunks = torch.split(landmark_summary, self.group_dims, dim=-1)
+        tokens = torch.stack([tok_fn(chunk) for tok_fn, chunk in zip(self.domain_tokenizers, chunks)], dim=1)
+        tokens = tokens + self.domain_type_embed.to(dtype=tokens.dtype)
+        ctx_in, gamma_in, beta_in = self.context_encoder(tokens, static_attention_mask=None)
+        if self.out_proj is not None and self.film_proj is not None:
+            context = self.out_proj(ctx_in)
+            gamma, beta = self.film_proj(ctx_in).chunk(2, dim=-1)
+        else:
+            context, gamma, beta = ctx_in, gamma_in, beta_in
+        g_cls = None
+        if self.use_fup_gate and self.fup_gate_lin is not None and landmark_fup is not None:
+            g_film, g_cls = self.compute_fup_gates(landmark_fup)
+            g_film = g_film.to(device=gamma.device, dtype=gamma.dtype)
+            gamma = gamma * g_film
+            beta = beta * g_film
+        return context, gamma, beta, g_cls
+
+
 class PatientEmbeddingLayer(nn.Module):
     def __init__(
         self,
@@ -646,6 +919,11 @@ class PatientEmbeddingLayer(nn.Module):
         },
         time_mapping: dict[str, str] = {"days_since_tpx": "time"},
         use_numerical_embedding: bool = True,
+        use_static_conditioning: bool = False,
+        landmark_summary_group_dims: list[int] | None = None,
+        landmark_bottleneck_dim: int | None = None,
+        landmark_dropout: float | None = None,
+        landmark_fup_gate: bool = False,
         dropout_prob: float = 0.1,
         **_unused_kwargs,
     ):
@@ -657,6 +935,14 @@ class PatientEmbeddingLayer(nn.Module):
         self.time_key = list(time_mapping.keys())[0]
         self.eav_keys = list(eav_mappings.keys())
         self.use_numerical_embedding = use_numerical_embedding
+        self.use_static_conditioning = bool(use_static_conditioning)
+        self.landmark_summary_group_dims = [int(d) for d in landmark_summary_group_dims] if landmark_summary_group_dims else None
+        self.landmark_bottleneck_dim = int(landmark_bottleneck_dim) if landmark_bottleneck_dim is not None else None
+        self.landmark_dropout = float(landmark_dropout) if landmark_dropout is not None else max(0.1, float(dropout_prob))
+        self.landmark_fup_gate = bool(landmark_fup_gate)
+        self._last_static_context: torch.Tensor | None = None
+        self._last_landmark_context: torch.Tensor | None = None
+        self._last_landmark_cls_gate: torch.Tensor | None = None
 
         self.time_embedding = TimeEmbedding(embedding_dim)
         self.delta_time_embedding = TimeEmbedding(embedding_dim)
@@ -673,6 +959,22 @@ class PatientEmbeddingLayer(nn.Module):
             nn.Linear(embedding_dim * 3, embedding_dim),
             nn.LayerNorm(embedding_dim),
             nn.Dropout(dropout_prob),
+        )
+        self.static_encoder = (
+            StaticContextEncoder(embedding_dim=embedding_dim, dropout_prob=dropout_prob)
+            if self.use_static_conditioning
+            else None
+        )
+        self.landmark_encoder = (
+            LandmarkSummaryEncoder(
+                group_dims=self.landmark_summary_group_dims,
+                embedding_dim=embedding_dim,
+                dropout_prob=self.landmark_dropout,
+                bottleneck_dim=self.landmark_bottleneck_dim,
+                use_fup_gate=self.landmark_fup_gate,
+            )
+            if self.landmark_summary_group_dims
+            else None
         )
 
         # Explicit hooks for Captum attribution analysis (identity layers)
@@ -716,6 +1018,17 @@ class PatientEmbeddingLayer(nn.Module):
         num_embeds = self.numerical_embedding(safe_nums).to(dtype=tok_embeds.dtype)
         return torch.where(is_num.unsqueeze(-1), num_embeds, tok_embeds)
 
+    def _encode_static_eav(self, kwargs: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        st_embeds = []
+        for key in self.eav_keys:
+            st_key = f"static_{key}"
+            if key == "value_id":
+                st_embeds.append(self.encode_values(kwargs[st_key], kwargs.get("static_value_num")))
+            else:
+                st_embeds.append(self.token_embedding(kwargs[st_key]))
+        st_x = self.eav_projector(torch.cat(st_embeds, dim=-1))
+        return self.static_encoder(st_x, kwargs.get("static_attention_mask"))
+
     def forward(self, **kwargs) -> torch.Tensor:
         """
         Forward pass for the patient embedding layer.
@@ -732,7 +1045,27 @@ class PatientEmbeddingLayer(nn.Module):
         x = self.eav_projector(torch.cat(eav_embeds, dim=-1))
         x = self.aggregated_embedding_hook(x)  # for captum analysis
         x = x.to(kwargs[self.time_key].device)
-        return self.add_time_embeddings(x, kwargs[self.time_key])
+        x = self.add_time_embeddings(x, kwargs[self.time_key])
+
+        if self.use_static_conditioning and self.static_encoder is not None and "static_entity_id" in kwargs:
+            static_ctx, gamma, beta = self._encode_static_eav(kwargs)
+            self._last_static_context = static_ctx
+            x = x * (1.0 + gamma.unsqueeze(1).to(dtype=x.dtype)) + beta.unsqueeze(1).to(dtype=x.dtype)
+        else:
+            self._last_static_context = None
+
+        if self.landmark_encoder is not None and "landmark_summary" in kwargs:
+            lm_dtype = self.landmark_encoder.domain_tokenizers[0][0].weight.dtype
+            lm_in = kwargs["landmark_summary"].to(device=x.device, dtype=lm_dtype)
+            lm_fup = kwargs.get("landmark_fup")
+            lm_ctx, lm_gamma, lm_beta, lm_cls_gate = self.landmark_encoder(lm_in, landmark_fup=lm_fup)
+            self._last_landmark_context = lm_ctx
+            self._last_landmark_cls_gate = lm_cls_gate
+            x = x * (1.0 + lm_gamma.unsqueeze(1).to(dtype=x.dtype)) + lm_beta.unsqueeze(1).to(dtype=x.dtype)
+        else:
+            self._last_landmark_context = None
+            self._last_landmark_cls_gate = None
+        return x
 
 
 @dataclass
@@ -806,6 +1139,50 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
 
         return padded_sequences
     
+    def _extract_and_pad_static(
+        self,
+        samples: list[dict],
+    ) -> tuple[list[dict], dict[str, np.ndarray]]:
+        """Extract and pad optional separate static conditioning arrays without time/MLM corruption."""
+        if not samples or "static_entity_id" not in samples[0]:
+            return samples, {}
+        samples = [dict(s) for s in samples]
+        static_eav_keys = [f"static_{k}" for k in self.eav_keys]
+        static_num_key = f"static_{self.value_num_key}"
+        static_lengths = np.array([len(s[static_eav_keys[0]]) for s in samples], dtype=np.int64)
+        max_s = max(1, int(static_lengths.max()))
+
+        padded_static: dict[str, np.ndarray] = {}
+        for key in static_eav_keys:
+            seqs = [np.asarray(s.pop(key), dtype=np.int64) for s in samples]
+            arr = np.full((len(samples), max_s), self.pad_token_id, dtype=np.int64)
+            for idx, seq in enumerate(seqs):
+                if len(seq) > 0:
+                    arr[idx, :len(seq)] = seq
+            padded_static[key] = arr
+
+        if static_num_key in samples[0]:
+            num_seqs = [np.asarray(s.pop(static_num_key), dtype=np.float32) for s in samples]
+            num_arr = np.full((len(samples), max_s), np.nan, dtype=np.float32)
+            for idx, seq in enumerate(num_seqs):
+                if len(seq) > 0:
+                    num_arr[idx, :len(seq)] = seq
+            padded_static[static_num_key] = num_arr
+
+        padded_static["static_attention_mask"] = (np.arange(max_s)[None, :] < static_lengths[:, None]).astype(np.int64)
+        return samples, padded_static
+
+    def _extract_landmark_summary(
+        self,
+        samples: list[dict],
+    ) -> tuple[list[dict], np.ndarray | None]:
+        """Extract pre-normalized semi-static landmark summary vectors (B, D_tab) if present."""
+        if not samples or "landmark_summary" not in samples[0]:
+            return samples, None
+        samples = [dict(s) for s in samples]
+        lm_rows = [np.asarray(s.pop("landmark_summary"), dtype=np.float32) for s in samples]
+        return samples, np.stack(lm_rows, axis=0)
+
     def _separate_non_processed_features(
         self,
         samples: list[dict],
@@ -1007,6 +1384,7 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
         Main entry point used by HuggingFace Trainer.
         """
         self.do_augmentation = bool(samples and samples[0].get("split") == "train")
+        samples, padded_static = self._extract_and_pad_static(samples)
         samples, non_features = self._separate_non_processed_features(samples)
         padded_batch, attention_mask = self._process_batch(samples)
         # Snapshot clean (unmasked) arrays before _masked_modelling mutates padded_batch in-place.
@@ -1021,6 +1399,8 @@ class PatientDataCollatorForMaskedLanguageModelling(DataCollatorMixin):
         input_dict_tensors = {k: torch.tensor(v) for k, v in masked_input_dict.items()}
         for ck, cv in clean_snapshot.items():
             input_dict_tensors[ck] = torch.tensor(cv)
+        for sk, sv in padded_static.items():
+            input_dict_tensors[sk] = torch.tensor(sv)
         batch = {
             "input_dict": input_dict_tensors,
             "attention_mask": torch.tensor(attention_mask),
@@ -1175,6 +1555,9 @@ class PatientDataCollatorForClassification(PatientDataCollatorForMaskedLanguageM
         Used by HuggingFace's trainer
         """
         samples = [dict(s) for s in samples]
+        ipw_vals = None
+        if samples and "ipw_weight" in samples[0]:
+            ipw_vals = [float(s.pop("ipw_weight")) for s in samples]
         batch_labels = []
         for s in samples:
             missing_keys = [k for k in self.label_keys if k not in s]
@@ -1186,14 +1569,27 @@ class PatientDataCollatorForClassification(PatientDataCollatorForMaskedLanguageM
 
         # Preprocess the input samples
         self.do_augmentation = bool(samples and samples[0].get("split") == "train")
+        samples, padded_static = self._extract_and_pad_static(samples)
+        samples, landmark_summary = self._extract_landmark_summary(samples)
         samples, non_features = self._separate_non_processed_features(samples)
         padded_batch, attention_mask = self._process_batch(samples)
 
         # Assemble batch
+        input_dict_tensors = {k: torch.tensor(v) for k, v in padded_batch.items()}
+        for sk, sv in padded_static.items():
+            input_dict_tensors[sk] = torch.tensor(sv)
+        if landmark_summary is not None:
+            input_dict_tensors["landmark_summary"] = torch.tensor(landmark_summary, dtype=torch.float32)
+        if "fup" in non_features:
+            input_dict_tensors["landmark_fup"] = torch.as_tensor(non_features["fup"], dtype=torch.float32)
+        labels_tensor = torch.tensor(batch_labels, dtype=torch.float)
+        if ipw_vals is not None:
+            w_col = torch.tensor(ipw_vals, dtype=torch.float32).unsqueeze(1)
+            labels_tensor = torch.cat([labels_tensor, w_col], dim=1)
         batch = {
-            "input_dict": {k: torch.tensor(v) for k, v in padded_batch.items()},
+            "input_dict": input_dict_tensors,
             "attention_mask": torch.tensor(attention_mask),
-            "labels": torch.tensor(batch_labels, dtype=torch.float),
+            "labels": labels_tensor,
         }
         batch.update(non_features)  # in case useful somewhere
 

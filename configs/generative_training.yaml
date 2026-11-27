@@ -16,7 +16,7 @@
 # =============================================================================
 
 # Run configuration and task (data collator) definition
-data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v3.9/teav
+data_dir: /home/shares/ds4dh/aiidkit_project/data_new/processed/v4.0/teav
 data_split_type: random_split               # random_split, center_split, temporal_split
 result_dir: results/generative_transformer  # base directory name for all generative (`tfg_*`) results
 data_collator:
@@ -36,7 +36,7 @@ data_collator:
     value_id: 0.60      # probability of masking a value sub-token
 
 # Configuration for finetuning tasks to run
-train_data_augment: all           # default: "all" (pool every fup folder; 'fups' then only affect run names). "none" = one model per fup, "valid" = pool listed fups
+train_data_augment: random        # "random" (per-epoch continuous daily landmarks), "all" (30d grid), "valid" (18 FUPs), "none" (per-FUP)
 target_undersampling_ratio: 15.0  # maximum ("worst") ratio of positive to negative samples during finetuning (null for not using under-sampling)
 drop_unlabeled: true              # drop rows whose horizon labels are all -100 (unknown outcome; the loss masks them anyway)
 early_stopping_metric: roc_auc    # metric to use for early stopping (per label, then averaged)

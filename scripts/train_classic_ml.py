@@ -9,13 +9,13 @@ import json
 import numpy as np
 import pandas as pd
 import optuna
-from concurrent.futures import ThreadPoolExecutor
 from tqdm.auto import tqdm
 from scipy.special import logit
 from xgboost import XGBClassifier
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.feature_selection import SelectPercentile, f_classif, VarianceThreshold
+from sklearn.feature_selection import f_classif, VarianceThreshold
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
@@ -24,6 +24,7 @@ from sklearn.metrics import roc_auc_score
 from transformers.trainer_utils import EvalPrediction
 from imblearn.pipeline import Pipeline as ImbPipeline
 from imblearn.under_sampling import RandomUnderSampler
+from src.data.dynamic_store import get_dynamic_classic_ml_store, is_dynamic_classic_ml_dir
 from src.utils import apply_config_overrides
 from src.evaluation.plot_results import plot_task_results
 from src.evaluation.evaluate_models import (
@@ -99,17 +100,14 @@ def main():
 
             # Determine training configuration (train vs valid follow-up periods)
             if train_data_augment == "none":
-                # One run per follow-up period
                 run_configs = [([f], [f]) for f in valid_fups]
             else:
-                # Single run with aggregated data
                 if train_data_augment == "valid":
                     train_fups = valid_fups
-                elif train_data_augment == "all":
+                elif train_data_augment in ("all", "random"):
                     train_fups = scan_all_fups(data_root)
                 else:
                     raise ValueError(f"Unknown train_data_augment: {train_data_augment}")
-                
                 run_configs = [(train_fups, valid_fups)]
 
             # Train a model for all combinations of horizons and follow-up periods
@@ -117,7 +115,12 @@ def main():
                 for train_fups_list, valid_fups_list in run_configs:
                     
                     # Train model
-                    t_str = "All" if train_data_augment == "all" else str(train_fups_list)
+                    if train_data_augment == "random":
+                        t_str = f"Random (stride={cfg.get('random_landmark_stride_days', 30)}d)"
+                    elif train_data_augment == "all":
+                        t_str = "All"
+                    else:
+                        t_str = str(train_fups_list)
                     print(f"\nProcessing task: {task_key} | Model: {model_type}")
                     print(f"Horizon: {horizon}d | Train FUPs: {t_str}")
                     train_model_run(
@@ -145,32 +148,44 @@ def main():
             )
 
 
-def _load_cached_split_frame(data_root: Path, fups: list[int], filename: str, base_ignore_cols: set[str]) -> tuple[pd.DataFrame | None, list[str]]:
-    """Loads all FUP parquets once per (data_root, fups, filename) without split-dependent encoding."""
-    cache_key = (str(data_root.resolve()), tuple(int(f) for f in fups), filename)
+def _load_cached_split_frame(
+    data_root: Path,
+    fups: list[int],
+    filename: str,
+    base_ignore_cols: set[str],
+    landmark_mode: str = "fixed_grid",
+    random_stride_days: int = 30,
+    random_max_fup: int = 3600,
+    random_seed: int = 1234,
+) -> tuple[pd.DataFrame | None, list[str]]:
+    """Materialize a split DataFrame ONCE from the portable v4.0 dynamic Classic ML store."""
+    if not is_dynamic_classic_ml_dir(data_root):
+        raise FileNotFoundError(
+            f"Expected a v4.0 dynamic Classic ML store (manifest.json + indexes.npz) at: {data_root}"
+        )
+
+    split_name = Path(filename).stem  # "train", "validation", "test"
+    cache_key = (
+        str(data_root.resolve()),
+        ("random_landmark", int(random_stride_days), int(random_max_fup), int(random_seed))
+        if landmark_mode == "random_landmark"
+        else tuple(int(f) for f in fups),
+        filename,
+    )
     if cache_key in _SPLIT_FRAME_CACHE:
         return _SPLIT_FRAME_CACHE[cache_key]
 
-    def _read_one(fup):
-        fup_dir = data_root / f"fup_{fup:04d}d"
-        if not fup_dir.exists():
-            fup_dir = data_root / f"fup_{fup:04d}"
-        file_path = fup_dir / filename
-        if not file_path.exists():
-            return None
-        df_chunk = pd.read_parquet(file_path)
-        if len(df_chunk) > 0:
-            df_chunk = df_chunk.copy()
-            df_chunk["__fup__"] = int(fup)
-        return df_chunk
-
-    workers = min(8, max(1, len(fups)))
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        dfs = [d for d in ex.map(_read_one, fups) if d is not None]
-
-    if not dfs:
+    store = get_dynamic_classic_ml_store(data_root)
+    full_df = store.materialize_split(
+        split=split_name,
+        mode=landmark_mode,
+        fups=(None if landmark_mode == "random_landmark" else fups),
+        stride_days=random_stride_days,
+        max_fup_cap=random_max_fup,
+        seed=random_seed,
+    )
+    if full_df is None or full_df.empty:
         return None, []
-    full_df = pd.concat(dfs, ignore_index=True)
     feats = [c for c in full_df.columns if c not in base_ignore_cols and c != "__fup__" and not c.startswith("label_")]
     _SPLIT_FRAME_CACHE[cache_key] = (full_df, feats)
     return full_df, feats
@@ -178,12 +193,25 @@ def _load_cached_split_frame(data_root: Path, fups: list[int], filename: str, ba
 
 def load_combined_data(
     data_root, fups, filename, label_key, ignore_cols, enforced_features=None, return_fups=False,
+    landmark_mode: str = "fixed_grid",
+    random_stride_days: int = 30,
+    random_max_fup: int = 3600,
+    random_seed: int = 1234,
 ):
     """
-    Loads and concatenates data from multiple FUP directories (served from in-memory split cache).
+    Loads and concatenates data from multiple FUP directories (or materializes from a dynamic store).
     """
     base_ignore = {c for c in ignore_cols if not c.startswith("label_")}
-    full_df, detected_feats = _load_cached_split_frame(Path(data_root), list(fups), filename, base_ignore)
+    full_df, detected_feats = _load_cached_split_frame(
+        Path(data_root),
+        list(fups),
+        filename,
+        base_ignore,
+        landmark_mode=landmark_mode,
+        random_stride_days=random_stride_days,
+        random_max_fup=random_max_fup,
+        random_seed=random_seed,
+    )
     if full_df is None or full_df.empty:
         return (None, None, None, None, None) if return_fups else (None, None, None, None)
 
@@ -227,11 +255,22 @@ def train_model_run(
     label_key = f"label_{task_key}_{horizon:04d}d"
     ignore_cols = set(cfg['ignore_columns'] + [label_key])
 
-    # Load training data
-    print(f"Loading training data from {len(train_fups)} folders...")
+    # Load training data (dynamic random landmarks when train_data_augment == "random", else fixed FUP grid)
+    tr_landmark_mode = "random_landmark" if train_data_augment == "random" else "fixed_grid"
+    tr_stride = int(cfg.get("random_landmark_stride_days", 30))
+    tr_max_fup = int(cfg.get("random_landmark_max_fup", 3600))
+    tr_seed = int(cfg.get("random_landmark_seed", 1234))
+    if tr_landmark_mode == "random_landmark":
+        print(f"Materializing dynamic random-landmark training data (stride={tr_stride}d, max_fup={tr_max_fup}d)...")
+    else:
+        print(f"Loading training data from {len(train_fups)} FUPs...")
     X_train, y_train, features, _ = load_combined_data(
         data_root, train_fups, "train.parquet",
         label_key, ignore_cols, enforced_features=None,
+        landmark_mode=tr_landmark_mode,
+        random_stride_days=tr_stride,
+        random_max_fup=tr_max_fup,
+        random_seed=tr_seed,
     )
     if X_train is None or len(X_train) == 0:
         print("Training set empty. Skipping.")
@@ -271,6 +310,9 @@ def train_model_run(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Train
+    store = get_dynamic_classic_ml_store(data_root)
+    categorical_names = set(store.manifest.get("categorical_mappings", {}).keys())
+
     target_us_ratio = None
     inv_tusr = cfg.get('target_undersampling_ratio')
     if inv_tusr is not None: 
@@ -283,6 +325,8 @@ def train_model_run(
             n_trials=model_config.get('n_optuna_trials', 50),
             output_dir=output_dir,
             target_ratio=target_us_ratio,
+            feature_names=features,
+            categorical_names=categorical_names,
         )
         trainer.optimize_and_train(X_train, y_train, X_val, y_val)
     else:
@@ -293,6 +337,8 @@ def train_model_run(
             model_params=final_params,
             output_dir=output_dir,
             target_ratio=target_us_ratio,
+            feature_names=features,
+            categorical_names=categorical_names,
         )
         trainer.train(X_train, y_train)
     
@@ -339,17 +385,20 @@ def _evaluate_pipeline_predictions(pipeline, X, y, evaluator, prefix="eval"):
 
 
 class BaselineTrainer:
-    def __init__(self, model_type, model_params, output_dir, target_ratio):
+    def __init__(self, model_type, model_params, output_dir, target_ratio, feature_names=None, categorical_names=None):
         self.output_dir = Path(output_dir)
         self.model_type = model_type
         self.model_params = model_params
         self.pipeline = None 
         self.target_ratio = target_ratio
+        self.feature_names = feature_names
+        self.categorical_names = categorical_names
 
     def train(self, X_train, y_train):
         print(f"Training {self.model_type}...")
         self.pipeline = build_model_pipeline(
             X_train, y_train, self.model_type, self.model_params, self.target_ratio,
+            feature_names=self.feature_names, categorical_names=self.categorical_names,
         )
         self.pipeline.fit(X_train, y_train)
 
@@ -358,7 +407,7 @@ class BaselineTrainer:
 
 
 class OptunaTrainer:
-    def __init__(self, model_type, optuna_config, n_trials, output_dir, target_ratio):
+    def __init__(self, model_type, optuna_config, n_trials, output_dir, target_ratio, feature_names=None, categorical_names=None):
         self.model_type = model_type
         self.optuna_config = optuna_config
         self.n_trials = n_trials
@@ -366,18 +415,23 @@ class OptunaTrainer:
         self.pipeline = None
         self.best_params = None
         self.target_ratio = target_ratio
+        self.feature_names = feature_names
+        self.categorical_names = categorical_names
 
     def optimize_and_train(self, X_train, y_train, X_val, y_val):
         """
         Runs seeded Optuna optimization to find best params (precomputing preprocessing
         and ANOVA feature ranking once), then retrains on full training data.
         """
-        base_pipe = build_model_pipeline(X_train, y_train, self.model_type, self._merge_fixed_params({}), self.target_ratio)
+        base_pipe = build_model_pipeline(
+            X_train, y_train, self.model_type, self._merge_fixed_params({}), self.target_ratio,
+            feature_names=self.feature_names, categorical_names=self.categorical_names,
+        )
         prep_only = Pipeline([base_pipe.steps[0], base_pipe.steps[1]])
         X_train_prep = prep_only.fit_transform(X_train, y_train)
         X_val_prep = prep_only.transform(X_val)
 
-        f_scores, _ = f_classif(X_train_prep, y_train)
+        f_scores, _ = f_classif(_median_impute_for_scoring(X_train_prep), y_train)
         f_scores = np.nan_to_num(f_scores, nan=-np.inf)
         feat_rank_desc = np.argsort(f_scores)[::-1]
         n_prep_feats = X_train_prep.shape[1]
@@ -386,7 +440,7 @@ class OptunaTrainer:
             params = dict(self._suggest_params(trial))
             pct = int(params.pop("feature_fraction", 100))
             k_keep = max(1, int(np.ceil(n_prep_feats * (pct / 100.0))))
-            keep_cols = feat_rank_desc[:k_keep]
+            keep_cols = np.sort(feat_rank_desc[:k_keep])
             X_tr_sel = X_train_prep[:, keep_cols]
             X_va_sel = X_val_prep[:, keep_cols]
 
@@ -425,6 +479,7 @@ class OptunaTrainer:
         print("Retraining final model on training set...")
         self.pipeline = build_model_pipeline(
             X_train, y_train, self.model_type, final_params, self.target_ratio,
+            feature_names=self.feature_names, categorical_names=self.categorical_names,
         )
         self.pipeline.fit(X_train, y_train)
 
@@ -479,64 +534,119 @@ class OptunaTrainer:
 # HELPER FUNCTIONS
 # ================
 
-def infer_feature_types(X, cat_threshold=20):
+def _median_impute_for_scoring(X) -> np.ndarray:
+    """Return a finite float64 view for univariate ANOVA ranking without mutating X."""
+    X_arr = np.asarray(X, dtype=np.float64)
+    if not np.isnan(X_arr).any():
+        return X_arr
+    medians = np.nanmedian(X_arr, axis=0)
+    medians = np.where(np.isnan(medians), 0.0, medians)
+    rows, cols = np.where(np.isnan(X_arr))
+    X_imp = X_arr.copy()
+    X_imp[rows, cols] = medians[cols]
+    return X_imp
+
+
+class NaNSafeSelectPercentile(BaseEstimator, TransformerMixin):
+    """Selects top ``percentile``% features by ANOVA F-score while preserving NaNs in transform."""
+
+    def __init__(self, percentile: int = 100):
+        self.percentile = int(percentile)
+
+    def fit(self, X, y):
+        X_arr = np.asarray(X, dtype=np.float64)
+        self.n_features_in_ = X_arr.shape[1]
+        f_scores, _ = f_classif(_median_impute_for_scoring(X_arr), y)
+        f_scores = np.nan_to_num(f_scores, nan=-np.inf)
+        k_keep = max(1, int(np.ceil(self.n_features_in_ * (self.percentile / 100.0))))
+        self.keep_indices_ = np.sort(np.argsort(f_scores)[::-1][:k_keep])
+        return self
+
+    def transform(self, X):
+        return np.asarray(X)[:, self.keep_indices_]
+
+    def get_support(self, indices: bool = False):
+        if indices:
+            return self.keep_indices_.copy()
+        mask = np.zeros(self.n_features_in_, dtype=bool)
+        mask[self.keep_indices_] = True
+        return mask
+
+
+def infer_feature_types(X, feature_names=None, categorical_names=None, cat_threshold=20):
     """
-    Heuristic to categorize columns into Binary, Categorical, and Numerical
-    based on the training data.
+    Categorize columns into Binary, Categorical, and Numerical using explicit
+    manifest categorical metadata when available (keeping *_count and Hosp_days_*
+    as numerical rather than one-hot encoding small integer counts).
     """
     binary_cols = []
     categorical_cols = []
     numerical_cols = []
-    
-    # Analyze a sample to speed up (optional, but X is usually small enough here)
+    cat_set = set(categorical_names) if categorical_names is not None else None
     n_samples, n_features = X.shape
-    
+
     for i in range(n_features):
+        name = feature_names[i] if feature_names is not None else None
+        if cat_set is not None and name is not None:
+            if name in cat_set:
+                categorical_cols.append(i)
+                continue
+            if name.endswith("_count") or name.startswith(("Hosp_days_", "Recency_")):
+                numerical_cols.append(i)
+                continue
+
         col = X[:, i]
-        # Drop NaNs for unique count
         valid_values = col[~pd.isna(col)]
         unique_vals = np.unique(valid_values)
         n_unique = len(unique_vals)
-        
+
         if n_unique <= 2:
             binary_cols.append(i)
-        elif n_unique <= cat_threshold:
-            # Heuristic: Small integer range = categorical
-            # (Check if values are essentially integers)
+        elif cat_set is None and n_unique <= cat_threshold:
             try:
                 is_int_like = np.all(np.mod(valid_values.astype(float), 1) == 0)
             except (TypeError, ValueError):
                 is_int_like = True
             if is_int_like:
-                 categorical_cols.append(i)
+                categorical_cols.append(i)
             else:
-                 numerical_cols.append(i)
+                numerical_cols.append(i)
         else:
             numerical_cols.append(i)
-            
+
     return binary_cols, categorical_cols, numerical_cols
 
 
 def build_model_pipeline(
     X_train, y_train, model_type, model_params, target_ratio=None,
     include_preprocessor=True, include_selector=True,
+    feature_names=None, categorical_names=None,
 ):
     """
-    Constructs a ColumnTransformer pipeline fitted strictly on training data.
+    Constructs a ColumnTransformer pipeline fitted strictly on training data:
+      - XGBoost: preserves numeric NaNs natively so trees learn optimal missing branches.
+      - LR / RF: median imputation with explicit missingness indicators (add_indicator=True)
+        so 'never occurred' (Recency=NaN) and sparse lab windows are not blurred into medians.
+      - Only true manifest categorical columns are one-hot encoded; counts stay numerical.
     """
     if include_preprocessor:
-        cache_sig = (id(X_train), X_train.shape)
+        cache_sig = (id(X_train), X_train.shape, tuple(feature_names) if feature_names is not None else None)
         if cache_sig not in _FEATURE_TYPES_CACHE:
-            _FEATURE_TYPES_CACHE[cache_sig] = infer_feature_types(X_train)
+            _FEATURE_TYPES_CACHE[cache_sig] = infer_feature_types(
+                X_train, feature_names=feature_names, categorical_names=categorical_names,
+            )
         bin_idx, cat_idx, num_idx = _FEATURE_TYPES_CACHE[cache_sig]
     else:
         bin_idx, cat_idx, num_idx = [], [], []
 
-    # Numerical: median impute -> standard scale (robust to outliers/skew)
-    num_transformer = Pipeline([
-        ('imputer', SimpleImputer(strategy='median')),
-        ('scaler', StandardScaler())
-    ])
+    # Numerical: native NaN passthrough for XGBoost; median + missingness indicators + scaling for LR/RF
+    if model_type == "xgboost":
+        num_transformer = "passthrough"
+    else:
+        num_transformer = Pipeline([
+            ('imputer', SimpleImputer(strategy='median', add_indicator=True)),
+            ('scaler', StandardScaler()),
+        ])
 
     # Categorical: most frequent impute -> one-hot (handle new categories by ignoring)
     cat_transformer = Pipeline([
@@ -544,7 +654,7 @@ def build_model_pipeline(
         ('encoder', OneHotEncoder(drop='if_binary', handle_unknown='ignore', sparse_output=False))
     ])
 
-    # Binary: most frequent impute -> passthrough (already 0/1)
+    # Binary: constant 0 fill -> passthrough (already 0/1)
     bin_transformer = Pipeline([
         ('imputer', SimpleImputer(strategy='constant', fill_value=0))
     ])
@@ -559,10 +669,10 @@ def build_model_pipeline(
         verbose_feature_names_out=False
     )
 
-    # Remove constant features (0 variance)
+    # Remove constant / all-NaN features (0 variance)
     dropper = VarianceThreshold(threshold=0)
 
-    # Feature selector (keeps top N-% of features based on ANOVA F-value
+    # Feature selector (keeps top N-% of features based on ANOVA F-value, NaN-safe)
     model_params = dict(model_params)
     if model_params.get("n_jobs") == -1:
         model_params["n_jobs"] = (
@@ -571,7 +681,7 @@ def build_model_pipeline(
             else int(os.environ.get("SLURM_CPUS_PER_TASK", 16))
         )
     percentile = model_params.pop('feature_fraction', 100)
-    selector = SelectPercentile(score_func=f_classif, percentile=percentile)
+    selector = NaNSafeSelectPercentile(percentile=percentile)
 
     # Attach model
     if model_type == 'logistic_regression':
@@ -644,14 +754,6 @@ def test_classic_ml_model(
     ]
     
     for config in split_configs:
-        # Check if the target source files actually exist on disk before launching the pass
-        file_check_sample = data_root / f"fup_{all_possible_fups[0]:04d}d" / config["filename"]
-        if not file_check_sample.exists():
-            file_check_sample = data_root / f"fup_{all_possible_fups[0]:04d}" / config["filename"]
-        if not file_check_sample.exists():
-            print(f"    [Skip] Partition data missing for split: [{config['split_label']}]")
-            continue
-            
         print(f"\n>>> Running classic ML final evaluation pass over all FUPs for: [{config['split_label'].upper()}]")
         
         final_metrics = {}
